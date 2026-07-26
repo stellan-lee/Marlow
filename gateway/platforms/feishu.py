@@ -1779,6 +1779,7 @@ class FeishuAdapter(BasePlatformAdapter):
         authorized_user_id: str = "",
         binary: bool = False,
         title: str = "Command Approval Required",
+        action_intent: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send an interactive card with approval buttons.
 
@@ -1801,6 +1802,50 @@ class FeishuAdapter(BasePlatformAdapter):
                     "value": {"marlow_action": action_name, "approval_id": approval_id},
                 }
 
+            from gateway.approval_presentation import terminal_intent_view
+
+            intent_view = terminal_intent_view(
+                action_intent, description=description
+            )
+            if intent_view is None:
+                review_elements = [{
+                    "tag": "markdown",
+                    "content": f"```\n{cmd_preview}\n```\n**Reason:** {description}",
+                }]
+            else:
+                intro_lines = [f"**Intent**\n{intent_view['operation']}"]
+                for label, key in (
+                    ("Target", "target"),
+                    ("Approval trigger", "reason"),
+                    ("Impact", "impact"),
+                    ("Environment", "environment"),
+                    ("Origin", "origin"),
+                ):
+                    if intent_view[key]:
+                        intro_lines.append(f"**{label}:** {intent_view[key]}")
+                if intent_view["is_plan"]:
+                    intro_lines.append(
+                        "**Approval scope:** Each listed command once, in this "
+                        "session, for 15 minutes. Any change requires a new approval."
+                    )
+                review_elements = [{
+                    "tag": "markdown",
+                    "content": "\n\n".join(intro_lines),
+                }]
+                command_count = len(intent_view["commands"])
+                for index, item in enumerate(intent_view["commands"], start=1):
+                    label = (
+                        f"Command {index} of {command_count}"
+                        if intent_view["is_plan"]
+                        else "Command"
+                    )
+                    if item["workdir"]:
+                        label += f" — {item['workdir']}"
+                    review_elements.append({
+                        "tag": "markdown",
+                        "content": f"**{label}**\n```\n{item['command']}\n```",
+                    })
+
             card = {
                 "config": {"wide_screen_mode": True},
                 "header": {
@@ -1808,10 +1853,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     "template": "orange",
                 },
                 "elements": [
-                    {
-                        "tag": "markdown",
-                        "content": f"```\n{cmd_preview}\n```\n**Reason:** {description}",
-                    },
+                    *review_elements,
                     {
                         "tag": "action",
                         "actions": (

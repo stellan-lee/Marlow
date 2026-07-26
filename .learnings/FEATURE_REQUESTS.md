@@ -163,3 +163,47 @@ authorization, and strip personal-memory surfaces from guest agents.
   focused regression coverage.
 
 ---
+
+## [FEAT-20260726-001] multi-command-intent-approval
+
+**Logged**: 2026-07-26T00:00:00+08:00
+**Priority**: high
+**Status**: resolved
+**Area**: backend
+
+### Requested Capability
+
+Allow one administrator decision to authorize all terminal commands needed for
+an approved intent without prompting separately for each command.
+
+### User Context
+
+Multi-step tasks become disruptive when every dangerous-command finding asks
+the administrator to approve the same intended outcome again.
+
+### Complexity Estimate
+
+complex
+
+### Suggested Implementation
+
+Use a bounded, request-scoped intent grant that contains an administrator-
+reviewed set of exact command digests. Keep the grant session-bound, expiring,
+single-use per command, and subject to hardline safety checks. Do not treat a
+reused purpose string as authorization for arbitrary future commands.
+
+### Metadata
+
+- Frequency: first_time
+- Related Features: administrator-routed approvals, terminal action intents,
+  dangerous command approvals
+
+### Resolution
+
+- **Resolved**: 2026-07-26T00:00:00+08:00
+- **Notes**: Added administrator-reviewed exact command plans with opaque,
+  session-bound, 15-minute grants; atomic one-use command consumption; hardline
+  enforcement; intent-first Telegram, Slack, Feishu, and Discord rendering; and
+  focused security, concurrency, expiry, schema, and adapter coverage.
+
+---

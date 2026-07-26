@@ -40,6 +40,11 @@ configured platform must be connected when a request is sent.
 
 - Dangerous terminal commands and gateway `execute_code` requests are wrapped
   as `terminal.execute` and `code.execute` action intents automatically.
+  Terminal calls declare a concise user-facing `purpose`; that intended outcome
+  becomes the approval operation and is bound to the exact command and
+  environment, including the resolved working directory. An admin-routed
+  terminal warning without a purpose fails closed before any approval card is
+  sent.
 - Any built-in or plugin tool registered with `action_intent` is intercepted at
   central dispatch. Approval and execution happen in one call stack, so the
   approved arguments cannot be replaced before the handler runs.
@@ -49,8 +54,19 @@ configured platform must be connected when a request is sent.
   not represented by a registered tool. This is a compatibility escape hatch;
   registered action-intent policies are preferred because they bind approval
   directly to execution.
-- Each card has only **Approve** and **Decline**. Approval is one-shot and tied
-  to the request ID; it never creates a session or permanent grant.
+- Each card has only **Approve** and **Decline**. A normal approval is one-shot
+  and tied to the request ID; it never creates a pattern, session-wide, or
+  permanent grant.
+- A terminal call may instead submit an `approval_plan` containing every exact
+  command for one intent. The card shows the whole plan. Approval returns an
+  opaque `intent_grant_id` that allows each remaining listed command once,
+  without another prompt. The grant is bound to the originating session,
+  purpose, environment, command text, and working directory; it expires after
+  15 minutes and is lost on restart. Changed, repeated, or additional commands
+  require a new approval. Plans are limited to 12 commands and 2,400 command
+  characters so the administrator can review them completely.
+- Hardline command blocks and sudo credential protections run before grant
+  matching on every execution and cannot be pre-approved by a plan.
 - Only the configured user can operate the card, even when a platform's normal
   allowlist is broader.
 - Delivery failure, timeout, stale cards, invalid identities, and incomplete
@@ -117,7 +133,9 @@ def database_intent(args):
     }
 ```
 
-The approval card renders the semantic intent as labeled text plus a SHA-256
-digest bound to the original tool name and unredacted arguments. The structured
-intent remains attached to approval hooks, while display parameters are
-secret-redacted before being sent to the messaging adapter.
+The approval request binds the semantic intent to a SHA-256 digest of the
+original tool name and unredacted arguments. Telegram renders terminal
+approvals with the intended outcome first and the secret-redacted command as
+supporting evidence. The structured intent remains attached to approval hooks,
+while display parameters are secret-redacted before being sent to any messaging
+adapter.

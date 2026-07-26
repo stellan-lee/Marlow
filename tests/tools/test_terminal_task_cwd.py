@@ -31,15 +31,20 @@ def test_foreground_command_uses_registered_task_cwd_for_existing_environment(mo
     monkeypatch.setattr(terminal_tool, "_last_activity", {})
     monkeypatch.setattr(terminal_tool, "_task_env_overrides", {task_id: {"cwd": "/workspace/client"}})
     monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config())
+    guard_calls = []
     monkeypatch.setattr(
         terminal_tool,
         "_check_all_guards",
-        lambda command, env_type: {"approved": True},
+        lambda command, env_type, **kwargs: (
+            guard_calls.append((command, env_type, kwargs))
+            or {"approved": True}
+        ),
     )
 
     result = json.loads(terminal_tool.terminal_tool(command="pwd", task_id=task_id))
 
     assert result["exit_code"] == 0
+    assert guard_calls[0][2]["workdir"] == "/workspace/client"
     assert calls == [("pwd", {"timeout": 60, "cwd": "/workspace/client"})]
 
 
@@ -61,7 +66,7 @@ def test_explicit_workdir_still_wins_over_registered_task_cwd(monkeypatch):
     monkeypatch.setattr(
         terminal_tool,
         "_check_all_guards",
-        lambda command, env_type: {"approved": True},
+        lambda command, env_type, **kwargs: {"approved": True},
     )
 
     result = json.loads(
@@ -74,6 +79,44 @@ def test_explicit_workdir_still_wins_over_registered_task_cwd(monkeypatch):
 
     assert result["exit_code"] == 0
     assert calls == [{"timeout": 60, "cwd": "/explicit/workdir"}]
+
+
+def test_terminal_result_returns_intent_grant_metadata(monkeypatch):
+    class FakeEnv:
+        env = {}
+        cwd = "/workspace/live"
+
+        def execute(self, command, **kwargs):
+            return {"output": "done", "returncode": 0}
+
+    task_id = "session-intent-grant"
+    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: FakeEnv()})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config())
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda command, env_type, **kwargs: {
+            "approved": True,
+            "user_approved": True,
+            "description": "approved plan",
+            "intent_grant_id": "opaque-grant",
+            "intent_grant_remaining": 2,
+            "intent_grant_expires_in_seconds": 900,
+        },
+    )
+
+    result = json.loads(terminal_tool.terminal_tool(
+        command="echo done",
+        task_id=task_id,
+        purpose="Complete the planned workflow",
+    ))
+
+    assert result["exit_code"] == 0
+    assert result["intent_grant_id"] == "opaque-grant"
+    assert result["intent_grant_remaining"] == 2
+    assert result["intent_grant_expires_in_seconds"] == 900
 
 
 def test_foreground_command_prefers_live_env_cwd_over_init_time_cwd(monkeypatch):
@@ -98,7 +141,7 @@ def test_foreground_command_prefers_live_env_cwd_over_init_time_cwd(monkeypatch)
     monkeypatch.setattr(
         terminal_tool,
         "_check_all_guards",
-        lambda command, env_type: {"approved": True},
+        lambda command, env_type, **kwargs: {"approved": True},
     )
 
     result = json.loads(terminal_tool.terminal_tool(command="pwd", task_id=task_id))
@@ -136,7 +179,7 @@ def test_background_command_prefers_live_env_cwd_over_init_time_cwd(monkeypatch)
     monkeypatch.setattr(
         terminal_tool,
         "_check_all_guards",
-        lambda command, env_type: {"approved": True},
+        lambda command, env_type, **kwargs: {"approved": True},
     )
     monkeypatch.setattr(process_registry_mod, "process_registry", registry)
 

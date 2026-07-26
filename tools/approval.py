@@ -9,6 +9,7 @@ This module is the single source of truth for the dangerous command system:
 """
 
 import contextvars
+import html
 import logging
 import os
 import re
@@ -543,6 +544,181 @@ _session_approved: dict[str, set] = {}
 _session_yolo: set[str] = set()
 _permanent_approved: set = set()
 
+# Administrator-approved terminal plans are deliberately narrower than the
+# legacy pattern grants above.  A grant is process-local, session-bound,
+# short-lived, and contains a consumable multiset of exact command digests.
+# Restarting the gateway therefore invalidates every outstanding grant.
+_INTENT_GRANT_TTL_SECONDS = 15 * 60
+_MAX_INTENT_PLAN_COMMANDS = 12
+_MAX_INTENT_PLAN_COMMAND_CHARS = 2400
+_intent_grants: dict[str, dict] = {}
+
+
+def _terminal_grant_digest(command: str, env_type: str, workdir: str) -> str:
+    """Return the exact execution digest used by bounded intent grants."""
+    from tools.action_intent import argument_digest
+
+    return argument_digest(
+        "terminal.intent-command",
+        {
+            "command": command,
+            "environment": env_type,
+            "workdir": workdir,
+        },
+    )
+
+
+def _purpose_grant_digest(purpose: str) -> str:
+    """Hash the raw purpose so grants bind intent without retaining secrets."""
+    from tools.action_intent import argument_digest
+
+    return argument_digest("terminal.intent-purpose", {"purpose": purpose})
+
+
+def _normalize_terminal_plan(
+    approval_plan,
+    *,
+    command: str,
+    env_type: str,
+    workdir: str,
+) -> tuple[Optional[list[dict[str, str]]], Optional[str]]:
+    """Validate a model-supplied exact command plan and include this command."""
+    if approval_plan is None:
+        return None, None
+    if not isinstance(approval_plan, list) or not approval_plan:
+        return None, "approval_plan must be a non-empty list of command objects"
+
+    normalized: list[dict[str, str]] = []
+    for index, item in enumerate(approval_plan, start=1):
+        if not isinstance(item, dict):
+            return None, f"approval_plan item {index} must be an object"
+        planned_command = item.get("command")
+        if not isinstance(planned_command, str) or not planned_command.strip():
+            return None, f"approval_plan item {index} requires a non-empty command"
+        planned_workdir = item.get("workdir", workdir)
+        if planned_workdir is None:
+            planned_workdir = workdir
+        if not isinstance(planned_workdir, str):
+            return None, f"approval_plan item {index} workdir must be a string"
+        normalized.append({
+            "command": planned_command,
+            "environment": env_type,
+            "workdir": planned_workdir,
+        })
+
+    current = {"command": command, "environment": env_type, "workdir": workdir}
+    try:
+        current_index = normalized.index(current)
+    except ValueError:
+        normalized.insert(0, current)
+    else:
+        normalized.insert(0, normalized.pop(current_index))
+
+    if len(normalized) > _MAX_INTENT_PLAN_COMMANDS:
+        return None, (
+            f"approval_plan may contain at most {_MAX_INTENT_PLAN_COMMANDS} commands"
+        )
+    rendered_plan_chars = sum(
+        len(html.escape(item["command"])) + len(html.escape(item["workdir"]))
+        for item in normalized
+    )
+    if rendered_plan_chars > _MAX_INTENT_PLAN_COMMAND_CHARS:
+        return None, (
+            "approval_plan commands are too long for complete administrator review; "
+            "split the workflow into smaller plans"
+        )
+
+    for index, item in enumerate(normalized, start=1):
+        blocked, description = detect_hardline_command(item["command"])
+        if blocked:
+            return None, f"approval_plan item {index} is unconditionally blocked: {description}"
+        sudo_blocked, sudo_description = _check_sudo_stdin_guard(item["command"])
+        if sudo_blocked:
+            return None, f"approval_plan item {index} is blocked: {sudo_description}"
+    return normalized, None
+
+
+def _create_terminal_intent_grant(
+    *,
+    session_key: str,
+    purpose: str,
+    plan: list[dict[str, str]],
+    current_command: str,
+    env_type: str,
+    workdir: str,
+) -> tuple[Optional[str], int]:
+    """Create a grant for future plan entries, excluding the current call."""
+    remaining: dict[str, int] = {}
+    current_digest = _terminal_grant_digest(current_command, env_type, workdir)
+    current_removed = False
+    for item in plan:
+        digest = _terminal_grant_digest(
+            item["command"], item["environment"], item["workdir"]
+        )
+        if digest == current_digest and not current_removed:
+            current_removed = True
+            continue
+        remaining[digest] = remaining.get(digest, 0) + 1
+
+    count = sum(remaining.values())
+    if not count:
+        return None, 0
+
+    grant_id = uuid.uuid4().hex
+    purpose_digest = _purpose_grant_digest(purpose)
+    with _lock:
+        now = time.monotonic()
+        for expired_id, grant in list(_intent_grants.items()):
+            if grant["expires_at"] <= now:
+                _intent_grants.pop(expired_id, None)
+        _intent_grants[grant_id] = {
+            "session_key": session_key,
+            "purpose_digest": purpose_digest,
+            "expires_at": now + _INTENT_GRANT_TTL_SECONDS,
+            "remaining": remaining,
+        }
+    return grant_id, count
+
+
+def _consume_terminal_intent_grant(
+    *,
+    grant_id: str,
+    session_key: str,
+    purpose: str,
+    command: str,
+    env_type: str,
+    workdir: str,
+) -> Optional[int]:
+    """Atomically consume one exact planned command; return remaining count."""
+    if not grant_id:
+        return None
+    now = time.monotonic()
+    command_digest = _terminal_grant_digest(command, env_type, workdir)
+    purpose_digest = _purpose_grant_digest(purpose)
+    with _lock:
+        grant = _intent_grants.get(grant_id)
+        if grant is None:
+            return None
+        if grant["expires_at"] <= now:
+            _intent_grants.pop(grant_id, None)
+            return None
+        if (
+            grant["session_key"] != session_key
+            or grant["purpose_digest"] != purpose_digest
+        ):
+            return None
+        uses = grant["remaining"].get(command_digest, 0)
+        if uses <= 0:
+            return None
+        if uses == 1:
+            grant["remaining"].pop(command_digest, None)
+        else:
+            grant["remaining"][command_digest] = uses - 1
+        remaining = sum(grant["remaining"].values())
+        if not remaining:
+            _intent_grants.pop(grant_id, None)
+        return remaining
+
 # =========================================================================
 # Blocking gateway approval (mirrors CLI's synchronous input() flow)
 # =========================================================================
@@ -701,6 +877,9 @@ def clear_session(session_key: str) -> None:
         _session_approved.pop(session_key, None)
         _session_yolo.discard(session_key)
         _pending.pop(session_key, None)
+        for grant_id, grant in list(_intent_grants.items()):
+            if grant["session_key"] == session_key:
+                _intent_grants.pop(grant_id, None)
         entries = _gateway_queues.pop(session_key, [])
     for entry in entries:
         # Session-boundary cleanup should cancel any blocked approval waits
@@ -1457,8 +1636,16 @@ def request_admin_approval(
     return request_action_intent_approval(intent)
 
 
-def check_all_command_guards(command: str, env_type: str,
-                             approval_callback=None) -> dict:
+def check_all_command_guards(
+    command: str,
+    env_type: str,
+    approval_callback=None,
+    *,
+    purpose: str = "",
+    workdir: str = "",
+    approval_plan=None,
+    intent_grant_id: str = "",
+) -> dict:
     """Run all pre-exec security checks and return a single approval decision.
 
     Gathers findings from tirith and dangerous-command detection, then
@@ -1516,6 +1703,68 @@ def check_all_command_guards(command: str, env_type: str,
     is_cli = env_var_enabled("MARLOW_INTERACTIVE")
     is_gateway = _is_gateway_approval_context()
     is_ask = env_var_enabled("MARLOW_EXEC_ASK")
+    session_key = get_current_session_key()
+
+    normalized_plan = None
+    if admin_enforced and approval_plan is not None:
+        normalized_plan, plan_error = _normalize_terminal_plan(
+            approval_plan,
+            command=command,
+            env_type=env_type,
+            workdir=workdir,
+        )
+        if plan_error:
+            return {
+                "approved": False,
+                "message": f"BLOCKED: Invalid administrator approval plan: {plan_error}.",
+                "description": plan_error,
+                "outcome": "invalid_approval_plan",
+            }
+
+    normalized_purpose = str(purpose or "").strip()
+    if normalized_plan is not None and len(html.escape(normalized_purpose)) > 500:
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: Invalid administrator approval plan: purpose may contain "
+                "at most 500 characters."
+            ),
+            "description": "approval plan purpose is too long",
+            "outcome": "invalid_approval_plan",
+        }
+    if admin_enforced and (normalized_plan is not None or intent_grant_id):
+        if not normalized_purpose:
+            return {
+                "approved": False,
+                "message": (
+                    "BLOCKED: Administrator approval requires a clear terminal "
+                    "purpose. Retry the terminal call with a concise user-facing "
+                    "outcome in the purpose field; do not merely restate the command."
+                ),
+                "description": "terminal purpose is required for administrator approval",
+                "outcome": "missing_purpose",
+            }
+
+    # A grant bypasses only repeat prompting. The hardline and sudo guards above
+    # have already run, and exact session/purpose/command/environment/workdir
+    # matching is consumed atomically before execution.
+    if admin_enforced and intent_grant_id:
+        remaining = _consume_terminal_intent_grant(
+            grant_id=intent_grant_id,
+            session_key=session_key,
+            purpose=normalized_purpose,
+            command=command,
+            env_type=env_type,
+            workdir=workdir,
+        )
+        if remaining is not None:
+            return {
+                "approved": True,
+                "message": None,
+                "intent_grant_used": True,
+                "intent_grant_id": intent_grant_id,
+                "intent_grant_remaining": remaining,
+            }
 
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
     # flows, we do not block on approvals and we skip external guard work.
@@ -1557,8 +1806,6 @@ def check_all_command_guards(command: str, env_type: str,
     # Collect warnings that need approval
     warnings = []  # list of (pattern_key, description, is_tirith)
 
-    session_key = get_current_session_key()
-
     # Tirith block/warn → approvable warning with rich findings.
     # Previously, tirith "block" was a hard block with no approval prompt.
     # Now both block and warn go through the approval flow so users can
@@ -1576,8 +1823,44 @@ def check_all_command_guards(command: str, env_type: str,
             warnings.append((pattern_key, description, False))
 
     # Nothing to warn about
-    if not warnings:
+    if not warnings and normalized_plan is None:
         return {"approved": True, "message": None}
+
+    if not warnings:
+        warnings.append((
+            "terminal:intent-plan",
+            "Pre-authorize the exact command plan for this intent",
+            False,
+        ))
+
+    if admin_enforced and not normalized_purpose:
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: Administrator approval requires a clear terminal "
+                "purpose. Retry the terminal call with a concise user-facing "
+                "outcome in the purpose field; do not merely restate the command."
+            ),
+            "description": "terminal purpose is required for administrator approval",
+            "outcome": "missing_purpose",
+        }
+
+    review_purpose = normalized_purpose
+    if admin_enforced:
+        try:
+            from agent.redact import redact_sensitive_text
+
+            review_purpose = redact_sensitive_text(normalized_purpose, force=True)
+        except Exception:
+            return {
+                "approved": False,
+                "message": (
+                    "BLOCKED: Terminal purpose could not be safely prepared for "
+                    "administrator review. Do not retry with secrets in purpose."
+                ),
+                "description": "terminal purpose redaction failed",
+                "outcome": "purpose_redaction_failed",
+            }
 
     # --- Phase 2.5: Smart approval (auxiliary LLM risk assessment) ---
     # When approvals.mode=smart, ask the aux LLM before prompting the user.
@@ -1638,16 +1921,36 @@ def check_all_command_guards(command: str, env_type: str,
 
                 terminal_intent = build_action_intent(
                     tool_name="terminal",
-                    args={"command": command, "environment": env_type},
+                    args={
+                        "purpose": normalized_purpose,
+                        "command": command,
+                        "environment": env_type,
+                        "workdir": workdir,
+                        **(
+                            {"approval_plan": normalized_plan}
+                            if normalized_plan is not None
+                            else {}
+                        ),
+                    },
                     builder={
                         "action_type": "terminal.execute",
-                        "operation": "execute terminal command",
+                        "operation": review_purpose,
                         "target": f"{env_type} terminal environment",
                         "reason": combined_desc,
                         "impact": (
                             "The command was flagged as capable of changing "
                             "or damaging system state."
                         ),
+                        "parameters": {
+                            "command": command,
+                            "environment": env_type,
+                            "workdir": workdir,
+                            **(
+                                {"command_plan": normalized_plan}
+                                if normalized_plan is not None
+                                else {}
+                            ),
+                        },
                     },
                 )
                 if terminal_intent is None:  # static builders never skip
@@ -1718,8 +2021,24 @@ def check_all_command_guards(command: str, env_type: str,
                 # choice == "once": no persistence — command allowed this
                 # single time only, matching the CLI's behavior.
 
-            return {"approved": True, "message": None,
-                    "user_approved": True, "description": combined_desc}
+            result = {"approved": True, "message": None,
+                      "user_approved": True, "description": combined_desc}
+            if admin_enforced and normalized_plan is not None:
+                grant_id, remaining = _create_terminal_intent_grant(
+                    session_key=session_key,
+                    purpose=normalized_purpose,
+                    plan=normalized_plan,
+                    current_command=command,
+                    env_type=env_type,
+                    workdir=workdir,
+                )
+                if grant_id:
+                    result.update({
+                        "intent_grant_id": grant_id,
+                        "intent_grant_remaining": remaining,
+                        "intent_grant_expires_in_seconds": _INTENT_GRANT_TTL_SECONDS,
+                    })
+            return result
 
         # Fallback: no gateway callback registered (e.g. cron, batch).
         # Return approval_required for backward compat.

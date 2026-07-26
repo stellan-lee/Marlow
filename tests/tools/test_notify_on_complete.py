@@ -260,6 +260,16 @@ class TestCheckpointNotify:
 # =========================================================================
 
 class TestTerminalSchema:
+    def test_schema_requires_user_facing_purpose(self):
+        from tools.terminal_tool import TERMINAL_SCHEMA
+
+        params = TERMINAL_SCHEMA["parameters"]
+        assert params["required"] == ["purpose", "command"]
+        assert params["properties"]["purpose"]["minLength"] == 1
+        assert "goal, not the shell syntax" in params["properties"]["purpose"][
+            "description"
+        ]
+
     def test_schema_has_notify_on_complete(self):
         from tools.terminal_tool import TERMINAL_SCHEMA
         props = TERMINAL_SCHEMA["parameters"]["properties"]
@@ -277,6 +287,45 @@ class TestTerminalSchema:
             )
             _, kwargs = mock_tt.call_args
             assert kwargs["notify_on_complete"] is True
+
+    def test_handler_passes_purpose(self):
+        from tools.terminal_tool import _handle_terminal
+
+        with patch("tools.terminal_tool.terminal_tool", return_value='{"ok":true}') as mock_tt:
+            _handle_terminal(
+                {
+                    "purpose": "Inspect the active deployment",
+                    "command": "kubectl get deployment backend",
+                },
+                task_id="t1",
+            )
+
+        _, kwargs = mock_tt.call_args
+        assert kwargs["purpose"] == "Inspect the active deployment"
+
+    def test_schema_and_handler_expose_bounded_intent_grants(self):
+        from tools.terminal_tool import TERMINAL_SCHEMA, _handle_terminal
+
+        props = TERMINAL_SCHEMA["parameters"]["properties"]
+        assert props["approval_plan"]["maxItems"] == 12
+        assert props["approval_plan"]["items"]["required"] == ["command"]
+        assert props["intent_grant_id"]["type"] == "string"
+
+        plan = [{"command": "rm -rf /tmp/fixture", "workdir": "/tmp"}]
+        with patch("tools.terminal_tool.terminal_tool", return_value='{"ok":true}') as mock_tt:
+            _handle_terminal(
+                {
+                    "purpose": "Clean a temporary fixture",
+                    "command": "rm -rf /tmp/fixture",
+                    "approval_plan": plan,
+                    "intent_grant_id": "opaque-grant",
+                },
+                task_id="t1",
+            )
+
+        _, kwargs = mock_tt.call_args
+        assert kwargs["approval_plan"] == plan
+        assert kwargs["intent_grant_id"] == "opaque-grant"
 
 
 # =========================================================================

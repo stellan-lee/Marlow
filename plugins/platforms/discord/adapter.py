@@ -4032,6 +4032,7 @@ class DiscordAdapter(BasePlatformAdapter):
         authorized_user_id: str = "",
         binary: bool = False,
         title: str = "Command Approval Required",
+        action_intent: Optional[dict] = None,
     ) -> SendResult:
         """
         Send a button-based exec approval prompt for a dangerous command.
@@ -4052,15 +4053,52 @@ class DiscordAdapter(BasePlatformAdapter):
             if not channel:
                 channel = await self._client.fetch_channel(int(target_id))
 
-            # Discord embed description limit is 4096; show full command up to that
-            max_desc = 4088
-            cmd_display = command if len(command) <= max_desc else command[: max_desc - 3] + "..."
+            from gateway.approval_presentation import terminal_intent_view
+
+            intent_view = terminal_intent_view(
+                action_intent, description=description
+            )
+            if intent_view is None:
+                # Discord embed description limit is 4096; show full command up to that
+                max_desc = 4088
+                cmd_display = command if len(command) <= max_desc else command[: max_desc - 3] + "..."
+                embed_description = f"```\n{cmd_display}\n```"
+            else:
+                lines = [f"**Intent**\n{intent_view['operation']}"]
+                for label, key in (
+                    ("Target", "target"),
+                    ("Approval trigger", "reason"),
+                    ("Impact", "impact"),
+                    ("Environment", "environment"),
+                    ("Origin", "origin"),
+                ):
+                    if intent_view[key]:
+                        lines.append(f"**{label}:** {intent_view[key]}")
+                if intent_view["is_plan"]:
+                    lines.append(
+                        "**Approval scope:** Each listed command once, in this "
+                        "session, for 15 minutes. Any change requires a new approval."
+                    )
+                command_count = len(intent_view["commands"])
+                for index, item in enumerate(intent_view["commands"], start=1):
+                    label = (
+                        f"Command {index} of {command_count}"
+                        if intent_view["is_plan"]
+                        else "Command"
+                    )
+                    if item["workdir"]:
+                        label += f" — {item['workdir']}"
+                    lines.append(f"**{label}**\n```\n{item['command']}\n```")
+                embed_description = "\n\n".join(lines)
+                if len(embed_description) > 4096:
+                    raise ValueError("terminal approval plan exceeds Discord's review limit")
             embed = discord.Embed(
                 title=f"⚠️ {title}",
-                description=f"```\n{cmd_display}\n```",
+                description=embed_description,
                 color=discord.Color.orange(),
             )
-            embed.add_field(name="Reason", value=description, inline=False)
+            if intent_view is None:
+                embed.add_field(name="Reason", value=description, inline=False)
 
             view = ExecApprovalView(
                 session_key=session_key,
