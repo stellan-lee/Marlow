@@ -149,6 +149,52 @@ class TestTelegramExecApproval:
         assert "Request digest:" not in text
 
     @pytest.mark.asyncio
+    async def test_terminal_intent_plan_renders_every_command_for_review(self):
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(return_value=MagicMock(message_id=44))
+        plan = [
+            {
+                "command": "kubectl rollout restart deployment/backend",
+                "environment": "local",
+                "workdir": "/srv/app",
+            },
+            {
+                "command": "kubectl rollout status deployment/backend",
+                "environment": "local",
+                "workdir": "/srv/app",
+            },
+        ]
+        intent = {
+            "action_type": "terminal.execute",
+            "operation": "Restart the backend and verify the rollout",
+            "target": "local terminal environment",
+            "reason": "Pre-authorize the exact command plan for this intent",
+            "impact": "The commands can change deployment state.",
+            "parameters": {
+                "command": plan[0]["command"],
+                "command_plan": plan,
+                "environment": "local",
+            },
+        }
+
+        result = await adapter.send_exec_approval(
+            chat_id="12345",
+            command="legacy summary",
+            session_key="requester-session",
+            description="planned deployment\nOrigin: requester=42",
+            binary=True,
+            action_intent=intent,
+        )
+
+        assert result.success is True
+        text = adapter._bot.send_message.call_args.kwargs["text"]
+        assert "<b>Approved command plan (2)</b>" in text
+        assert text.index("1. in /srv/app") < text.index(plan[0]["command"])
+        assert text.index(plan[0]["command"]) < text.index(plan[1]["command"])
+        assert text.count("<pre>") == 2
+        assert "legacy summary" not in text
+
+    @pytest.mark.asyncio
     async def test_stores_approval_state(self):
         adapter = _make_adapter()
         mock_msg = MagicMock()

@@ -130,11 +130,10 @@ def _format_terminal_action_intent_html(
         return None
 
     command = parameters.get("command")
+    command_plan = parameters.get("command_plan")
     environment = parameters.get("environment")
     if not isinstance(command, str) or not command:
         return None
-
-    command_preview = command[:2800] + "..." if len(command) > 2800 else command
     origin = next(
         (
             line.removeprefix("Origin:").strip()
@@ -154,12 +153,50 @@ def _format_terminal_action_intent_html(
         sections.append(f"<b>Approval trigger:</b> {_html.escape(reason)}")
     if impact:
         sections.append(f"<b>Impact:</b> {_html.escape(impact)}")
-    sections.append(f"<b>Command</b>\n<pre>{_html.escape(command_preview)}</pre>")
+    if isinstance(command_plan, list) and command_plan:
+        rendered_commands = []
+        for index, item in enumerate(command_plan, start=1):
+            if not isinstance(item, dict) or not isinstance(item.get("command"), str):
+                return None
+            planned_command = item["command"]
+            planned_workdir = str(item.get("workdir") or "").strip()
+            label = f"{index}."
+            if planned_workdir:
+                label += f" in {_html.escape(planned_workdir)}"
+            rendered_commands.append(
+                f"<b>{label}</b>\n<pre>{_html.escape(planned_command)}</pre>"
+            )
+        plan_section = (
+            f"<b>Approved command plan ({len(command_plan)})</b>\n"
+            + "\n".join(rendered_commands)
+        )
+        sections.append(plan_section)
+        sections.append(
+            "<b>Approval scope:</b> Each listed command once, in this session, "
+            "for 15 minutes. Any change requires a new approval."
+        )
+    else:
+        command_preview = command[:2800] + "..." if len(command) > 2800 else command
+        sections.append(f"<b>Command</b>\n<pre>{_html.escape(command_preview)}</pre>")
     if environment:
         sections.append(f"<b>Environment:</b> {_html.escape(str(environment))}")
     if origin:
         sections.append(f"<b>Origin:</b> {_html.escape(origin)}")
-    return "\n\n".join(sections)
+    rendered = "\n\n".join(sections)
+    if len(rendered) > 4000 and isinstance(command_plan, list) and command_plan:
+        # Preserve the complete intent and exact plan by dropping explanatory
+        # metadata before Telegram's 4096-character message ceiling.
+        essential = [sections[0], sections[1], plan_section]
+        if environment:
+            essential.append(f"<b>Environment:</b> {_html.escape(str(environment))}")
+        essential.append(
+            "<b>Approval scope:</b> Each listed command once, in this session, "
+            "for 15 minutes. Any change requires a new approval."
+        )
+        rendered = "\n\n".join(essential)
+    if len(rendered) > 4096:
+        raise ValueError("terminal approval plan exceeds Telegram's review limit")
+    return rendered
 
 
 def _telegram_clarify_decision_indices(choices: Optional[list]) -> Optional[tuple[int, int]]:

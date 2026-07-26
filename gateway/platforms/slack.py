@@ -2648,6 +2648,7 @@ class SlackAdapter(BasePlatformAdapter):
         authorized_user_id: str = "",
         binary: bool = False,
         title: str = "Command Approval Required",
+        action_intent: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send a Block Kit approval prompt with interactive buttons.
 
@@ -2693,8 +2694,13 @@ class SlackAdapter(BasePlatformAdapter):
                 "value": session_key,
             })
 
-            blocks = [
-                {
+            from gateway.approval_presentation import terminal_intent_view
+
+            intent_view = terminal_intent_view(
+                action_intent, description=description
+            )
+            if intent_view is None:
+                blocks = [{
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
@@ -2704,16 +2710,56 @@ class SlackAdapter(BasePlatformAdapter):
                             f"Reason: {description}"
                         ),
                     },
-                },
-                {
-                    "type": "actions",
-                    "elements": action_elements,
-                },
-            ]
+                }]
+                fallback_label = cmd_preview[:100]
+            else:
+                intro_lines = [
+                    f":warning: *{title}*",
+                    f"*Intent*\n{intent_view['operation']}",
+                ]
+                for label, key in (
+                    ("Target", "target"),
+                    ("Approval trigger", "reason"),
+                    ("Impact", "impact"),
+                    ("Environment", "environment"),
+                    ("Origin", "origin"),
+                ):
+                    if intent_view[key]:
+                        intro_lines.append(f"*{label}:* {intent_view[key]}")
+                if intent_view["is_plan"]:
+                    intro_lines.append(
+                        "*Approval scope:* Each listed command once, in this "
+                        "session, for 15 minutes. Any change requires a new approval."
+                    )
+                blocks = [{
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": "\n\n".join(intro_lines)},
+                }]
+                command_count = len(intent_view["commands"])
+                for index, item in enumerate(intent_view["commands"], start=1):
+                    command_label = (
+                        f"Command {index} of {command_count}"
+                        if intent_view["is_plan"]
+                        else "Command"
+                    )
+                    if item["workdir"]:
+                        command_label += f" — {item['workdir']}"
+                    blocks.append({
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"*{command_label}*\n```{item['command']}```",
+                        },
+                    })
+                fallback_label = intent_view["operation"][:100]
+            blocks.append({
+                "type": "actions",
+                "elements": action_elements,
+            })
 
             kwargs: Dict[str, Any] = {
                 "channel": chat_id,
-                "text": f"⚠️ {title}: {cmd_preview[:100]}",
+                "text": f"⚠️ {title}: {fallback_label}",
                 "blocks": blocks,
             }
             if thread_ts:

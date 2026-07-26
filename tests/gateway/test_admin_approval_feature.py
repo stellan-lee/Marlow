@@ -21,6 +21,7 @@ def _clear_approval_state() -> None:
     approval._session_yolo.clear()
     approval._permanent_approved.clear()
     approval._pending.clear()
+    approval._intent_grants.clear()
 
 
 class _Adapter:
@@ -318,7 +319,12 @@ class TestAdminApprovalQueue:
         assert not seen[0]["action"].lstrip().startswith("{")
         assert seen[0]["action_intent"]["argument_digest"] == argument_digest(
             "terminal",
-            {"purpose": purpose, "command": command, "environment": "local"},
+            {
+                "purpose": purpose,
+                "command": command,
+                "environment": "local",
+                "workdir": "",
+            },
         )
         assert "Impact: The command was flagged as capable of changing" in seen[0][
             "description"
@@ -429,6 +435,266 @@ class TestAdminApprovalQueue:
         assert result["outcome"] == "missing_purpose"
         assert "purpose field" in result["message"]
         assert notified == []
+
+    def test_approved_plan_returns_grant_and_consumes_exact_next_command(self):
+        from tools import approval
+
+        session_key = "agent:main:telegram:dm:planned"
+        purpose = "Clean two temporary deployment fixtures"
+        first = "rm -rf /tmp/intent-plan-one"
+        second = "rm -rf /tmp/intent-plan-two"
+        plan = [
+            {"command": second, "workdir": "/tmp"},
+            {"command": first, "workdir": "/tmp"},
+        ]
+        seen = []
+
+        def notify(payload):
+            seen.append(dict(payload))
+            approval.resolve_gateway_approval(
+                session_key, "once", request_id=payload["request_id"]
+            )
+
+        token = approval.set_current_session_key(session_key)
+        approval.register_gateway_notify(session_key, notify)
+        try:
+            with (
+                patch.object(approval, "_is_gateway_approval_context", return_value=True),
+                patch.object(
+                    approval,
+                    "_get_approval_config",
+                    return_value={"mode": "manual", "admin": {"enabled": True}},
+                ),
+                patch(
+                    "tools.tirith_security.check_command_security",
+                    return_value={"action": "allow", "findings": [], "summary": ""},
+                ),
+            ):
+                approved = approval.check_all_command_guards(
+                    first,
+                    "local",
+                    purpose=purpose,
+                    workdir="/tmp",
+                    approval_plan=plan,
+                )
+                grant_id = approved["intent_grant_id"]
+                consumed = approval.check_all_command_guards(
+                    second,
+                    "local",
+                    purpose=purpose,
+                    workdir="/tmp",
+                    intent_grant_id=grant_id,
+                )
+        finally:
+            approval.unregister_gateway_notify(session_key)
+            approval.reset_current_session_key(token)
+
+        assert approved["intent_grant_remaining"] == 1
+        assert approved["intent_grant_expires_in_seconds"] == 900
+        assert consumed == {
+            "approved": True,
+            "message": None,
+            "intent_grant_used": True,
+            "intent_grant_id": grant_id,
+            "intent_grant_remaining": 0,
+        }
+        assert len(seen) == 1
+        assert seen[0]["action_intent"]["parameters"]["command_plan"] == [
+            {"command": first, "environment": "local", "workdir": "/tmp"},
+            {"command": second, "environment": "local", "workdir": "/tmp"},
+        ]
+
+    @pytest.mark.parametrize(
+        ("changed_purpose", "changed_command", "changed_workdir"),
+        [
+            ("A different intent", None, None),
+            (None, "rm -rf /tmp/not-in-the-plan", None),
+            (None, None, "/var/tmp"),
+        ],
+    )
+    def test_grant_mismatch_requires_new_approval(
+        self, changed_purpose, changed_command, changed_workdir
+    ):
+        from tools import approval
+
+        session_key = "agent:main:telegram:dm:mismatch"
+        purpose = "Clean temporary fixtures"
+        first = "rm -rf /tmp/intent-plan-first"
+        second = "rm -rf /tmp/intent-plan-second"
+        seen = []
+
+        def notify(payload):
+            seen.append(dict(payload))
+            choice = "once" if len(seen) == 1 else "deny"
+            approval.resolve_gateway_approval(
+                session_key, choice, request_id=payload["request_id"]
+            )
+
+        token = approval.set_current_session_key(session_key)
+        approval.register_gateway_notify(session_key, notify)
+        try:
+            with (
+                patch.object(approval, "_is_gateway_approval_context", return_value=True),
+                patch.object(
+                    approval,
+                    "_get_approval_config",
+                    return_value={"mode": "manual", "admin": {"enabled": True}},
+                ),
+                patch(
+                    "tools.tirith_security.check_command_security",
+                    return_value={"action": "allow", "findings": [], "summary": ""},
+                ),
+            ):
+                approved = approval.check_all_command_guards(
+                    first,
+                    "local",
+                    purpose=purpose,
+                    workdir="/tmp",
+                    approval_plan=[
+                        {"command": first, "workdir": "/tmp"},
+                        {"command": second, "workdir": "/tmp"},
+                    ],
+                )
+                result = approval.check_all_command_guards(
+                    changed_command or second,
+                    "local",
+                    purpose=changed_purpose or purpose,
+                    workdir=changed_workdir or "/tmp",
+                    intent_grant_id=approved["intent_grant_id"],
+                )
+        finally:
+            approval.unregister_gateway_notify(session_key)
+            approval.reset_current_session_key(token)
+
+        assert result["approved"] is False
+        assert result["outcome"] == "denied"
+        assert len(seen) == 2
+
+    def test_grant_is_session_bound_and_expires(self):
+        from tools import approval
+
+        purpose = "Clean a temporary fixture"
+        command = "rm -rf /tmp/session-bound-plan"
+        digest = approval._terminal_grant_digest(command, "local", "/tmp")
+        grant_id = "test-expiring-grant"
+        approval._intent_grants[grant_id] = {
+            "session_key": "session-a",
+            "purpose_digest": approval._purpose_grant_digest(purpose),
+            "expires_at": 100.0,
+            "remaining": {digest: 1},
+        }
+
+        with patch.object(approval.time, "monotonic", return_value=50.0):
+            assert approval._consume_terminal_intent_grant(
+                grant_id=grant_id,
+                session_key="session-b",
+                purpose=purpose,
+                command=command,
+                env_type="local",
+                workdir="/tmp",
+            ) is None
+        with patch.object(approval.time, "monotonic", return_value=101.0):
+            assert approval._consume_terminal_intent_grant(
+                grant_id=grant_id,
+                session_key="session-a",
+                purpose=purpose,
+                command=command,
+                env_type="local",
+                workdir="/tmp",
+            ) is None
+        assert grant_id not in approval._intent_grants
+
+    def test_grant_consumption_is_atomic(self):
+        from tools import approval
+
+        purpose = "Clean one temporary fixture"
+        command = "rm -rf /tmp/atomic-plan"
+        digest = approval._terminal_grant_digest(command, "local", "/tmp")
+        grant_id = "test-atomic-grant"
+        approval._intent_grants[grant_id] = {
+            "session_key": "session-a",
+            "purpose_digest": approval._purpose_grant_digest(purpose),
+            "expires_at": approval.time.monotonic() + 60,
+            "remaining": {digest: 1},
+        }
+        barrier = threading.Barrier(3)
+        results = []
+
+        def consume():
+            barrier.wait()
+            results.append(approval._consume_terminal_intent_grant(
+                grant_id=grant_id,
+                session_key="session-a",
+                purpose=purpose,
+                command=command,
+                env_type="local",
+                workdir="/tmp",
+            ))
+
+        threads = [threading.Thread(target=consume) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=2)
+
+        assert sorted(results, key=lambda value: value is None) == [0, None]
+
+    def test_plan_cannot_preapprove_hardline_command(self):
+        from tools import approval
+
+        notified = []
+        with (
+            patch.object(approval, "_is_gateway_approval_context", return_value=True),
+            patch.object(
+                approval,
+                "_get_approval_config",
+                return_value={"mode": "manual", "admin": {"enabled": True}},
+            ),
+        ):
+            result = approval.check_all_command_guards(
+                "echo prepare",
+                "local",
+                purpose="Prepare then erase the host",
+                approval_plan=[
+                    {"command": "echo prepare"},
+                    {"command": "rm -rf /"},
+                ],
+            )
+
+        assert result["approved"] is False
+        assert result["outcome"] == "invalid_approval_plan"
+        assert "unconditionally blocked" in result["message"]
+        assert notified == []
+
+    def test_hardline_guard_runs_before_even_a_forged_grant(self):
+        from tools import approval
+
+        purpose = "Erase the host"
+        command = "rm -rf /"
+        grant_id = "forged-hardline-grant"
+        digest = approval._terminal_grant_digest(command, "local", "/")
+        approval._intent_grants[grant_id] = {
+            "session_key": "session-a",
+            "purpose_digest": approval._purpose_grant_digest(purpose),
+            "expires_at": approval.time.monotonic() + 60,
+            "remaining": {digest: 1},
+        }
+        token = approval.set_current_session_key("session-a")
+        try:
+            result = approval.check_all_command_guards(
+                command,
+                "local",
+                purpose=purpose,
+                workdir="/",
+                intent_grant_id=grant_id,
+            )
+        finally:
+            approval.reset_current_session_key(token)
+
+        assert result["approved"] is False
+        assert result["hardline"] is True
+        assert grant_id in approval._intent_grants
 
 
 class TestAdminApprovalRouting:

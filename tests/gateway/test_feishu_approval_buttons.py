@@ -154,6 +154,54 @@ class TestFeishuExecApproval:
         assert state["chat_id"] == "oc_12345"
 
     @pytest.mark.asyncio
+    async def test_intent_plan_renders_every_command(self):
+        adapter = _make_adapter()
+        commands = ["kubectl apply -f app.yaml", "kubectl rollout status deploy/app"]
+        action_intent = {
+            "action_type": "terminal.execute",
+            "operation": "Deploy the app and verify its rollout",
+            "target": "local terminal environment",
+            "reason": "Pre-authorize the exact command plan for this intent",
+            "impact": "The plan changes deployment state.",
+            "parameters": {
+                "command": commands[0],
+                "environment": "local",
+                "command_plan": [
+                    {"command": command, "workdir": "/srv/app"}
+                    for command in commands
+                ],
+            },
+        }
+        mock_response = SimpleNamespace(
+            success=lambda: True,
+            data=SimpleNamespace(message_id="msg_plan"),
+        )
+        with patch.object(
+            adapter,
+            "_feishu_send_with_retry",
+            new_callable=AsyncMock,
+            return_value=mock_response,
+        ) as mock_send:
+            await adapter.send_exec_approval(
+                chat_id="oc_12345",
+                command="legacy summary",
+                session_key="requester-session",
+                description="planned deployment\nOrigin: requester=42",
+                binary=True,
+                action_intent=action_intent,
+            )
+
+        card = json.loads(mock_send.call_args.kwargs["payload"])
+        rendered = "\n".join(
+            element.get("content", "") for element in card["elements"]
+        )
+        assert "**Intent**" in rendered
+        assert "Each listed command once" in rendered
+        assert all(command in rendered for command in commands)
+        assert "Command 2 of 2 — /srv/app" in rendered
+        assert "legacy summary" not in rendered
+
+    @pytest.mark.asyncio
     async def test_admin_prompt_is_binary_and_request_scoped(self):
         adapter = _make_adapter()
         mock_response = SimpleNamespace(

@@ -118,6 +118,48 @@ class TestSlackExecApproval:
         assert kwargs.get("thread_ts") == "9999.0000"
 
     @pytest.mark.asyncio
+    async def test_intent_plan_renders_all_commands_in_separate_blocks(self):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_postMessage = AsyncMock(return_value={"ts": "1234.7000"})
+        commands = ["kubectl apply -f app.yaml", "kubectl rollout status deploy/app"]
+        action_intent = {
+            "action_type": "terminal.execute",
+            "operation": "Deploy the app and verify its rollout",
+            "target": "local terminal environment",
+            "reason": "Pre-authorize the exact command plan for this intent",
+            "impact": "The plan changes deployment state.",
+            "parameters": {
+                "command": commands[0],
+                "environment": "local",
+                "command_plan": [
+                    {"command": command, "workdir": "/srv/app"}
+                    for command in commands
+                ],
+            },
+        }
+
+        await adapter.send_exec_approval(
+            chat_id="C1",
+            command="legacy summary",
+            session_key="requester-session",
+            description="planned deployment\nOrigin: requester=42",
+            binary=True,
+            action_intent=action_intent,
+        )
+
+        blocks = mock_client.chat_postMessage.call_args.kwargs["blocks"]
+        rendered = "\n".join(
+            block.get("text", {}).get("text", "") for block in blocks
+        )
+        assert "*Intent*" in rendered
+        assert "Each listed command once" in rendered
+        assert all(command in rendered for command in commands)
+        assert "Command 1 of 2 — /srv/app" in rendered
+        assert "legacy summary" not in rendered
+        assert blocks[-1]["type"] == "actions"
+
+    @pytest.mark.asyncio
     async def test_admin_prompt_is_binary_and_request_scoped(self):
         adapter = _make_adapter()
         mock_client = adapter._team_clients["T1"]

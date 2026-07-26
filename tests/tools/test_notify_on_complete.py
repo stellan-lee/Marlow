@@ -303,6 +303,30 @@ class TestTerminalSchema:
         _, kwargs = mock_tt.call_args
         assert kwargs["purpose"] == "Inspect the active deployment"
 
+    def test_schema_and_handler_expose_bounded_intent_grants(self):
+        from tools.terminal_tool import TERMINAL_SCHEMA, _handle_terminal
+
+        props = TERMINAL_SCHEMA["parameters"]["properties"]
+        assert props["approval_plan"]["maxItems"] == 12
+        assert props["approval_plan"]["items"]["required"] == ["command"]
+        assert props["intent_grant_id"]["type"] == "string"
+
+        plan = [{"command": "rm -rf /tmp/fixture", "workdir": "/tmp"}]
+        with patch("tools.terminal_tool.terminal_tool", return_value='{"ok":true}') as mock_tt:
+            _handle_terminal(
+                {
+                    "purpose": "Clean a temporary fixture",
+                    "command": "rm -rf /tmp/fixture",
+                    "approval_plan": plan,
+                    "intent_grant_id": "opaque-grant",
+                },
+                task_id="t1",
+            )
+
+        _, kwargs = mock_tt.call_args
+        assert kwargs["approval_plan"] == plan
+        assert kwargs["intent_grant_id"] == "opaque-grant"
+
 
 # =========================================================================
 # Code execution blocked params

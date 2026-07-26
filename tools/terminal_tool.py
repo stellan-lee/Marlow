@@ -208,13 +208,24 @@ from tools.approval import (
 )
 
 
-def _check_all_guards(command: str, env_type: str, *, purpose: str = "") -> dict:
+def _check_all_guards(
+    command: str,
+    env_type: str,
+    *,
+    purpose: str = "",
+    workdir: str = "",
+    approval_plan=None,
+    intent_grant_id: str = "",
+) -> dict:
     """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
     return _check_all_guards_impl(
         command,
         env_type,
         approval_callback=_get_approval_callback(),
         purpose=purpose,
+        workdir=workdir,
+        approval_plan=approval_plan,
+        intent_grant_id=intent_grant_id,
     )
 
 
@@ -1603,6 +1614,8 @@ def terminal_tool(
     notify_on_complete: bool = False,
     watch_patterns: Optional[List[str]] = None,
     purpose: str = "",
+    approval_plan=None,
+    intent_grant_id: str = "",
 ) -> str:
     """
     Execute a command in the configured terminal environment.
@@ -1618,6 +1631,8 @@ def terminal_tool(
         notify_on_complete: If True and background=True, you'll be notified exactly once when the process exits. The right choice for almost every long task. MUTUALLY EXCLUSIVE with watch_patterns.
         watch_patterns: List of strings to watch for in background output. HARD rate limit: 1 notification per 15s per process. After 3 strike windows in a row, watch_patterns is disabled and the session is auto-promoted to notify_on_complete. Use ONLY for rare, one-shot mid-process signals on long-lived processes (server readiness, migration-done markers). NEVER use in loops/batch jobs — error patterns there will hit the strike limit and get disabled. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both.
         purpose: Concise user-facing outcome this command is intended to achieve.
+        approval_plan: Exact commands requested under one administrator-reviewed intent.
+        intent_grant_id: Opaque grant returned after an approval_plan is approved.
 
     Returns:
         str: JSON string with output, exit_code, and error fields
@@ -1786,14 +1801,41 @@ def terminal_tool(
                         env = new_env
                     logger.info("%s environment ready for task %s", env_type, effective_task_id[:8])
 
+        # Validate and resolve the execution directory before asking an
+        # administrator to approve it. The exact resolved value is part of an
+        # intent grant, so a later cwd change cannot broaden the approval.
+        if workdir:
+            workdir_error = _validate_workdir(workdir)
+            if workdir_error:
+                logger.warning("Blocked dangerous workdir: %s (command: %s)",
+                               workdir[:200], _safe_command_preview(command))
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": workdir_error,
+                    "status": "blocked"
+                }, ensure_ascii=False)
+        effective_cwd = _resolve_command_cwd(
+            workdir=workdir,
+            env=env,
+            default_cwd=cwd,
+        ) or ""
+
         # Pre-exec security checks (tirith + dangerous command detection)
         # Skip check if force=True (user has confirmed they want to run it)
         approval_note = None
+        approval_metadata = {}
         if not force:
-            approval = (
-                _check_all_guards(command, env_type, purpose=purpose)
-                if purpose
-                else _check_all_guards(command, env_type)
+            guard_kwargs = {
+                "purpose": purpose,
+                "workdir": effective_cwd,
+                "approval_plan": approval_plan,
+                "intent_grant_id": intent_grant_id,
+            }
+            approval = _check_all_guards(
+                command,
+                env_type,
+                **guard_kwargs,
             )
             if not approval["approved"]:
                 # Check if this is an approval_required (gateway ask mode)
@@ -1827,19 +1869,14 @@ def terminal_tool(
             elif approval.get("smart_approved"):
                 desc = approval.get("description", "flagged as dangerous")
                 approval_note = f"Command was flagged ({desc}) and auto-approved by smart approval."
-
-        # Validate workdir against shell injection
-        if workdir:
-            workdir_error = _validate_workdir(workdir)
-            if workdir_error:
-                logger.warning("Blocked dangerous workdir: %s (command: %s)",
-                               workdir[:200], _safe_command_preview(command))
-                return json.dumps({
-                    "output": "",
-                    "exit_code": -1,
-                    "error": workdir_error,
-                    "status": "blocked"
-                }, ensure_ascii=False)
+            for key in (
+                "intent_grant_id",
+                "intent_grant_remaining",
+                "intent_grant_expires_in_seconds",
+                "intent_grant_used",
+            ):
+                if key in approval:
+                    approval_metadata[key] = approval[key]
 
         # Prepare command for execution
         pty_disabled_reason = None
@@ -1861,11 +1898,6 @@ def terminal_tool(
             from tools.process_registry import process_registry
 
             session_key = get_current_session_key(default="")
-            effective_cwd = _resolve_command_cwd(
-                workdir=workdir,
-                env=env,
-                default_cwd=cwd,
-            )
             try:
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
@@ -1894,6 +1926,7 @@ def terminal_tool(
                 }
                 if approval_note:
                     result_data["approval"] = approval_note
+                result_data.update(approval_metadata)
                 if pty_disabled_reason:
                     result_data["pty_note"] = pty_disabled_reason
 
@@ -2067,11 +2100,13 @@ def terminal_tool(
 
                 return json.dumps(result_data, ensure_ascii=False)
             except Exception as e:
-                return json.dumps({
+                error_result = {
                     "output": "",
                     "exit_code": -1,
                     "error": f"Failed to start background process: {str(e)}"
-                }, ensure_ascii=False)
+                }
+                error_result.update(approval_metadata)
+                return json.dumps(error_result, ensure_ascii=False)
         else:
             # Run foreground command with retry logic
             max_retries = 3
@@ -2082,21 +2117,19 @@ def terminal_tool(
                 try:
                     execute_kwargs = {
                         "timeout": effective_timeout,
-                        "cwd": _resolve_command_cwd(
-                            workdir=workdir,
-                            env=env,
-                            default_cwd=cwd,
-                        ),
+                        "cwd": effective_cwd,
                     }
                     result = env.execute(command, **execute_kwargs)
                 except Exception as e:
                     error_str = str(e).lower()
                     if "timeout" in error_str:
-                        return json.dumps({
+                        timeout_result = {
                             "output": "",
                             "exit_code": 124,
                             "error": f"Command timed out after {effective_timeout} seconds"
-                        }, ensure_ascii=False)
+                        }
+                        timeout_result.update(approval_metadata)
+                        return json.dumps(timeout_result, ensure_ascii=False)
                     
                     # Retry on transient errors
                     if retry_count < max_retries:
@@ -2109,11 +2142,13 @@ def terminal_tool(
                     
                     logger.error("Execution failed after %d retries - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
                                  max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
-                    return json.dumps({
+                    execution_error = {
                         "output": "",
                         "exit_code": -1,
                         "error": f"Command execution failed: {type(e).__name__}: {str(e)}"
-                    }, ensure_ascii=False)
+                    }
+                    execution_error.update(approval_metadata)
+                    return json.dumps(execution_error, ensure_ascii=False)
                 
                 # Got a result
                 break
@@ -2179,6 +2214,7 @@ def terminal_tool(
             }
             if approval_note:
                 result_dict["approval"] = approval_note
+            result_dict.update(approval_metadata)
             if exit_note:
                 result_dict["exit_code_meaning"] = exit_note
 
@@ -2331,6 +2367,36 @@ TERMINAL_SCHEMA = {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "Strings to watch for in background process output. HARD RATE LIMIT: at most 1 notification per 15 seconds per process — matches arriving inside the cooldown are dropped. After 3 consecutive 15-second windows with dropped matches, watch_patterns is automatically disabled for that process and promoted to notify_on_complete behavior (one notification on exit, no more mid-process spam). USE ONLY for truly rare, one-shot mid-process signals on LONG-LIVED processes that will never exit on their own — e.g. ['Application startup complete'] on a server so you know when to hit its endpoint, or ['migration done'] on a daemon. DO NOT use for: (1) end-of-run markers like 'DONE'/'PASS' — use notify_on_complete instead; (2) error patterns like 'ERROR'/'Traceback' in loops or multi-item batch jobs — they fire on every iteration and you'll hit the strike limit fast; (3) anything you'd ever combine with notify_on_complete. When in doubt, choose notify_on_complete. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both."
+            },
+            "approval_plan": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 12,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "minLength": 1},
+                        "workdir": {
+                            "type": "string",
+                            "description": "Exact working directory for this planned command. Defaults to the current command directory."
+                        },
+                    },
+                    "required": ["command"],
+                },
+                "description": (
+                    "Complete exact command plan for this intent. When administrator "
+                    "approval is required, all commands are shown together and approval "
+                    "returns an intent_grant_id for the remaining exact commands. Include "
+                    "only commands you expect to execute; changed or additional commands "
+                    "require a new approval."
+                ),
+            },
+            "intent_grant_id": {
+                "type": "string",
+                "description": (
+                    "Opaque session-bound grant returned by an approved approval_plan. "
+                    "Pass it unchanged on the next exact planned command; never invent one."
+                ),
             }
         },
         "required": ["purpose", "command"]
@@ -2349,6 +2415,8 @@ def _handle_terminal(args, **kw):
         notify_on_complete=args.get("notify_on_complete", False),
         watch_patterns=args.get("watch_patterns"),
         purpose=args.get("purpose", ""),
+        approval_plan=args.get("approval_plan"),
+        intent_grant_id=args.get("intent_grant_id", ""),
     )
 
 
