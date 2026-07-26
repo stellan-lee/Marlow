@@ -2191,3 +2191,78 @@ a separate scoped change.
 - Related Files: tests/gateway/test_feishu.py, gateway/platforms/feishu.py
 
 ---
+
+## [ERR-20260725-001] telegram-approval-html-test
+
+**Logged**: 2026-07-25T00:00:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tests
+
+### Summary
+
+The intent-first Telegram approval test expected raw command quotes even though
+the adapter correctly HTML-escapes all dynamic content.
+
+### Error
+
+```
+AssertionError: raw command was not found in the HTML approval message
+```
+
+### Context
+
+- The rendered command contained `&#x27;` instead of a literal single quote.
+- The escaping is required to prevent Telegram HTML markup injection.
+
+### Suggested Fix
+
+Compare against the standard-library HTML-escaped command.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: tests/gateway/test_telegram_approval_buttons.py
+
+### Resolution
+
+- **Resolved**: 2026-07-25T00:00:00+08:00
+- **Notes**: Updated the assertion to use `html.escape()`.
+
+---
+
+## [ERR-20260725-002] mcp-tool-collection-baseline
+
+**Logged**: 2026-07-25T00:00:00+08:00
+**Priority**: medium
+**Status**: pending
+**Area**: tests
+
+### Summary
+
+The MCP tool suite does not collect because its compatibility type is not
+exported by the current `tools.mcp_tool` module.
+
+### Error
+
+```
+ImportError: cannot import name 'CreateMessageResultWithTools' from 'tools.mcp_tool'
+```
+
+### Context
+
+- Encountered while running broader tool-schema compatibility validation.
+- The terminal-intent change does not modify MCP code or its tests.
+- The remaining model-tool, toolset, registry, and transport suites passed.
+
+### Suggested Fix
+
+Reconcile the MCP SDK compatibility import and module export in a separately
+scoped change.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: tools/mcp_tool.py, tests/tools/test_mcp_tool.py
+
+---

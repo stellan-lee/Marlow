@@ -1457,8 +1457,13 @@ def request_admin_approval(
     return request_action_intent_approval(intent)
 
 
-def check_all_command_guards(command: str, env_type: str,
-                             approval_callback=None) -> dict:
+def check_all_command_guards(
+    command: str,
+    env_type: str,
+    approval_callback=None,
+    *,
+    purpose: str = "",
+) -> dict:
     """Run all pre-exec security checks and return a single approval decision.
 
     Gathers findings from tirith and dangerous-command detection, then
@@ -1579,6 +1584,36 @@ def check_all_command_guards(command: str, env_type: str,
     if not warnings:
         return {"approved": True, "message": None}
 
+    normalized_purpose = str(purpose or "").strip()
+    if admin_enforced and not normalized_purpose:
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: Administrator approval requires a clear terminal "
+                "purpose. Retry the terminal call with a concise user-facing "
+                "outcome in the purpose field; do not merely restate the command."
+            ),
+            "description": "terminal purpose is required for administrator approval",
+            "outcome": "missing_purpose",
+        }
+
+    review_purpose = normalized_purpose
+    if admin_enforced:
+        try:
+            from agent.redact import redact_sensitive_text
+
+            review_purpose = redact_sensitive_text(normalized_purpose, force=True)
+        except Exception:
+            return {
+                "approved": False,
+                "message": (
+                    "BLOCKED: Terminal purpose could not be safely prepared for "
+                    "administrator review. Do not retry with secrets in purpose."
+                ),
+                "description": "terminal purpose redaction failed",
+                "outcome": "purpose_redaction_failed",
+            }
+
     # --- Phase 2.5: Smart approval (auxiliary LLM risk assessment) ---
     # When approvals.mode=smart, ask the aux LLM before prompting the user.
     # Inspired by OpenAI Codex's Smart Approvals guardian subagent
@@ -1638,16 +1673,24 @@ def check_all_command_guards(command: str, env_type: str,
 
                 terminal_intent = build_action_intent(
                     tool_name="terminal",
-                    args={"command": command, "environment": env_type},
+                    args={
+                        "purpose": normalized_purpose,
+                        "command": command,
+                        "environment": env_type,
+                    },
                     builder={
                         "action_type": "terminal.execute",
-                        "operation": "execute terminal command",
+                        "operation": review_purpose,
                         "target": f"{env_type} terminal environment",
                         "reason": combined_desc,
                         "impact": (
                             "The command was flagged as capable of changing "
                             "or damaging system state."
                         ),
+                        "parameters": {
+                            "command": command,
+                            "environment": env_type,
+                        },
                     },
                 )
                 if terminal_intent is None:  # static builders never skip

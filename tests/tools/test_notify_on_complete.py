@@ -260,6 +260,16 @@ class TestCheckpointNotify:
 # =========================================================================
 
 class TestTerminalSchema:
+    def test_schema_requires_user_facing_purpose(self):
+        from tools.terminal_tool import TERMINAL_SCHEMA
+
+        params = TERMINAL_SCHEMA["parameters"]
+        assert params["required"] == ["purpose", "command"]
+        assert params["properties"]["purpose"]["minLength"] == 1
+        assert "goal, not the shell syntax" in params["properties"]["purpose"][
+            "description"
+        ]
+
     def test_schema_has_notify_on_complete(self):
         from tools.terminal_tool import TERMINAL_SCHEMA
         props = TERMINAL_SCHEMA["parameters"]["properties"]
@@ -277,6 +287,21 @@ class TestTerminalSchema:
             )
             _, kwargs = mock_tt.call_args
             assert kwargs["notify_on_complete"] is True
+
+    def test_handler_passes_purpose(self):
+        from tools.terminal_tool import _handle_terminal
+
+        with patch("tools.terminal_tool.terminal_tool", return_value='{"ok":true}') as mock_tt:
+            _handle_terminal(
+                {
+                    "purpose": "Inspect the active deployment",
+                    "command": "kubectl get deployment backend",
+                },
+                task_id="t1",
+            )
+
+        _, kwargs = mock_tt.call_args
+        assert kwargs["purpose"] == "Inspect the active deployment"
 
 
 # =========================================================================

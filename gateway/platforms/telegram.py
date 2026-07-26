@@ -111,6 +111,57 @@ _CLARIFY_APPROVE_LABELS = {"approve", "approved", "yes", "allow", "accept", "con
 _CLARIFY_DENY_LABELS = {"deny", "denied", "no", "reject", "decline", "cancel"}
 
 
+def _format_terminal_action_intent_html(
+    *,
+    title: str,
+    action_intent: Dict[str, Any],
+    description: str,
+) -> Optional[str]:
+    """Render an intent-first terminal approval card, or return no override."""
+    if action_intent.get("action_type") != "terminal.execute":
+        return None
+
+    operation = str(action_intent.get("operation") or "").strip()
+    target = str(action_intent.get("target") or "").strip()
+    reason = str(action_intent.get("reason") or "").strip()
+    impact = str(action_intent.get("impact") or "").strip()
+    parameters = action_intent.get("parameters")
+    if not operation or not isinstance(parameters, dict):
+        return None
+
+    command = parameters.get("command")
+    environment = parameters.get("environment")
+    if not isinstance(command, str) or not command:
+        return None
+
+    command_preview = command[:2800] + "..." if len(command) > 2800 else command
+    origin = next(
+        (
+            line.removeprefix("Origin:").strip()
+            for line in description.splitlines()
+            if line.startswith("Origin:")
+        ),
+        "",
+    )
+
+    sections = [
+        f"⚠️ <b>{_html.escape(title)}</b>",
+        f"<b>Intent</b>\n{_html.escape(operation)}",
+    ]
+    if target:
+        sections.append(f"<b>Target:</b> {_html.escape(target)}")
+    if reason:
+        sections.append(f"<b>Approval trigger:</b> {_html.escape(reason)}")
+    if impact:
+        sections.append(f"<b>Impact:</b> {_html.escape(impact)}")
+    sections.append(f"<b>Command</b>\n<pre>{_html.escape(command_preview)}</pre>")
+    if environment:
+        sections.append(f"<b>Environment:</b> {_html.escape(str(environment))}")
+    if origin:
+        sections.append(f"<b>Origin:</b> {_html.escape(origin)}")
+    return "\n\n".join(sections)
+
+
 def _telegram_clarify_decision_indices(choices: Optional[list]) -> Optional[tuple[int, int]]:
     """Return approve/deny choice indexes for a two-choice decision prompt.
 
@@ -2748,6 +2799,7 @@ class TelegramAdapter(BasePlatformAdapter):
         authorized_user_id: str = "",
         binary: bool = False,
         title: str = "Command Approval Required",
+        action_intent: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send an inline-keyboard approval prompt with interactive buttons.
 
@@ -2758,12 +2810,22 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
-            cmd_preview = command[:3800] + "..." if len(command) > 3800 else command
             text = (
-                f"⚠️ <b>{_html.escape(title)}</b>\n\n"
-                f"<pre>{_html.escape(cmd_preview)}</pre>\n\n"
-                f"Reason: {_html.escape(description)}"
+                _format_terminal_action_intent_html(
+                    title=title,
+                    action_intent=action_intent,
+                    description=description,
+                )
+                if isinstance(action_intent, dict)
+                else None
             )
+            if text is None:
+                cmd_preview = command[:3800] + "..." if len(command) > 3800 else command
+                text = (
+                    f"⚠️ <b>{_html.escape(title)}</b>\n\n"
+                    f"<pre>{_html.escape(cmd_preview)}</pre>\n\n"
+                    f"Reason: {_html.escape(description)}"
+                )
 
             # Resolve thread context for thread replies
             thread_id = self._metadata_thread_id(metadata)

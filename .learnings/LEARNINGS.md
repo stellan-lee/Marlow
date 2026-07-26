@@ -224,8 +224,8 @@ code against retained consumers before deleting it.
 ## [LRN-20260719-001] correction
 
 **Logged**: 2026-07-19T08:57:28Z
-**Priority**: medium
-**Status**: pending
+**Priority**: high
+**Status**: resolved
 **Area**: backend
 
 ### Summary
@@ -241,16 +241,31 @@ administrator-level intent. A routine terminal command can be promoted to a
 structured action intent by central enforcement, creating an admin-routed
 decision whose content still represents an ordinary command.
 
+This recurred on 2026-07-25 when a presentation-only fix made the command more
+prominent instead of correcting the missing semantic intention at the terminal
+tool boundary.
+
 ### Suggested Action
 
 When explaining approval behavior, separately identify (1) who is authorized
 to decide, (2) what semantic object is being approved, and (3) why that object
 was escalated. Treat raw structured-intent rendering as a separate UX concern.
+Require terminal requests to carry a user-facing intended outcome before an
+administrator approval can be created; bind that intention and the exact tool
+arguments in the same request, and render the command only as supporting
+evidence.
 
 ### Metadata
 
 - Source: user_feedback
 - Related Files: tools/registry.py, tools/action_intent.py, tools/approval.py, gateway/run.py
 - Tags: approvals, admin-routing, action-intent, semantics, ux
+
+### Resolution
+
+- **Resolved**: 2026-07-25T00:00:00+08:00
+- **Notes**: Terminal calls now declare a request-bound purpose; admin-routed
+  warnings fail closed without one, and Telegram renders the semantic intention
+  before the supporting redacted command.
 
 ---

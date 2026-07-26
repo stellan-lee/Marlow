@@ -40,6 +40,10 @@ configured platform must be connected when a request is sent.
 
 - Dangerous terminal commands and gateway `execute_code` requests are wrapped
   as `terminal.execute` and `code.execute` action intents automatically.
+  Terminal calls declare a concise user-facing `purpose`; that intended outcome
+  becomes the approval operation and is bound to the exact command and
+  environment. An admin-routed terminal warning without a purpose fails closed
+  before any approval card is sent.
 - Any built-in or plugin tool registered with `action_intent` is intercepted at
   central dispatch. Approval and execution happen in one call stack, so the
   approved arguments cannot be replaced before the handler runs.
@@ -117,7 +121,9 @@ def database_intent(args):
     }
 ```
 
-The approval card renders the semantic intent as labeled text plus a SHA-256
-digest bound to the original tool name and unredacted arguments. The structured
-intent remains attached to approval hooks, while display parameters are
-secret-redacted before being sent to the messaging adapter.
+The approval request binds the semantic intent to a SHA-256 digest of the
+original tool name and unredacted arguments. Telegram renders terminal
+approvals with the intended outcome first and the secret-redacted command as
+supporting evidence. The structured intent remains attached to approval hooks,
+while display parameters are secret-redacted before being sent to any messaging
+adapter.

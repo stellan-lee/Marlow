@@ -2,6 +2,7 @@
 
 import os
 import sys
+from html import escape
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -104,6 +105,48 @@ class TestTelegramExecApproval:
         assert "rm -rf /important" in kwargs["text"]
         assert "dangerous deletion" in kwargs["text"]
         assert kwargs["reply_markup"] is not None  # InlineKeyboardMarkup
+
+    @pytest.mark.asyncio
+    async def test_terminal_action_intent_is_rendered_intent_first(self):
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(return_value=MagicMock(message_id=43))
+        command = "kubectl logs deployment/backend | python3 -c 'print(1)'"
+        intent = {
+            "action_type": "terminal.execute",
+            "operation": "Inspect backend logs and extract collection timing values",
+            "target": "local terminal environment",
+            "reason": "script execution via -e/-c flag",
+            "impact": "The command may change or damage system state.",
+            "parameters": {"command": command, "environment": "local"},
+        }
+
+        result = await adapter.send_exec_approval(
+            chat_id="12345",
+            command="legacy formatted summary",
+            session_key="requester-session",
+            description=(
+                "script execution via -e/-c flag\n"
+                "Impact: The command may change or damage system state.\n"
+                "Origin: platform=telegram, chat=99, requester=42"
+            ),
+            request_id="request-123",
+            authorized_user_id="777",
+            binary=True,
+            title="Action Approval Required",
+            action_intent=intent,
+        )
+
+        assert result.success is True
+        text = adapter._bot.send_message.call_args.kwargs["text"]
+        assert "<b>Intent</b>" in text
+        assert intent["operation"] in text
+        assert f"<b>Command</b>\n<pre>{escape(command)}</pre>" in text
+        assert text.index("<b>Intent</b>") < text.index("<b>Command</b>")
+        assert "<b>Approval trigger:</b> script execution via -e/-c flag" in text
+        assert "<b>Environment:</b> local" in text
+        assert "<b>Origin:</b> platform=telegram, chat=99, requester=42" in text
+        assert "legacy formatted summary" not in text
+        assert "Request digest:" not in text
 
     @pytest.mark.asyncio
     async def test_stores_approval_state(self):

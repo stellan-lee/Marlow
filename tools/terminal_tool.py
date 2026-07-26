@@ -208,10 +208,14 @@ from tools.approval import (
 )
 
 
-def _check_all_guards(command: str, env_type: str) -> dict:
+def _check_all_guards(command: str, env_type: str, *, purpose: str = "") -> dict:
     """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
-    return _check_all_guards_impl(command, env_type,
-                                  approval_callback=_get_approval_callback())
+    return _check_all_guards_impl(
+        command,
+        env_type,
+        approval_callback=_get_approval_callback(),
+        purpose=purpose,
+    )
 
 
 # Allowlist: characters that can legitimately appear in directory paths.
@@ -1598,6 +1602,7 @@ def terminal_tool(
     pty: bool = False,
     notify_on_complete: bool = False,
     watch_patterns: Optional[List[str]] = None,
+    purpose: str = "",
 ) -> str:
     """
     Execute a command in the configured terminal environment.
@@ -1612,6 +1617,7 @@ def terminal_tool(
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
         notify_on_complete: If True and background=True, you'll be notified exactly once when the process exits. The right choice for almost every long task. MUTUALLY EXCLUSIVE with watch_patterns.
         watch_patterns: List of strings to watch for in background output. HARD rate limit: 1 notification per 15s per process. After 3 strike windows in a row, watch_patterns is disabled and the session is auto-promoted to notify_on_complete. Use ONLY for rare, one-shot mid-process signals on long-lived processes (server readiness, migration-done markers). NEVER use in loops/batch jobs — error patterns there will hit the strike limit and get disabled. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both.
+        purpose: Concise user-facing outcome this command is intended to achieve.
 
     Returns:
         str: JSON string with output, exit_code, and error fields
@@ -1784,7 +1790,11 @@ def terminal_tool(
         # Skip check if force=True (user has confirmed they want to run it)
         approval_note = None
         if not force:
-            approval = _check_all_guards(command, env_type)
+            approval = (
+                _check_all_guards(command, env_type, purpose=purpose)
+                if purpose
+                else _check_all_guards(command, env_type)
+            )
             if not approval["approved"]:
                 # Check if this is an approval_required (gateway ask mode)
                 if approval.get("status") == "pending_approval":
@@ -2279,6 +2289,16 @@ TERMINAL_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
+            "purpose": {
+                "type": "string",
+                "minLength": 1,
+                "description": (
+                    "Concise user-facing outcome this command is intended to achieve. "
+                    "Describe the goal, not the shell syntax (for example, 'Inspect "
+                    "recent backend logs and extract collection timing values'). This "
+                    "intention is shown to an administrator if approval is required."
+                ),
+            },
             "command": {
                 "type": "string",
                 "description": "The command to execute on the VM"
@@ -2313,7 +2333,7 @@ TERMINAL_SCHEMA = {
                 "description": "Strings to watch for in background process output. HARD RATE LIMIT: at most 1 notification per 15 seconds per process — matches arriving inside the cooldown are dropped. After 3 consecutive 15-second windows with dropped matches, watch_patterns is automatically disabled for that process and promoted to notify_on_complete behavior (one notification on exit, no more mid-process spam). USE ONLY for truly rare, one-shot mid-process signals on LONG-LIVED processes that will never exit on their own — e.g. ['Application startup complete'] on a server so you know when to hit its endpoint, or ['migration done'] on a daemon. DO NOT use for: (1) end-of-run markers like 'DONE'/'PASS' — use notify_on_complete instead; (2) error patterns like 'ERROR'/'Traceback' in loops or multi-item batch jobs — they fire on every iteration and you'll hit the strike limit fast; (3) anything you'd ever combine with notify_on_complete. When in doubt, choose notify_on_complete. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both."
             }
         },
-        "required": ["command"]
+        "required": ["purpose", "command"]
     }
 }
 
@@ -2328,6 +2348,7 @@ def _handle_terminal(args, **kw):
         pty=args.get("pty", False),
         notify_on_complete=args.get("notify_on_complete", False),
         watch_patterns=args.get("watch_patterns"),
+        purpose=args.get("purpose", ""),
     )
 
 

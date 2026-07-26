@@ -16826,6 +16826,10 @@ class GatewayRunner:
                                 "binary": binary,
                                 "title": title,
                             })
+                        if _accepts_extra or "action_intent" in _send_params:
+                            _send_kwargs["action_intent"] = approval_data.get(
+                                "action_intent"
+                            )
                         _approval_fut = safe_schedule_threadsafe(
                             _send_approval(**_send_kwargs),
                             _loop_for_step,

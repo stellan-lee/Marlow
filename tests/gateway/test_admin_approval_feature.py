@@ -253,8 +253,12 @@ class TestAdminApprovalQueue:
 
     def test_admin_route_overrides_mode_off_yolo_and_prior_grants(self):
         from tools import approval
+        from tools.action_intent import argument_digest
 
         session_key = "agent:main:telegram:dm:user"
+        secret = "sk-test1234567890"
+        purpose = f"Remove the temporary admin approval fixture using {secret}"
+        command = "rm -rf /tmp/admin-approval-test"
         token = approval.set_current_session_key(session_key)
         approval.enable_session_yolo(session_key)
         _, pattern_key, _ = approval.detect_dangerous_command(
@@ -289,8 +293,9 @@ class TestAdminApprovalQueue:
                 ),
             ):
                 result = approval.check_all_command_guards(
-                    "rm -rf /tmp/admin-approval-test",
+                    command,
                     "local",
+                    purpose=purpose,
                 )
         finally:
             approval.unregister_gateway_notify(session_key)
@@ -302,8 +307,19 @@ class TestAdminApprovalQueue:
         assert len(seen) == 1
         assert seen[0]["kind"] == "action_intent"
         assert seen[0]["action_intent"]["action_type"] == "terminal.execute"
-        assert seen[0]["action"].startswith("Action: execute terminal command")
+        assert seen[0]["action_intent"]["operation"] == (
+            "Remove the temporary admin approval fixture using ***"
+        )
+        assert secret not in seen[0]["action"]
+        assert seen[0]["action"].startswith(
+            "Action: Remove the temporary admin approval fixture using ***"
+        )
+        assert "Action: execute terminal command" not in seen[0]["action"]
         assert not seen[0]["action"].lstrip().startswith("{")
+        assert seen[0]["action_intent"]["argument_digest"] == argument_digest(
+            "terminal",
+            {"purpose": purpose, "command": command, "environment": "local"},
+        )
         assert "Impact: The command was flagged as capable of changing" in seen[0][
             "description"
         ]
@@ -373,12 +389,46 @@ class TestAdminApprovalQueue:
                 result = approval.check_all_command_guards(
                     "rm -rf /tmp/admin-review-required",
                     "local",
+                    purpose="Remove the temporary review fixture",
                 )
         finally:
             approval.reset_current_session_key(token)
 
         assert result["approved"] is False
         assert result["approval_pending"] is True
+
+    def test_admin_terminal_approval_without_purpose_fails_before_notification(self):
+        from tools import approval
+
+        session_key = "agent:main:telegram:dm:user"
+        notified = []
+        token = approval.set_current_session_key(session_key)
+        approval.register_gateway_notify(session_key, lambda payload: notified.append(payload))
+        try:
+            with (
+                patch.object(approval, "_is_gateway_approval_context", return_value=True),
+                patch.object(
+                    approval,
+                    "_get_approval_config",
+                    return_value={"mode": "manual", "admin": {"enabled": True}},
+                ),
+                patch(
+                    "tools.tirith_security.check_command_security",
+                    return_value={"action": "allow", "findings": [], "summary": ""},
+                ),
+            ):
+                result = approval.check_all_command_guards(
+                    "rm -rf /tmp/admin-review-required",
+                    "local",
+                )
+        finally:
+            approval.unregister_gateway_notify(session_key)
+            approval.reset_current_session_key(token)
+
+        assert result["approved"] is False
+        assert result["outcome"] == "missing_purpose"
+        assert "purpose field" in result["message"]
+        assert notified == []
 
 
 class TestAdminApprovalRouting:
