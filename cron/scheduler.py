@@ -1752,6 +1752,31 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
         return 0
 
     try:
+        # Memory consolidation is a daily, config-gated backend pass.  Keep
+        # it inside the scheduler lock so concurrent ticks cannot process the
+        # same profile scope twice; failures remain isolated from cron jobs.
+        try:
+            _consolidation_cfg = load_config() or {}
+            _memory_settings = _consolidation_cfg.get("memory", {}) if isinstance(_consolidation_cfg, dict) else {}
+            _consolidation_settings = _memory_settings.get("consolidation", {}) if isinstance(_memory_settings, dict) else {}
+            if isinstance(_consolidation_settings, dict) and _consolidation_settings.get("enabled"):
+                from agent.memory_consolidation_runner import run_configured_consolidation
+                from agent.memory_consolidation import MemoryConsolidationStore
+                from marlow_constants import get_marlow_home
+                _consolidation_db = str((get_marlow_home() / "memory_consolidation.db").resolve())
+                with MemoryConsolidationStore(_consolidation_db) as _consolidation_store:
+                    _scopes = _consolidation_store.scopes_with_evidence()
+                for _scope_type, _scope_id in _scopes:
+                    _consolidation_result = run_configured_consolidation(
+                        config=_consolidation_cfg,
+                        scope_id=_scope_id,
+                        scope_type=_scope_type,
+                        state_db_path=_consolidation_db,
+                    )
+                    logger.info("memory consolidation scope_type=%s status=%s run_id=%s", _scope_type, _consolidation_result.status, _consolidation_result.run_id or "-")
+        except Exception as _consolidation_error:
+            logger.warning("memory consolidation tick failed: %s", type(_consolidation_error).__name__)
+
         due_jobs = get_due_jobs()
 
         if verbose and not due_jobs:
