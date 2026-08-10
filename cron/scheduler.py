@@ -17,6 +17,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from contextlib import contextmanager
 
 import fcntl
@@ -1774,6 +1775,32 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                         state_db_path=_consolidation_db,
                     )
                     logger.info("memory consolidation scope_type=%s status=%s run_id=%s", _scope_type, _consolidation_result.status, _consolidation_result.run_id or "-")
+                    _verification_day = int(_consolidation_settings.get("weekly_verification_day", 0)) % 7
+                    _now_epoch = time.time()
+                    with MemoryConsolidationStore(_consolidation_db) as _verification_store:
+                        _last_verification = _verification_store.last_verification_at(_scope_id, _scope_type)
+                    if (
+                        _consolidation_settings.get("weekly_verification_enabled", True)
+                        and _marlow_now().weekday() == _verification_day
+                        and (_last_verification is None or _now_epoch - _last_verification >= 6.5 * 86400)
+                    ):
+                        from agent.memory_consolidation_runner import (
+                            MemoryConsolidationStoreRepository,
+                            WeeklyVerificationRunner,
+                        )
+                        with MemoryConsolidationStore(_consolidation_db) as _verification_store:
+                            _verification_repo = MemoryConsolidationStoreRepository(
+                                _verification_store, scope_id=_scope_id, scope_type=_scope_type
+                            )
+                            _verification_result = WeeklyVerificationRunner(
+                                _verification_repo,
+                                enabled=True,
+                                apply=bool(_consolidation_settings.get("weekly_verification_apply", False)),
+                            ).run(scope_id=_scope_id, scope_type=_scope_type)
+                        if _verification_result.status in {"observed", "committed"}:
+                            with MemoryConsolidationStore(_consolidation_db) as _verification_store:
+                                _verification_store.record_verification_run(_scope_id, _scope_type, _now_epoch)
+                        logger.info("memory weekly verification scope_type=%s status=%s flagged=%d", _scope_type, _verification_result.status, _verification_result.flagged)
         except Exception as _consolidation_error:
             logger.warning("memory consolidation tick failed: %s", type(_consolidation_error).__name__)
 

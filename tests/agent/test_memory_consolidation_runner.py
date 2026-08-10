@@ -2,11 +2,16 @@ from datetime import datetime, timedelta, timezone
 
 from agent.memory_consolidation_runner import (
     CandidateExtractor,
+    ConsolidationMetrics,
+    ConsolidationTracer,
     ConsolidationPlanner,
     ConsolidationRunner,
     ConsolidationSchedule,
     EvidenceEvent,
+    LlmCandidateExtractor,
+    LlmConsolidationPlanner,
     MemoryConsolidationStoreRepository,
+    WeeklyVerificationRunner,
     append_conversation_evidence,
 )
 from agent.memory_consolidation import MemoryConsolidationStore
@@ -50,6 +55,65 @@ def test_extractor_is_deterministic_and_requires_evidence():
     assert first[0].confidence == 1.0
 
 
+def test_llm_extractor_enforces_provenance_and_scope_with_mocked_structured_call():
+    calls = []
+
+    def structured_call(**kwargs):
+        calls.append(kwargs)
+        return {"parsed": {"candidates": [
+            {"content": "Use American English", "evidence_ids": ["evt-1"], "origin": "explicit", "confidence": 0.98},
+            # Unknown and cross-scope IDs are rejected deterministically.
+            {"content": "forged", "evidence_ids": ["missing"], "origin": "inferred", "confidence": 1.0},
+        ]}}
+
+    event = EvidenceEvent("evt-1", "Use American English", scope_type="user", scope_id="u1", origin="explicit")
+    candidates = LlmCandidateExtractor(llm_call=structured_call).extract([event])
+    assert len(candidates) == 1
+    assert candidates[0].scope_type == "user"
+    assert candidates[0].scope_id == "u1"
+    assert candidates[0].evidence_ids == ("evt-1",)
+    assert candidates[0].id.startswith("candidate_")
+    assert calls and calls[0]["json_schema"]["required"] == ["candidates"]
+
+
+def test_llm_extractor_bounded_failure_degrades_to_empty_noop():
+    calls = []
+
+    def broken(**kwargs):
+        calls.append(kwargs)
+        raise RuntimeError("provider unavailable")
+
+    result = LlmCandidateExtractor(llm_call=broken, max_retries=2).extract([EvidenceEvent("evt-1", "fact")])
+    assert result == []
+    assert len(calls) == 3
+
+
+def test_llm_planner_only_targets_known_matches_and_preserves_candidate_id():
+    def structured_call(**kwargs):
+        return {"parsed": {
+            "operation": "REINFORCE", "candidate_id": "model-forged", "target_memory_ids": ["mem-1"],
+            "result": {}, "confidence": 0.9, "reason": "confirmed",
+        }}
+
+    candidate = CandidateExtractor().extract([EvidenceEvent("evt-1", "fact")])[0]
+    planned = LlmConsolidationPlanner(llm_call=structured_call).plan(candidate, [{"id": "mem-1", "content": "fact"}])
+    assert planned.operation == "REINFORCE"
+    assert planned.candidate_id == candidate.id
+    assert planned.target_memory_ids == ("mem-1",)
+
+
+def test_llm_planner_unknown_target_is_noop():
+    def structured_call(**kwargs):
+        return {"parsed": {
+            "operation": "ARCHIVE", "candidate_id": "x", "target_memory_ids": ["not-allowed"],
+            "result": {}, "confidence": 0.9, "reason": "archive",
+        }}
+
+    candidate = CandidateExtractor().extract([EvidenceEvent("evt-1", "fact")])[0]
+    planned = LlmConsolidationPlanner(llm_call=structured_call).plan(candidate, [{"id": "mem-1", "content": "fact"}])
+    assert planned.operation == "NOOP"
+
+
 def test_runner_defaults_to_disabled_and_does_not_create_run():
     repo = FakeRepository([{"id": "evt-1", "content": "fact"}])
     result = ConsolidationRunner(repo).run(cutoff_watermark=10)
@@ -87,6 +151,20 @@ def test_runner_marks_failure_and_does_not_advance_on_repository_error():
     assert result.status == "failed"
     assert not repo.succeeded
     assert repo.failed and "db unavailable" in repo.failed[0][1]
+
+
+def test_runner_records_guard_rejection_metric():
+    class GuardRejected(FakeRepository):
+        def commit_consolidation(self, run, operations, cutoff):
+            raise ValueError("protected memory cannot be archived")
+
+    metrics = ConsolidationMetrics()
+    result = ConsolidationRunner(
+        GuardRejected([{"id": "evt-1", "content": "fact"}]),
+        enabled=True, dry_run=False, phase="safe", metrics=metrics,
+    ).run(cutoff_watermark=10)
+    assert result.status == "failed"
+    assert metrics.snapshot()["memory_guard_rejections_total"] == 1
 
 
 def test_schedule_is_default_off_and_daily_guard_prevents_duplicates():
@@ -140,3 +218,49 @@ def test_observe_plan_can_be_promoted_to_safe_commit(tmp_path):
         assert observed.status == "dry_run"
         assert committed.status == "committed"
         assert store.cursor("person_a") == 1
+
+
+def test_runner_emits_metrics_structured_log_and_spans(caplog):
+    caplog.set_level("INFO")
+    repo = FakeRepository([{"id": "evt-1", "content": "fact", "origin": "explicit"}])
+    metrics = ConsolidationMetrics()
+    tracer = ConsolidationTracer()
+    result = ConsolidationRunner(repo, enabled=True, dry_run=False, phase="safe", metrics=metrics, tracer=tracer).run(cutoff_watermark=10)
+    assert result.status == "committed"
+    assert metrics.snapshot()["memory_consolidation_runs_total"] == 1
+    assert metrics.snapshot()["memory_created_total"] == 1
+    assert {span["name"] for span in tracer.spans} >= {"collect_evidence", "extract_candidates", "match_memories", "plan_operations", "commit"}
+    assert "memory_consolidation_completed" in caplog.text
+
+
+def test_weekly_verification_flags_low_confidence_without_mutating(tmp_path):
+    path = (tmp_path / "state.db").resolve()
+    with MemoryConsolidationStore(path) as store:
+        event = store.append_evidence(scope_id="person_a", source_key="turn:1", content="I use vim.")
+        store.commit(scope_id="person_a", operations=[{"type": "create", "candidate": {"kind": "preference", "claim": "The preferred editor is emacs", "evidence_event_ids": [event["event_id"]]}}], end_seq=1)
+        repo = MemoryConsolidationStoreRepository(store, scope_id="person_a")
+        result = WeeklyVerificationRunner(repo, threshold=0.9).run(scope_id="person_a")
+        assert result.status == "observed"
+        assert result.selected == result.verified == 1
+        assert result.flagged == 1
+        assert result.proposals[0].operation == "FLAG_CONFLICT"
+        assert store.cursor("person_a") == 1
+
+
+def test_weekly_verification_can_use_guarded_commit(tmp_path):
+    path = (tmp_path / "state.db").resolve()
+    with MemoryConsolidationStore(path) as store:
+        event = store.append_evidence(scope_id="person_a", source_key="turn:1", content="I use vim.")
+        store.commit(scope_id="person_a", operations=[{"type": "create", "candidate": {"kind": "preference", "claim": "The preferred editor is emacs", "evidence_event_ids": [event["event_id"]]}}], end_seq=1)
+        repo = MemoryConsolidationStoreRepository(store, scope_id="person_a")
+        result = WeeklyVerificationRunner(repo, threshold=0.9, apply=True).run(scope_id="person_a")
+        assert result.status == "committed"
+        # The proposal is persisted through the same guarded operation path;
+        # no direct status mutation is performed by the verifier.
+        import sqlite3
+        with sqlite3.connect(path) as conn:
+            assert conn.execute("SELECT status FROM memory_items").fetchone()[0] == "conflicted"
+        flags = store.conflict_flags(scope_id="person_a")
+        assert len(flags) == 1
+        store.resolve_conflict_flag(flags[0]["flag_id"], scope_id="person_a")
+        assert store.conflict_flags(scope_id="person_a") == []

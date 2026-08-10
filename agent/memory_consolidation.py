@@ -78,9 +78,17 @@ class MemoryConsolidationStore:
             "CREATE TABLE IF NOT EXISTS memory_revisions (item_id TEXT NOT NULL, revision INTEGER NOT NULL, claim TEXT NOT NULL, evidence_json TEXT NOT NULL, candidate_key TEXT NOT NULL, created_at REAL NOT NULL, PRIMARY KEY(item_id, revision), FOREIGN KEY(item_id) REFERENCES memory_items(item_id) ON DELETE CASCADE)",
             "CREATE TABLE IF NOT EXISTS memory_sources (item_id TEXT NOT NULL, revision INTEGER NOT NULL, event_id TEXT NOT NULL, PRIMARY KEY(item_id, revision, event_id), FOREIGN KEY(item_id, revision) REFERENCES memory_revisions(item_id, revision) ON DELETE CASCADE, FOREIGN KEY(event_id) REFERENCES memory_events(event_id))",
             "CREATE TABLE IF NOT EXISTS memory_conflicts (left_item_id TEXT NOT NULL, right_item_id TEXT NOT NULL, scope_id TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('open','resolved')), created_at REAL NOT NULL, resolved_at REAL, CHECK(left_item_id < right_item_id), PRIMARY KEY(left_item_id, right_item_id), FOREIGN KEY(left_item_id) REFERENCES memory_items(item_id), FOREIGN KEY(right_item_id) REFERENCES memory_items(item_id))",
+            "CREATE TABLE IF NOT EXISTS memory_conflict_flags (flag_id TEXT PRIMARY KEY, scope_id TEXT NOT NULL, item_id TEXT NOT NULL, revision INTEGER NOT NULL, reason TEXT NOT NULL, evidence_json TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('open','resolved')), created_at REAL NOT NULL, resolved_at REAL, FOREIGN KEY(item_id) REFERENCES memory_items(item_id) ON DELETE CASCADE)",
             "CREATE TABLE IF NOT EXISTS memory_runs (run_id TEXT PRIMARY KEY, scope_id TEXT NOT NULL, start_seq INTEGER NOT NULL, end_seq INTEGER NOT NULL, status TEXT NOT NULL CHECK(status IN ('committed','observed','failed','rolled_back')), created_at REAL NOT NULL, committed_at REAL)",
             "CREATE TABLE IF NOT EXISTS memory_operations (operation_key TEXT PRIMARY KEY, run_id TEXT NOT NULL, scope_id TEXT NOT NULL, operation_json TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('proposed','committed')), created_at REAL NOT NULL, FOREIGN KEY(run_id) REFERENCES memory_runs(run_id))",
             "CREATE TABLE IF NOT EXISTS memory_index_outbox (operation_key TEXT PRIMARY KEY, scope_id TEXT NOT NULL, item_id TEXT NOT NULL, revision INTEGER NOT NULL, created_at REAL NOT NULL, delivered_at REAL, FOREIGN KEY(operation_key) REFERENCES memory_operations(operation_key))",
+            "CREATE TABLE IF NOT EXISTS memory_verification_runs (scope_id TEXT PRIMARY KEY, verified_at REAL NOT NULL)",
+            # Derived retrieval state.  ``memory_items`` and its revisions are
+            # authoritative; this table is disposable and can always be
+            # rebuilt from them.  Keeping it separate makes asynchronous
+            # index consumers safe around a committed memory transaction.
+            "CREATE TABLE IF NOT EXISTS memory_retrieval_index (item_id TEXT PRIMARY KEY, scope_id TEXT NOT NULL, revision INTEGER NOT NULL, claim TEXT NOT NULL, status TEXT NOT NULL, updated_at REAL NOT NULL, FOREIGN KEY(item_id) REFERENCES memory_items(item_id) ON DELETE CASCADE)",
+            "CREATE INDEX IF NOT EXISTS idx_memory_retrieval_index_scope ON memory_retrieval_index(scope_id, status, updated_at)",
         )
         for statement in statements: self._conn.execute(statement)
 
@@ -100,6 +108,70 @@ class MemoryConsolidationStore:
     def scopes_with_evidence(self) -> list[tuple[str, str]]:
         rows = self._conn.execute("SELECT DISTINCT scope_id FROM memory_events ORDER BY scope_id").fetchall()
         return [self.decode_scope_key(row[0]) for row in rows]
+
+    def select_memories_for_verification(self, *, scope_id: str, scope_type: str = "profile", limit: int = 100) -> list[dict[str, Any]]:
+        """Select important, still-readable memories for the weekly audit.
+
+        Protected and pinned memories are always preferred.  The remaining
+        slots are filled by recently modified active/conflicted memories so a
+        quiet profile is still periodically checked.
+        """
+        scope = self._scope_key(scope_type, scope_id)
+        rows = self._conn.execute(
+            """SELECT item_id, kind, status, retention_class, pinned, origin,
+                      confidence, current_revision, updated_at
+                 FROM memory_items
+                WHERE scope_id=? AND status IN ('active','conflicted')
+                ORDER BY CASE WHEN retention_class='protected' OR pinned=1 THEN 0 ELSE 1 END,
+                         updated_at DESC, item_id
+                LIMIT ?""",
+            (scope, max(1, int(limit))),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def load_memory_for_verification(self, *, scope_id: str, scope_type: str = "profile", item_id: str) -> dict[str, Any]:
+        """Load a current revision and all immutable source evidence."""
+        scope = self._scope_key(scope_type, scope_id)
+        item_key = self._id(item_id, "item_id")
+        row = self._conn.execute(
+            """SELECT i.item_id, i.scope_id, i.kind, i.status, i.retention_class,
+                      i.pinned, i.origin, i.confidence, i.current_revision,
+                      r.claim, r.evidence_json
+                 FROM memory_items i JOIN memory_revisions r
+                   ON r.item_id=i.item_id AND r.revision=i.current_revision
+                WHERE i.scope_id=? AND i.item_id=?""",
+            (scope, item_key),
+        ).fetchone()
+        if row is None:
+            raise ValueError("memory item not found in scope")
+        event_ids = json.loads(row["evidence_json"])
+        if not isinstance(event_ids, list):
+            raise ValueError("memory evidence is malformed")
+        evidence = [
+            dict(event)
+            for event in self._conn.execute(
+                "SELECT event_id, content, source_key, observed_at, created_at, metadata_json FROM memory_events WHERE scope_id=? AND event_id IN (%s) ORDER BY ingestion_seq" % ",".join("?" for _ in event_ids),
+                (scope, *event_ids),
+            ).fetchall()
+        ] if event_ids else []
+        result = dict(row)
+        result.pop("evidence_json", None)
+        result["evidence"] = evidence
+        return result
+
+    def memory_status_counts(self, *, scope_id: str, scope_type: str = "profile") -> dict[str, int]:
+        scope = self._scope_key(scope_type, scope_id)
+        rows = self._conn.execute("SELECT status, COUNT(*) FROM memory_items WHERE scope_id=? GROUP BY status", (scope,)).fetchall()
+        return {str(row[0]): int(row[1]) for row in rows}
+
+    def memories_without_evidence(self, *, scope_id: str, scope_type: str = "profile") -> int:
+        scope = self._scope_key(scope_type, scope_id)
+        return int(self._conn.execute(
+            """SELECT COUNT(*) FROM memory_items i
+                JOIN memory_revisions r ON r.item_id=i.item_id AND r.revision=i.current_revision
+                WHERE i.scope_id=? AND (r.evidence_json='[]' OR r.evidence_json IS NULL)""",
+            (scope,),
+        ).fetchone()[0])
 
     @staticmethod
     def _id(value: Any, name: str) -> str:
@@ -166,6 +238,130 @@ class MemoryConsolidationStore:
         row = self._conn.execute("SELECT ingestion_seq FROM memory_scope_cursors WHERE scope_id=?", (self._scope_key(scope_type, scope_id),)).fetchone()
         return int(row[0]) if row else 0
 
+    def pending_index_outbox(self, *, scope_id: str | None = None,
+                             scope_type: str = "profile", limit: int = 100) -> list[dict[str, Any]]:
+        """Return undelivered derived-index updates in commit order.
+
+        The outbox is intentionally durable and append-only.  Consumers may
+        safely retry a row; ``operation_key`` is the idempotency key exposed
+        to external indexers.
+        """
+        bounded = max(1, min(int(limit), 10_000))
+        if scope_id is None:
+            rows = self._conn.execute(
+                "SELECT * FROM memory_index_outbox WHERE delivered_at IS NULL "
+                "ORDER BY created_at, operation_key LIMIT ?", (bounded,)
+            ).fetchall()
+        else:
+            scope = self._scope_key(scope_type, scope_id)
+            rows = self._conn.execute(
+                "SELECT * FROM memory_index_outbox WHERE scope_id=? AND delivered_at IS NULL "
+                "ORDER BY created_at, operation_key LIMIT ?", (scope, bounded)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _index_item(self, conn: sqlite3.Connection, *, item_id: str,
+                    expected_revision: int, updated_at: float) -> dict[str, Any] | None:
+        """Materialize one current memory item into the disposable index."""
+        item = conn.execute(
+            "SELECT i.scope_id, i.current_revision, i.status, r.claim "
+            "FROM memory_items i JOIN memory_revisions r "
+            "ON r.item_id=i.item_id AND r.revision=i.current_revision "
+            "WHERE i.item_id=?", (item_id,)
+        ).fetchone()
+        if item is None:
+            conn.execute("DELETE FROM memory_retrieval_index WHERE item_id=?", (item_id,))
+            return None
+        # A stale outbox event must never overwrite a newer revision.
+        conn.execute(
+            "INSERT INTO memory_retrieval_index(item_id,scope_id,revision,claim,status,updated_at) "
+            "VALUES(?,?,?,?,?,?) ON CONFLICT(item_id) DO UPDATE SET "
+            "scope_id=excluded.scope_id,revision=excluded.revision,claim=excluded.claim,"
+            "status=excluded.status,updated_at=excluded.updated_at "
+            "WHERE excluded.revision >= memory_retrieval_index.revision",
+            (item_id, item[0], int(item[1]), item[3], item[2], updated_at),
+        )
+        return {"item_id": item_id, "scope_id": item[0], "revision": int(item[1]),
+                "expected_revision": int(expected_revision), "claim": item[3], "status": item[2]}
+
+    def consume_index_outbox(self, *, scope_id: str | None = None,
+                             scope_type: str = "profile", limit: int = 100,
+                             indexer: Any = None,
+                             delivered_at: float | None = None) -> dict[str, int]:
+        """Deliver pending index updates and materialize the local index.
+
+        ``indexer`` is an optional callable receiving a text-free event.  It
+        must be idempotent by ``operation_key``.  Failures leave the row
+        pending for retry and are propagated after prior successful rows.
+        """
+        rows = self.pending_index_outbox(scope_id=scope_id, scope_type=scope_type, limit=limit)
+        delivered = 0
+        failed = 0
+        now = time.time() if delivered_at is None else float(delivered_at)
+        for row in rows:
+            try:
+                def action(conn: sqlite3.Connection) -> dict[str, Any] | None:
+                    return self._index_item(conn, item_id=row["item_id"],
+                                            expected_revision=int(row["revision"]), updated_at=now)
+                current = self._write(action)
+                event_scope_type, event_scope_id = self.decode_scope_key(row["scope_id"])
+                event = {"operation_key": row["operation_key"], "scope_id": row["scope_id"],
+                         "scope_type": event_scope_type, "scope_identifier": event_scope_id,
+                         "item_id": row["item_id"], "revision": row["revision"],
+                         "current": current}
+                if indexer is not None:
+                    indexer(event)
+                self._write(lambda conn: conn.execute(
+                    "UPDATE memory_index_outbox SET delivered_at=? WHERE operation_key=? AND delivered_at IS NULL",
+                    (now, row["operation_key"])))
+                delivered += 1
+            except Exception:
+                failed += 1
+                # Keep processing independent rows, but expose the failure to
+                # the caller through the count so schedulers can alert/retry.
+                continue
+        return {"seen": len(rows), "delivered": delivered, "failed": failed}
+
+    def rebuild_retrieval_index(self, *, scope_id: str | None = None,
+                                scope_type: str = "profile") -> dict[str, int]:
+        """Rebuild disposable retrieval rows from authoritative revisions.
+
+        Rebuild does not acknowledge the outbox: external indexers still need
+        their durable events, while local retrieval becomes immediately
+        consistent.  ``scope_id=None`` rebuilds all scopes.
+        """
+        scope = None if scope_id is None else self._scope_key(scope_type, scope_id)
+        def action(conn: sqlite3.Connection) -> int:
+            if scope is None:
+                conn.execute("DELETE FROM memory_retrieval_index")
+                rows = conn.execute(
+                    "SELECT i.item_id,i.scope_id,i.current_revision,r.claim,i.status,i.updated_at "
+                    "FROM memory_items i JOIN memory_revisions r ON r.item_id=i.item_id AND r.revision=i.current_revision "
+                    "WHERE i.status IN ('active','conflicted')"
+                ).fetchall()
+            else:
+                conn.execute("DELETE FROM memory_retrieval_index WHERE scope_id=?", (scope,))
+                rows = conn.execute(
+                    "SELECT i.item_id,i.scope_id,i.current_revision,r.claim,i.status,i.updated_at "
+                    "FROM memory_items i JOIN memory_revisions r ON r.item_id=i.item_id AND r.revision=i.current_revision "
+                    "WHERE i.scope_id=? AND i.status IN ('active','conflicted')", (scope,)
+                ).fetchall()
+            conn.executemany(
+                "INSERT INTO memory_retrieval_index(item_id,scope_id,revision,claim,status,updated_at) VALUES(?,?,?,?,?,?)",
+                [tuple(row) for row in rows],
+            )
+            return len(rows)
+        return {"indexed": int(self._write(action))}
+
+    # Friendly aliases used by scheduler integrations.  Keep the canonical
+    # names above explicit in documentation while allowing older callers to
+    # use the shorter index terminology.
+    def drain_index_outbox(self, **kwargs: Any) -> dict[str, int]:
+        return self.consume_index_outbox(**kwargs)
+
+    def rebuild_index(self, **kwargs: Any) -> dict[str, int]:
+        return self.rebuild_retrieval_index(**kwargs)
+
     def last_run_at(self, scope_id: str, scope_type: str = "profile") -> float | None:
         scope = self._scope_key(scope_type, scope_id)
         row = self._conn.execute(
@@ -173,6 +369,23 @@ class MemoryConsolidationStore:
             (scope,),
         ).fetchone()
         return float(row[0]) if row else None
+
+    def last_verification_at(self, scope_id: str, scope_type: str = "profile") -> float | None:
+        scope = self._scope_key(scope_type, scope_id)
+        row = self._conn.execute(
+            "SELECT verified_at FROM memory_verification_runs WHERE scope_id=?", (scope,)
+        ).fetchone()
+        return float(row[0]) if row else None
+
+    def record_verification_run(self, scope_id: str, scope_type: str = "profile",
+                                verified_at: float | None = None) -> None:
+        scope = self._scope_key(scope_type, scope_id)
+        timestamp = time.time() if verified_at is None else float(verified_at)
+        self._write(lambda conn: conn.execute(
+            "INSERT INTO memory_verification_runs(scope_id,verified_at) VALUES(?,?) "
+            "ON CONFLICT(scope_id) DO UPDATE SET verified_at=excluded.verified_at",
+            (scope, timestamp),
+        ))
 
     def find_relevant_memories(self, *, scope_id: str, scope_type: str = "profile", claim: str, limit: int = 20) -> list[dict[str, Any]]:
         """Return active same-scope memories for conservative matching.
@@ -193,7 +406,79 @@ class MemoryConsolidationStore:
                 ORDER BY i.updated_at DESC LIMIT ?""",
             (scope, text, f"%{text}%", max(1, int(limit))),
         ).fetchall()
+        results = [dict(row) for row in rows]
+        for result in results:
+            evidence_rows = self._conn.execute(
+                "SELECT s.event_id, e.content, e.created_at "
+                "FROM memory_sources s JOIN memory_events e ON e.event_id=s.event_id "
+                "JOIN memory_items i ON i.item_id=s.item_id "
+                "WHERE s.item_id=? AND s.revision=? AND i.scope_id=? "
+                "ORDER BY e.ingestion_seq, e.event_id",
+                (result["id"], int(result["revision"]), scope),
+            ).fetchall()
+            result["evidence"] = [dict(item) for item in evidence_rows]
+        return results
+
+    def conflict_flags(self, *, scope_id: str, scope_type: str = "profile",
+                       state: str = "open") -> list[dict[str, Any]]:
+        scope = self._scope_key(scope_type, scope_id)
+        if state not in {"open", "resolved"}:
+            raise ValueError("invalid conflict flag state")
+        rows = self._conn.execute(
+            "SELECT * FROM memory_conflict_flags WHERE scope_id=? AND state=? "
+            "ORDER BY created_at, flag_id", (scope, state)
+        ).fetchall()
         return [dict(row) for row in rows]
+
+    def resolve_conflict_flag(self, flag_id: str, *, scope_id: str,
+                              scope_type: str = "profile",
+                              resolved_at: float | None = None) -> None:
+        flag = self._id(flag_id, "flag_id")
+        scope = self._scope_key(scope_type, scope_id)
+        timestamp = time.time() if resolved_at is None else float(resolved_at)
+        def action(conn: sqlite3.Connection) -> None:
+            updated = conn.execute(
+                "UPDATE memory_conflict_flags SET state='resolved',resolved_at=? "
+                "WHERE flag_id=? AND scope_id=? AND state='open'",
+                (timestamp, flag, scope),
+            ).rowcount
+            if not updated:
+                raise ValueError("open conflict flag not found in scope")
+        self._write(action)
+
+    def search_retrieval_index(self, *, scope_id: str, scope_type: str = "profile",
+                               query: str, limit: int = 8) -> list[dict[str, Any]]:
+        """Search the disposable same-scope retrieval index.
+
+        Retrieval is deliberately lexical and bounded.  The authoritative
+        memory/revision tables remain the source of truth; callers can rebuild
+        this table after corruption or an indexer outage.  Scope filtering is
+        applied before scoring so a query can never leak another tenant's
+        memory.
+        """
+        scope = self._scope_key(scope_type, scope_id)
+        text = str(query or "").strip().lower()
+        if not text:
+            return []
+        tokens = tuple(dict.fromkeys(re.findall(r"[a-z0-9_:-]+", text)))
+        rows = self._conn.execute(
+            "SELECT item_id, revision, claim, status, updated_at "
+            "FROM memory_retrieval_index WHERE scope_id=? "
+            "AND status IN ('active','conflicted') ORDER BY updated_at DESC LIMIT 500",
+            (scope,),
+        ).fetchall()
+        scored: list[tuple[int, float, dict[str, Any]]] = []
+        for row in rows:
+            claim = str(row[2])
+            lower_claim = claim.lower()
+            score = sum(1 for token in tokens if token in lower_claim)
+            if score:
+                scored.append((score, float(row[4]), {
+                    "item_id": row[0], "revision": int(row[1]), "claim": claim,
+                    "status": row[3], "score": score,
+                }))
+        scored.sort(key=lambda item: (-item[0], -item[1], item[2]["item_id"]))
+        return [item[2] for item in scored[:max(1, min(int(limit), 50))]]
 
     def commit(self, *, scope_id: str, scope_type: str = "profile", operations: Sequence[Mapping[str, Any]], end_seq: int,
                run_id: str | None = None, committed_at: float | None = None) -> dict[str, Any]:
@@ -221,6 +506,17 @@ class MemoryConsolidationStore:
             if normalized and all(row is not None and row[0] == "committed" for row in committed_rows):
                 original = conn.execute("SELECT run_id FROM memory_operations WHERE operation_key=?", (committed_keys[0],)).fetchone()[0]
                 return {"run_id": original, "replayed": True, "cursor": start_seq}
+            existing_run = conn.execute(
+                "SELECT run_id,start_seq,end_seq,status FROM memory_runs "
+                "WHERE run_id=? AND scope_id=?", (run, scope)
+            ).fetchone()
+            if (
+                existing_run is not None
+                and existing_run[3] == "committed"
+                and int(existing_run[1]) == start_seq
+                and int(existing_run[2]) == target
+            ):
+                return {"run_id": run, "replayed": True, "cursor": start_seq}
             if existing and len(existing) != len(normalized): raise ValueError("partial replay is not allowed")
             commit_operations = [{**op, "operation_key": "commit_" + op["operation_key"]} for op in normalized]
             conn.execute("INSERT INTO memory_runs VALUES(?,?,?,?,?,?,?)", (run, scope, start_seq, target, "committed", now, now))
@@ -346,6 +642,18 @@ class MemoryConsolidationStore:
             left, right = sorted((item_id, other_id))
             conn.execute("INSERT OR IGNORE INTO memory_conflicts VALUES(?,?,?,?,?,NULL)", (left, right, scope, "open", now))
             conn.execute("UPDATE memory_items SET status='conflicted',updated_at=? WHERE item_id IN (?,?)", (now, left, right))
+        elif op["type"] == "conflict":
+            # Verification can identify a single memory whose representation
+            # no longer agrees with its immutable evidence.  Preserve that
+            # finding as a first-class, resolvable flag rather than relying on
+            # the item's status alone.
+            conn.execute(
+                "INSERT OR IGNORE INTO memory_conflict_flags "
+                "(flag_id,scope_id,item_id,revision,reason,evidence_json,state,created_at,resolved_at) "
+                "VALUES(?,?,?,?,?,?, 'open', ?, NULL)",
+                (key, scope, item_id, revision, op.get("reason") or candidate["claim"],
+                 evidence_json, now),
+            )
         for superseded in superseded_ids:
             conn.execute("UPDATE memory_items SET status='superseded',updated_at=? WHERE item_id=?", (now, superseded))
 
@@ -381,6 +689,13 @@ class MemoryConsolidationStore:
             restored = 0
             for operation in operations:
                 undo = operation.get("undo") or {}
+                # Conflict verification flags are part of the operation's
+                # compensating history and must disappear on rollback.
+                if operation.get("operation_key"):
+                    conn.execute(
+                        "DELETE FROM memory_conflict_flags WHERE flag_id=?",
+                        (operation["operation_key"],),
+                    )
                 item_id = (operation.get("undo") or {}).get("item_id") or operation.get("target_item_id")
                 if not item_id:
                     raise ValueError("rollback item identity missing")

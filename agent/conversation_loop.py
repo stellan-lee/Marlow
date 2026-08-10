@@ -835,6 +835,36 @@ def run_conversation(
     # Use original_user_message (clean input) — user_message may contain
     # injected skill content that bloats / breaks provider queries.
     _ext_prefetch_cache = ""
+    _consolidated_prefetch_cache = ""
+    _raw_query_global = (
+        original_user_message if isinstance(original_user_message, str) else ""
+    )
+    # The consolidation index is local, same-scope, and fail-open.  It is
+    # queried independently of external providers so an index outage never
+    # blocks a turn and provider configuration cannot widen its scope.
+    if _raw_query_global:
+        try:
+            from marlow_cli.config import load_config as _load_consolidation_config
+            _consolidation_config = _load_consolidation_config() or {}
+            _memory_settings = (
+                _consolidation_config.get("memory", {})
+                if isinstance(_consolidation_config, dict) else {}
+            )
+            _consolidation_settings = (
+                _memory_settings.get("consolidation", {})
+                if isinstance(_memory_settings, dict) else {}
+            )
+            if isinstance(_consolidation_settings, dict) and _consolidation_settings.get("enabled"):
+                from agent.memory_consolidation_runner import retrieve_consolidated_memory
+                _scope_type = "user" if getattr(agent, "_user_id", "") else "profile"
+                _scope_id = getattr(agent, "_user_id", "") or getattr(agent, "session_id", "") or "default"
+                _consolidated_prefetch_cache = retrieve_consolidated_memory(
+                    scope_id=str(_scope_id), scope_type=_scope_type,
+                    query=_raw_query_global,
+                    limit=int(_consolidation_settings.get("retrieval_limit", 8)),
+                )
+        except Exception:
+            pass
     if agent._memory_manager:
         agent._memory_manager.reset_prefetch_stats()
         try:
@@ -960,6 +990,11 @@ def run_conversation(
                     )
         except Exception:
             pass
+
+    if _consolidated_prefetch_cache:
+        _ext_prefetch_cache = "\n\n".join(
+            part for part in (_ext_prefetch_cache, _consolidated_prefetch_cache) if part
+        )
 
     # Built-in MEMORY.md / USER.md are static prompt context rather than a
     # search provider. Record one injection per turn when either snapshot is

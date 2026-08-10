@@ -2199,6 +2199,7 @@ class AIAgent:
                     user_content=original_user_message,
                     assistant_content=final_response,
                     turn_id=getattr(self, "_user_turn_count", None),
+                    tool_events=messages,
                 )
         except Exception:
             pass

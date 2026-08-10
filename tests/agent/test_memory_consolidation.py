@@ -123,3 +123,49 @@ def test_noop_window_advances_cursor_and_revisions_preserve_sources(tmp_path: Pa
             assert first["event_id"] in evidence and second["event_id"] in evidence
         store.commit(scope_id="person_a", operations=[], end_seq=2, run_id="noop-run")
         assert store.cursor("person_a") == 2
+
+
+def test_index_outbox_delivery_is_idempotent_and_tracks_latest_revision(tmp_path: Path) -> None:
+    path = (tmp_path / "state.db").resolve()
+    seen = []
+    with MemoryConsolidationStore(path) as store:
+        first = store.append_evidence(scope_id="person_a", source_key="turn:1", content="vim")
+        store.commit(scope_id="person_a", operations=[_candidate(first["event_id"], "Use vim")], end_seq=1)
+        item_id = store.find_relevant_memories(scope_id="person_a", claim="Use vim")[0]["id"]
+        second = store.append_evidence(scope_id="person_a", source_key="turn:2", content="vim consistently")
+        store.commit(scope_id="person_a", operations=[{
+            "type": "revise", "target_item_id": item_id,
+            "candidate": {"kind": "preference", "claim": "Use vim consistently",
+                           "evidence_event_ids": [second["event_id"]]},
+        }], end_seq=2)
+        result = store.consume_index_outbox(scope_id="person_a", indexer=seen.append)
+        assert result == {"seen": 2, "delivered": 2, "failed": 0}
+        assert seen[0]["operation_key"] != seen[1]["operation_key"]
+        assert seen[-1]["current"]["revision"] == 2
+        assert store.pending_index_outbox(scope_id="person_a") == []
+        # A retry has no effects because both rows are acknowledged.
+        assert store.consume_index_outbox(scope_id="person_a") == {"seen": 0, "delivered": 0, "failed": 0}
+
+
+def test_indexer_failure_leaves_event_pending_and_rebuild_is_authoritative(tmp_path: Path) -> None:
+    path = (tmp_path / "state.db").resolve()
+    with MemoryConsolidationStore(path) as store:
+        event = store.append_evidence(scope_id="person_a", source_key="turn:1", content="vim")
+        store.commit(scope_id="person_a", operations=[_candidate(event["event_id"], "Use vim")], end_seq=1)
+        assert store.consume_index_outbox(scope_id="person_a", indexer=lambda _: (_ for _ in ()).throw(RuntimeError("offline"))) == {
+            "seen": 1, "delivered": 0, "failed": 1
+        }
+        assert len(store.pending_index_outbox(scope_id="person_a")) == 1
+        assert store.rebuild_retrieval_index(scope_id="person_a") == {"indexed": 1}
+        row = store._conn.execute("SELECT claim,revision,status FROM memory_retrieval_index").fetchone()
+        assert tuple(row) == ("Use vim", 1, "active")
+
+
+def test_relevant_memory_includes_original_supporting_evidence(tmp_path: Path) -> None:
+    path = (tmp_path / "state.db").resolve()
+    with MemoryConsolidationStore(path) as store:
+        event = store.append_evidence(scope_id="person_a", source_key="turn:1", content="I use vim every day")
+        store.commit(scope_id="person_a", operations=[_candidate(event["event_id"], "The preferred editor is vim")], end_seq=1)
+        match = store.find_relevant_memories(scope_id="person_a", claim="preferred editor")[0]
+        assert match["evidence"][0]["event_id"] == event["event_id"]
+        assert match["evidence"][0]["content"] == "I use vim every day"
