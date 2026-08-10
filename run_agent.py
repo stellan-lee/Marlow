@@ -2176,6 +2176,33 @@ class AIAgent:
         """
         if interrupted:
             return
+        # The consolidation evidence ledger is independent of an external
+        # memory provider.  When explicitly enabled, append only completed
+        # user/assistant turns with a deterministic source key; failures remain
+        # best-effort and never block the response path.
+        try:
+            from marlow_cli.config import load_config as _load_memory_config
+            _memory_cfg = _load_memory_config() or {}
+            _consolidation_cfg = (
+                _memory_cfg.get("memory", {}).get("consolidation", {})
+                if isinstance(_memory_cfg, dict)
+                else {}
+            )
+            if _consolidation_cfg.get("enabled") and final_response and original_user_message:
+                from agent.memory_consolidation_runner import append_conversation_evidence
+                _scope_type = "user" if getattr(self, "_user_id", "") else "profile"
+                _scope_id = getattr(self, "_user_id", "") or getattr(self, "session_id", "") or "default"
+                append_conversation_evidence(
+                    scope_id=str(_scope_id),
+                    scope_type=_scope_type,
+                    session_id=str(getattr(self, "session_id", "") or ""),
+                    user_content=original_user_message,
+                    assistant_content=final_response,
+                    turn_id=getattr(self, "_user_turn_count", None),
+                    tool_events=messages,
+                )
+        except Exception:
+            pass
         if not (self._memory_manager and final_response and original_user_message):
             return
         try:

@@ -1261,6 +1261,25 @@ DEFAULT_CONFIG = {
         # Require explicit override language ("instead", "replace", 改成, ...)
         # in the new card before superseding a prior one. Conservative default.
         "structured_conflict_require_explicit_override": True,
+        # Scheduled evidence consolidation.  Observe-only is deliberately
+        # disabled by default; enabling it requires an explicit rollout choice.
+        "consolidation": {
+            "enabled": False,
+            "schedule": "0 23 * * *",
+            "dry_run": True,
+            "phase": "observe",
+            "llm_enabled": True,
+            "extractor_version": "llm-v1",
+            "max_retries": 2,
+            "max_events": 32,
+            "max_tokens": 1800,
+            "planner_max_tokens": 1200,
+            "timeout": 30.0,
+            "retrieval_limit": 8,
+            "weekly_verification_enabled": True,
+            "weekly_verification_day": 0,
+            "weekly_verification_apply": False,
+        },
     },
 
     # Subagent delegation — override the provider:model used by delegate_task
