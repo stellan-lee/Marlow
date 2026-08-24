@@ -103,6 +103,9 @@ skills:
 
 experience:
   mode: off  # off | capture | shadow | assist
+  decisions:
+    enabled: true
+    explicit_capture_enabled: true
   telegram_digital_twin:
     enabled: false
     system_prompt: >-

@@ -1043,6 +1043,126 @@ class TestWorkExperienceRecall:
         assert "sensitive-customer-name" not in json.dumps(result)
         assert not missing_db.exists()
 
+    def test_decision_management_lifecycle(self, tmp_path, monkeypatch):
+        from agent.experience.authority import DecisionTurnAuthority
+        from agent.experience.store import ExperienceStore
+        import agent.transports.work_experience_mcp as experience_mcp
+
+        self._seed_lessons(tmp_path, monkeypatch)
+        db_path = experience_mcp._get_state_db_path()
+        with ExperienceStore(db_path) as store:
+            policy = store.list_scope_policies(principal_id="local-owner")[0]
+            candidate = store.create_decision(
+                item_id="decision_candidate",
+                principal_id=policy["principal_id"],
+                scope_type="project",
+                scope_id=policy["project_id"],
+                repository_id=policy["repository_id"],
+                project_id=policy["project_id"],
+                title="Candidate Decision",
+                summary="Awaiting MCP approval.",
+                body={
+                    "statement": "Use MCP approval for Decision Memory.",
+                    "rationale": "MCP approval is explicitly managed.",
+                    "source_type": "agent_proposal",
+                    "authority": "unapproved",
+                    "effective_at": 1.0,
+                },
+                created_by="agent",
+            )
+            active = store.create_decision(
+                item_id="decision_active",
+                principal_id=policy["principal_id"],
+                scope_type="project",
+                scope_id=policy["project_id"],
+                repository_id=policy["repository_id"],
+                project_id=policy["project_id"],
+                title="Active Decision",
+                summary="Already approved.",
+                body={
+                    "statement": "Use active Decision Memory.",
+                    "rationale": "Active decisions are authorized.",
+                    "source_type": "agent_proposal",
+                    "authority": "unapproved",
+                    "effective_at": 1.0,
+                },
+                created_by="agent",
+            )
+            store.activate_decision(
+                active["id"],
+                authority=DecisionTurnAuthority(
+                    source_turn_id="mcp_fixture",
+                    source_session_id="mcp_fixture",
+                    raw_user_text_hash="a" * 64,
+                    explicit_remember_grant=False,
+                    approved_item_ids=(active["id"],),
+                ),
+                repository_root=str(experience_mcp._get_project_root()),
+                repository_id=policy["repository_id"],
+            )
+
+        listed = json.loads(experience_mcp.list_decision_work_experience())
+        assert {decision["id"] for decision in listed["decisions"]} >= {
+            "decision_candidate",
+            "decision_active",
+        }
+
+        added = json.loads(
+            experience_mcp.add_decision_work_experience(
+                title="MCP Decision Proposal",
+                summary="Created through MCP.",
+                statement="Use MCP Decision proposals as candidates.",
+                rationale="MCP-created proposals need approval.",
+                effective_at=1.0,
+                sensitivity="normal",
+                egress_policy="explicit_any_provider",
+            )
+        )
+        added_id = added["decision"]["id"]
+        assert added["decision"]["status"] == "candidate"
+        assert added["decision"]["created_by"] == "agent"
+
+        approved = json.loads(
+            experience_mcp.approve_decision_work_experience(
+                added_id,
+                reason="Reviewed through MCP Decision governance",
+            )
+        )
+        assert approved["decision"]["status"] == "active"
+        assert approved["decision"]["authority"] == "user"
+
+        shown = json.loads(experience_mcp.show_decision_work_experience(added_id))
+        assert shown["decision"]["revision"]["body"]["statement"] == (
+            "Use MCP Decision proposals as candidates."
+        )
+
+        superseded = json.loads(
+            experience_mcp.supersede_decision_work_experience(
+                added_id,
+                title="MCP Decision Replacement",
+                summary="Replaces the first MCP Decision.",
+                statement="Use the replacement Decision.",
+                rationale="The first Decision is too broad.",
+                effective_at=2.0,
+                reason="Superseded by a narrower MCP Decision.",
+            )
+        )
+        replacement_id = superseded["decision"]["id"]
+        assert superseded["decision"]["status"] == "active"
+        assert superseded["superseded"] is True
+
+        revoked = json.loads(
+            experience_mcp.revoke_decision_work_experience(
+                replacement_id,
+                reason="Revoked through MCP Decision governance",
+            )
+        )
+        assert revoked["decision"]["status"] == "revoked"
+
+        related = json.loads(experience_mcp.related_decision_work_experience(replacement_id))
+        assert related["decision"]["id"] == replacement_id
+        assert any(link["to_item_id"] == added_id for link in related["links"])
+
     def test_management_lifecycle(self, tmp_path, monkeypatch):
         import agent.transports.work_experience_mcp as experience_mcp
 
@@ -1184,6 +1304,12 @@ class TestWorkExperienceRecall:
         assert tools["experience_approve"].annotations.destructiveHint is False
         assert tools["experience_edit"].annotations.idempotentHint is False
         assert tools["experience_retract"].annotations.destructiveHint is True
+        assert tools["experience_decision_list"].annotations.readOnlyHint is True
+        assert tools["experience_decision_show"].annotations.readOnlyHint is True
+        assert tools["experience_decision_add"].annotations.readOnlyHint is False
+        assert tools["experience_decision_approve"].annotations.destructiveHint is False
+        assert tools["experience_decision_supersede"].annotations.idempotentHint is False
+        assert tools["experience_decision_revoke"].annotations.destructiveHint is True
 
 
 class TestE2EPermissions:
@@ -1254,6 +1380,10 @@ class TestToolRegistration:
             "experience_recall", "experience_list", "experience_show",
             "experience_add", "experience_approve", "experience_edit",
             "experience_retract",
+            "experience_decision_list", "experience_decision_show",
+            "experience_decision_add", "experience_decision_approve",
+            "experience_decision_supersede", "experience_decision_revoke",
+            "experience_decision_related",
             "permissions_list_open", "permissions_respond",
         }
         assert expected == tool_names, f"Missing: {expected - tool_names}, Extra: {tool_names - expected}"

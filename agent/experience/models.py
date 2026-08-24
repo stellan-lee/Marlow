@@ -1,6 +1,6 @@
 """Small typed contract for the work-experience validation MVP.
 
-Only manually managed lessons are modeled here.  Durable views are frozen so
+Manually managed lessons and candidate Decisions are modeled here.  Durable views are frozen so
 editing means creating a new :class:`LessonRevision`, never mutating evidence
 or provenance attached to an older revision.
 """
@@ -62,11 +62,40 @@ class CreatedBy(StrEnum):
     IMPORT = "import"
 
 
+class DecisionAuthority(StrEnum):
+    """Authority that permits a Decision to become active."""
+
+    UNAPPROVED = "unapproved"
+    USER = "user"
+    REPOSITORY_POLICY = "repository_policy"
+
+
+class DecisionSourceType(StrEnum):
+    """Origin of a Decision body."""
+
+    USER_TURN = "user_turn"
+    REPOSITORY_POLICY = "repository_policy"
+    AGENT_PROPOSAL = "agent_proposal"
+    MIGRATION = "migration"
+    MANUAL_IMPORT = "manual_import"
+
+
 class TagNamespace(StrEnum):
     TASK_TYPE = "task_type"
     TECHNOLOGY = "technology"
     ENTITY = "entity"
     FAILURE = "failure"
+    COMPONENT = "component"
+
+
+class DecisionStatus(StrEnum):
+    """Canonical Decision lifecycle; candidates are not injectable."""
+
+    CANDIDATE = "candidate"
+    ACTIVE = "active"
+    REVIEW_REQUIRED = "review_required"
+    SUPERSEDED = "superseded"
+    REVOKED = "revoked"
 
 
 class RetrievalDisposition(StrEnum):
@@ -80,6 +109,14 @@ _TRANSITIONS = {
     LessonStatus.DEPRECATED: set(),
     LessonStatus.REJECTED: set(),
     LessonStatus.RETRACTED: set(),
+}
+
+_DECISION_TRANSITIONS = {
+    DecisionStatus.CANDIDATE: {DecisionStatus.ACTIVE, DecisionStatus.REVIEW_REQUIRED, DecisionStatus.REVOKED},
+    DecisionStatus.ACTIVE: {DecisionStatus.REVIEW_REQUIRED, DecisionStatus.SUPERSEDED, DecisionStatus.REVOKED},
+    DecisionStatus.REVIEW_REQUIRED: {DecisionStatus.ACTIVE, DecisionStatus.SUPERSEDED, DecisionStatus.REVOKED},
+    DecisionStatus.SUPERSEDED: set(),
+    DecisionStatus.REVOKED: set(),
 }
 
 
@@ -107,6 +144,33 @@ def require_lesson_transition(current: LessonStatus | str, target: LessonStatus 
     before, after = normalize_lesson_status(current), normalize_lesson_status(target)
     if not can_transition_lesson(before, after):
         raise ValueError(f"invalid lesson transition: {before.value} -> {after.value}")
+    return after
+
+
+def normalize_decision_status(value: DecisionStatus | str) -> DecisionStatus:
+    """Return the stored spelling for a Decision status."""
+
+    if isinstance(value, DecisionStatus):
+        return value
+    try:
+        return DecisionStatus(value.strip().lower())
+    except (AttributeError, ValueError) as exc:
+        raise ValueError(f"unsupported decision status: {value!r}") from exc
+
+
+def can_transition_decision(current: DecisionStatus | str, target: DecisionStatus | str) -> bool:
+    """Return whether a Decision transition is legal; same-state retries are idempotent."""
+
+    before, after = normalize_decision_status(current), normalize_decision_status(target)
+    return before == after or after in _DECISION_TRANSITIONS[before]
+
+
+def require_decision_transition(current: DecisionStatus | str, target: DecisionStatus | str) -> DecisionStatus:
+    """Validate a Decision lifecycle transition and return its canonical target."""
+
+    before, after = normalize_decision_status(current), normalize_decision_status(target)
+    if not can_transition_decision(before, after):
+        raise ValueError(f"invalid decision transition: {before.value} -> {after.value}")
     return after
 
 
@@ -211,6 +275,83 @@ class LessonBody:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class DecisionBody:
+    """Bounded, revisioned Decision statement and authority metadata."""
+
+    statement: str
+    rationale: str
+    source_type: DecisionSourceType
+    authority: DecisionAuthority
+    effective_at: float
+    expires_at: float | None = None
+    policy_anchor_path: str | None = None
+    policy_anchor_hash: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "statement", _text(self.statement, "statement", 4_000))
+        object.__setattr__(self, "rationale", _text(self.rationale, "rationale", 4_000))
+        object.__setattr__(self, "source_type", DecisionSourceType(self.source_type))
+        object.__setattr__(self, "authority", DecisionAuthority(self.authority))
+        object.__setattr__(self, "effective_at", _time(self.effective_at, "effective_at"))
+        object.__setattr__(self, "expires_at", _time(self.expires_at, "expires_at", optional=True))
+        if self.expires_at is not None and self.expires_at < self.effective_at:
+            raise ValueError("expires_at must not be earlier than effective_at")
+        if self.policy_anchor_path is None:
+            object.__setattr__(self, "policy_anchor_path", None)
+        else:
+            path = PurePosixPath(_text(self.policy_anchor_path, "policy_anchor_path", 1_024))
+            if path.is_absolute() or ".." in path.parts or "\\" in self.policy_anchor_path:
+                raise ValueError("policy_anchor_path must be repository-relative")
+            object.__setattr__(self, "policy_anchor_path", path.as_posix() or ".")
+        object.__setattr__(self, "policy_anchor_hash", _optional_digest(self.policy_anchor_hash, "policy_anchor_hash"))
+        if self.authority is DecisionAuthority.REPOSITORY_POLICY:
+            if self.source_type is not DecisionSourceType.REPOSITORY_POLICY:
+                raise ValueError("repository_policy authority requires repository_policy source_type")
+            if not self.policy_anchor_path or not self.policy_anchor_hash:
+                raise ValueError("repository_policy authority requires policy_anchor_path and policy_anchor_hash")
+        if self.authority is DecisionAuthority.UNAPPROVED:
+            if self.source_type is DecisionSourceType.REPOSITORY_POLICY:
+                raise ValueError("repository_policy source_type cannot be unapproved")
+        if self.authority is DecisionAuthority.USER:
+            if self.source_type not in {DecisionSourceType.USER_TURN, DecisionSourceType.AGENT_PROPOSAL, DecisionSourceType.MANUAL_IMPORT}:
+                raise ValueError("user authority requires a user-approved source type")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "statement": self.statement,
+            "rationale": self.rationale,
+            "source_type": self.source_type.value,
+            "authority": self.authority.value,
+            "effective_at": self.effective_at,
+            "expires_at": self.expires_at,
+            "policy_anchor_path": self.policy_anchor_path,
+            "policy_anchor_hash": self.policy_anchor_hash,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "DecisionBody":
+        if not isinstance(value, Mapping):
+            raise TypeError("decision body must be a mapping")
+        allowed = {
+            "statement", "rationale", "source_type", "authority", "effective_at",
+            "expires_at", "policy_anchor_path", "policy_anchor_hash",
+        }
+        unknown = set(value) - allowed
+        if unknown:
+            raise ValueError(f"unknown decision body fields: {sorted(unknown)!r}")
+        return cls(
+            statement=value.get("statement", ""),
+            rationale=value.get("rationale", ""),
+            source_type=value.get("source_type", DecisionSourceType.MANUAL_IMPORT),
+            authority=value.get("authority", DecisionAuthority.UNAPPROVED),
+            effective_at=value.get("effective_at", 0.0),
+            expires_at=value.get("expires_at"),
+            policy_anchor_path=value.get("policy_anchor_path"),
+            policy_anchor_hash=value.get("policy_anchor_hash"),
+        )
+
+
 @dataclass(frozen=True, slots=True, order=True)
 class LessonTag:
     """Normalized tag owned by one exact lesson revision."""
@@ -221,6 +362,10 @@ class LessonTag:
     def __post_init__(self) -> None:
         object.__setattr__(self, "namespace", TagNamespace(self.namespace))
         object.__setattr__(self, "value", _text(self.value, "tag", 160).casefold())
+
+
+# Compatibility alias while callers migrate to the shared tag name.
+ExperienceTag = LessonTag
 
 
 @dataclass(frozen=True, slots=True)
@@ -408,6 +553,107 @@ class LessonRevision:
 
 
 @dataclass(frozen=True, slots=True)
+class DecisionRevision:
+    """Immutable, revision-specific Decision content and provenance."""
+
+    item_id: str
+    revision: int
+    title: str
+    summary: str
+    body: DecisionBody
+    created_at: float
+    content_hash: str = ""
+    source_session_id: str | None = None
+    source_turn_id: str | None = None
+    source_work_id: str | None = None
+    source_hash: str | None = None
+    editor: str = "user"
+    edit_reason: str | None = None
+    producer_metadata: tuple[tuple[str, str], ...] = field(default_factory=tuple)
+    tags: tuple[ExperienceTag, ...] = field(default_factory=tuple)
+    last_validated_at: float | None = None
+    review_after: float | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "item_id", _text(self.item_id, "item_id", 256))
+        if isinstance(self.revision, bool) or not isinstance(self.revision, int) or self.revision < 1:
+            raise ValueError("revision must be a positive integer")
+        object.__setattr__(self, "title", _text(self.title, "title", 240))
+        object.__setattr__(self, "summary", _possibly_empty_text(self.summary, "summary", 2_000))
+        if not isinstance(self.body, DecisionBody):
+            raise TypeError("body must be DecisionBody")
+        object.__setattr__(self, "created_at", _time(self.created_at, "created_at"))
+        for name in ("source_session_id", "source_turn_id", "source_work_id", "edit_reason"):
+            value = getattr(self, name)
+            object.__setattr__(self, name, _text(value, name, 500, optional=True))
+        object.__setattr__(self, "source_hash", _optional_digest(self.source_hash, "source_hash"))
+        object.__setattr__(self, "editor", _text(self.editor, "editor", 256))
+        producer_pairs: set[tuple[str, str]] = set()
+        for pair in self.producer_metadata:
+            if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+                raise TypeError("producer_metadata entries must be key/value pairs")
+            producer_pairs.add(
+                (
+                    _text(pair[0], "producer_metadata key", 128),
+                    _possibly_empty_text(pair[1], "producer_metadata value", 500),
+                )
+            )
+        object.__setattr__(self, "producer_metadata", tuple(sorted(producer_pairs)))
+        object.__setattr__(self, "tags", tuple(sorted(set(self.tags))))
+        object.__setattr__(self, "last_validated_at", _time(self.last_validated_at, "last_validated_at", optional=True))
+        object.__setattr__(self, "review_after", _time(self.review_after, "review_after", optional=True))
+        digest = self.content_hash.strip().lower() or decision_content_hash(
+            self.body,
+            title=self.title,
+            summary=self.summary,
+            tags=self.tags,
+        )
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise ValueError("content_hash must be a SHA-256 hex digest")
+        object.__setattr__(self, "content_hash", digest)
+
+
+@dataclass(frozen=True, slots=True)
+class Decision:
+    """Current Decision metadata paired with its immutable revision."""
+
+    id: str
+    family_id: str
+    status: DecisionStatus
+    scope: ScopeRef
+    sensitivity: Sensitivity
+    egress_policy: EgressPolicy
+    producer_trust_domain: str | None
+    created_by: CreatedBy
+    created_at: float
+    updated_at: float
+    revision: DecisionRevision
+    deleted_at: float | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "id", _text(self.id, "id", 256))
+        object.__setattr__(self, "family_id", _text(self.family_id, "family_id", 256))
+        object.__setattr__(self, "status", normalize_decision_status(self.status))
+        object.__setattr__(self, "sensitivity", Sensitivity(self.sensitivity))
+        object.__setattr__(self, "egress_policy", EgressPolicy(self.egress_policy))
+        object.__setattr__(self, "created_by", CreatedBy(self.created_by))
+        object.__setattr__(self, "producer_trust_domain", _optional_trust_domain(self.producer_trust_domain))
+        object.__setattr__(self, "created_at", _time(self.created_at, "created_at"))
+        object.__setattr__(self, "updated_at", _time(self.updated_at, "updated_at"))
+        object.__setattr__(self, "deleted_at", _time(self.deleted_at, "deleted_at", optional=True))
+        if not isinstance(self.scope, ScopeRef) or not isinstance(self.revision, DecisionRevision):
+            raise TypeError("scope/revision have invalid types")
+        if self.revision.item_id != self.id or self.updated_at < self.created_at:
+            raise ValueError("decision revision or timestamps are inconsistent")
+        if self.status is DecisionStatus.ACTIVE and self.revision.body.authority is DecisionAuthority.UNAPPROVED:
+            raise ValueError("active decisions require user or repository_policy authority")
+
+    @property
+    def current_revision(self) -> int:
+        return self.revision.revision
+
+
+@dataclass(frozen=True, slots=True)
 class Lesson:
     """Current item metadata paired with its current immutable revision."""
 
@@ -524,6 +770,94 @@ class RetrievalMatch:
             object.__setattr__(self, "confidence", float(self.confidence))
 
 
+
+@dataclass(frozen=True, slots=True)
+class DecisionMatch:
+    """One active Decision result and its deterministic explanation."""
+
+    item_id: str
+    family_id: str
+    item_revision: int
+    title: str
+    summary: str
+    body: DecisionBody
+    authority: str
+    scope_type: str
+    scope_id: str
+    repository_id: str | None
+    project_id: str | None
+    source_session_id: str | None
+    source_turn_id: str | None
+    source_work_id: str | None
+    rank: int
+    score: float
+    match_reasons: tuple[str, ...]
+    confidence: float | None = None
+    tags: tuple[LessonTag, ...] = field(default_factory=tuple)
+    updated_at: float = 0.0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "item_id", _text(self.item_id, "item_id", 256))
+        object.__setattr__(self, "family_id", _text(self.family_id, "family_id", 256))
+        if (
+            isinstance(self.item_revision, bool)
+            or not isinstance(self.item_revision, int)
+            or self.item_revision < 1
+        ):
+            raise ValueError("item_revision must be positive")
+        if isinstance(self.rank, bool) or not isinstance(self.rank, int) or self.rank < 1:
+            raise ValueError("rank must be positive")
+        if (
+            isinstance(self.score, bool)
+            or not isinstance(self.score, (int, float))
+            or not math.isfinite(self.score)
+        ):
+            raise ValueError("score must be finite")
+        if not isinstance(self.body, DecisionBody):
+            raise TypeError("body must be DecisionBody")
+        object.__setattr__(self, "authority", _text(self.authority, "authority", 64))
+        if self.authority not in {"user", "repository_policy"}:
+            raise ValueError("decision match authority must be user or repository_policy")
+        object.__setattr__(self, "scope_type", ScopeType(self.scope_type))
+        object.__setattr__(self, "scope_id", _text(self.scope_id, "scope_id", 256))
+        object.__setattr__(
+            self,
+            "repository_id",
+            _text(self.repository_id, "repository_id", 256, optional=True),
+        )
+        object.__setattr__(
+            self,
+            "project_id",
+            _text(self.project_id, "project_id", 256, optional=True),
+        )
+        for name in ("source_session_id", "source_turn_id", "source_work_id"):
+            object.__setattr__(
+                self,
+                name,
+                _text(getattr(self, name), name, 256, optional=True),
+            )
+        object.__setattr__(self, "title", _text(self.title, "title", 240))
+        object.__setattr__(self, "summary", _possibly_empty_text(self.summary, "summary", 2_000))
+        object.__setattr__(self, "score", float(self.score))
+        reasons = tuple(
+            dict.fromkeys(_text(value, "match reason", 500) for value in self.match_reasons)
+        )
+        if not reasons:
+            raise ValueError("match_reasons must not be empty")
+        object.__setattr__(self, "match_reasons", reasons)
+        object.__setattr__(self, "tags", tuple(sorted(set(self.tags))))
+        if self.confidence is not None:
+            if (
+                isinstance(self.confidence, bool)
+                or not isinstance(self.confidence, (int, float))
+                or not math.isfinite(self.confidence)
+                or not 0 <= self.confidence <= 1
+            ):
+                raise ValueError("confidence must be between 0 and 1")
+            object.__setattr__(self, "confidence", float(self.confidence))
+        object.__setattr__(self, "updated_at", _time(self.updated_at, "updated_at"))
+
+
 @dataclass(frozen=True, slots=True)
 class RetrievalDiagnostic:
     """Text-free metadata for one retrieval attempt."""
@@ -580,6 +914,35 @@ class RetrievalItemDiagnostic:
             raise ValueError("match_reasons must not be empty")
         object.__setattr__(self, "match_reasons", reasons)
         object.__setattr__(self, "disposition", RetrievalDisposition(self.disposition))
+
+
+def decision_content_hash(
+    body: DecisionBody,
+    *,
+    title: str = "",
+    summary: str = "",
+    tags: Iterable[ExperienceTag] = (),
+    scope: ScopeRef | None = None,
+) -> str:
+    """Return deterministic, optionally scope-aware Decision content identity."""
+
+    payload: dict[str, Any] = {
+        "kind": "decision",
+        "title": title.strip(),
+        "summary": summary.strip(),
+        "body": body.to_dict(),
+        "tags": sorted((tag.namespace.value, tag.value) for tag in tags),
+    }
+    if scope:
+        payload["scope"] = [
+            scope.principal_id,
+            scope.scope_type.value,
+            scope.scope_id,
+            scope.repository_id,
+            scope.project_id,
+        ]
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 def lesson_content_hash(

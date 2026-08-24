@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from agent.experience.models import RetrievalQuery, ScopeRef, ScopeType
@@ -61,6 +62,104 @@ def _query(scope: ScopeRef, *, provider: str = "provider:a") -> RetrievalQuery:
         task_types=("persistence",),
         failure_fingerprints=("database is locked",),
     )
+
+
+def _authority(hash_hex: str) -> object:
+    from agent.experience.authority import DecisionTurnAuthority
+
+    return DecisionTurnAuthority(
+        source_turn_id="turn-authority",
+        source_session_id="session-authority",
+        raw_user_text_hash=hash_hex,
+        explicit_remember_grant=True,
+    )
+
+
+def _active_decision(store: ExperienceStore) -> dict:
+    created = store.create_decision(
+        item_id="decision",
+        principal_id="local-owner",
+        scope_type="project",
+        scope_id="project",
+        repository_id="repo",
+        project_id="project",
+        title="Use bounded SQLite retries",
+        summary="Decisions outrank historical lessons.",
+        body={
+            "statement": "Use Decision Memory for SQLite retry policy.",
+            "rationale": "The current policy was approved by the user.",
+            "source_type": "agent_proposal",
+            "authority": "unapproved",
+            "effective_at": 1.0,
+        },
+        tags={
+            "technology": ["sqlite"],
+            "task_type": ["persistence"],
+            "failure": ["database is locked"],
+        },
+        sensitivity="private_repo",
+        egress_policy="same_provider_trust_domain",
+        producer_trust_domain="provider:a",
+        source_hash="a" * 64,
+    )
+    assert created["id"] == "decision"
+    return store.activate_decision(
+        "decision",
+        authority=_authority("a" * 64),
+        transitioned_at=3.0,
+    )
+
+
+def _active_profile_decision(store: ExperienceStore, *, item_id: str) -> dict:
+    created = store.create_decision(
+        item_id=item_id,
+        principal_id="local-owner",
+        scope_type="profile",
+        scope_id="local-owner",
+        repository_id=None,
+        project_id=None,
+        title=f"Profile Decision {item_id}",
+        summary="Profile-scoped Decision.",
+        body={
+            "statement": "Use profile policy for this repository.",
+            "rationale": "The profile owner approved this durable preference.",
+            "source_type": "agent_proposal",
+            "authority": "unapproved",
+            "effective_at": 1.0,
+        },
+        tags={"technology": ["sqlite"]},
+        sensitivity="normal",
+        egress_policy="same_provider_trust_domain",
+        producer_trust_domain="provider:a",
+        source_hash="a" * 64,
+    )
+    return store.activate_decision(item_id, authority=_authority("a" * 64), transitioned_at=3.0)
+
+
+def _active_repository_decision(store: ExperienceStore, *, item_id: str) -> dict:
+    created = store.create_decision(
+        item_id=item_id,
+        principal_id="local-owner",
+        scope_type="repository",
+        scope_id="repo",
+        repository_id="repo",
+        project_id=None,
+        title=f"Repository Decision {item_id}",
+        summary="Repository-scoped Decision.",
+        body={
+            "statement": "Use repository policy for this codebase.",
+            "rationale": "The repository owner approved this durable policy.",
+            "source_type": "agent_proposal",
+            "authority": "unapproved",
+            "effective_at": 1.0,
+        },
+        tags={"technology": ["sqlite"]},
+        sensitivity="normal",
+        egress_policy="same_provider_trust_domain",
+        producer_trust_domain="provider:a",
+        source_hash="a" * 64,
+    )
+    return store.activate_decision(item_id, authority=_authority("a" * 64), transitioned_at=3.0)
 
 
 def test_deferred_application_api_is_not_exposed() -> None:
@@ -141,6 +240,120 @@ def test_task_signature_metadata_is_deterministic_and_text_is_not_stored(
         assert store.diagnostic_stats()["retrieval_count"] == 1
 
 
+def test_combined_retrieval_separates_decisions_and_lessons(tmp_path: Path) -> None:
+    with ExperienceStore((tmp_path / "state.db").resolve()) as store:
+        scope = _seed(store)
+        _active_decision(store)
+        service = ExperienceService(store, max_context_chars=2_000)
+
+        result = service.retrieve_decisions_and_lessons(
+            _query(scope),
+            turn_id="turn-combined",
+            work_id="work-combined",
+            max_decisions=2,
+            max_lessons=2,
+        )
+
+        assert [item.item_id for item in result.decisions] == ["decision"]
+        assert [item.item_id for item in result.lessons] == ["lesson"]
+        assert result.decisions[0].authority == "user"
+        assert result.item_diagnostics[0].item_id == "decision"
+        assert result.item_diagnostics[1].item_id == "lesson"
+
+        context = service.format_combined_context(result)
+        assert context.startswith("<active-decision-context")
+        assert context.index("</active-decision-context>") < context.index("<work-experience-context")
+        assert "Historical continuing decisions" in context
+        assert "Historical, fallible evidence" in context
+        assert "Use Decision Memory" in context
+        assert "Use &lt;BEGIN IMMEDIATE&gt;" in context
+
+
+def test_combined_retrieval_includes_broader_applicable_decisions(tmp_path: Path) -> None:
+    with ExperienceStore((tmp_path / "state.db").resolve()) as store:
+        scope = _seed(store)
+        _active_decision(store)
+        _active_repository_decision(store, item_id="repo_decision")
+        _active_profile_decision(store, item_id="profile_decision")
+        service = ExperienceService(store, max_context_chars=2_000)
+
+        result = service.retrieve_decisions_and_lessons(
+            _query(scope),
+            turn_id="turn-broader",
+            work_id="work-broader",
+            max_decisions=5,
+            max_lessons=1,
+        )
+
+        assert [item.item_id for item in result.decisions] == [
+            "decision",
+            "repo_decision",
+            "profile_decision",
+        ]
+        context = service.format_combined_context(result)
+        assert "project/project" in context
+        assert "repository/repo" in context
+        assert "profile/local-owner" in context
+
+
+def test_combined_context_truncates_long_decision_items(tmp_path: Path) -> None:
+    with ExperienceStore((tmp_path / "state.db").resolve()) as store:
+        scope = _seed(store)
+        store.create_decision(
+            item_id="long_decision",
+            principal_id="local-owner",
+            scope_type="project",
+            scope_id="project",
+            repository_id="repo",
+            project_id="project",
+            title="Long Decision",
+            summary="A long Decision for truncation.",
+            body={
+                "statement": "Use this very long decision statement " + ("word " * 80),
+                "rationale": "Use this very long rationale " + ("reason " * 80),
+                "source_type": "agent_proposal",
+                "authority": "unapproved",
+                "effective_at": 1.0,
+            },
+            tags={"technology": ["sqlite"]},
+            sensitivity="normal",
+            egress_policy="explicit_any_provider",
+            producer_trust_domain="provider:a",
+            source_hash="a" * 64,
+        )
+        store.activate_decision("long_decision", authority=_authority("a" * 64), transitioned_at=3.0)
+        service = ExperienceService(store, max_context_chars=320)
+
+        result = service.retrieve_decisions_and_lessons(
+            _query(scope),
+            turn_id="turn-long",
+            work_id="work-long",
+            max_decisions=1,
+            max_lessons=0,
+        )
+
+        context = service.format_combined_context(result)
+        assert len(context) <= 320
+        assert context.startswith("<active-decision-context")
+        assert "Use this very long decision statement" in context
+        assert "…" in context
+
+
+def test_combined_provider_fallback_reauthorizes_and_filters(tmp_path: Path) -> None:
+    with ExperienceStore((tmp_path / "state.db").resolve()) as store:
+        scope = _seed(store)
+        _active_decision(store)
+        service = ExperienceService(store, max_context_chars=1_200)
+
+        result = service.retrieve_decisions_and_lessons(
+            _query(scope),
+            turn_id="turn-provider",
+            work_id="work-provider",
+        )
+        assert result.decisions
+        assert service.format_combined_context(result, provider_trust_domain="provider:b") == ""
+
+
 def test_shadow_retrieval_does_not_require_injection_permission(tmp_path: Path) -> None:
     with ExperienceStore((tmp_path / "state.db").resolve()) as store:
         scope = _seed(store)
@@ -171,3 +384,26 @@ def test_shadow_retrieval_does_not_require_injection_permission(tmp_path: Path) 
 
         assert [item.item_id for item in shadow.items] == ["lesson"]
         assert assist.items == ()
+
+
+def test_record_disclosure_events_records_only_injected_items(tmp_path: Path) -> None:
+    with ExperienceStore((tmp_path / "state.db").resolve()) as store:
+        scope = _seed(store)
+        _active_decision(store)
+        service = ExperienceService(store)
+
+        result = service.retrieve_decisions_and_lessons(
+            _query(scope),
+            turn_id="turn-disclosure",
+            work_id="work-disclosure",
+            max_decisions=1,
+            max_lessons=1,
+        )
+        assert service.record_disclosure_events(result) == 2
+        assert service.record_disclosure_events(result) == 2
+        events = [
+            event for event in store.list_influence_events(retrieval_id=result.diagnostic.id)
+            if event["event_type"] == "disclosed"
+        ]
+        assert len(events) == 2
+        assert {event["item_id"] for event in events} == {"decision", "lesson"}

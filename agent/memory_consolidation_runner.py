@@ -1225,6 +1225,8 @@ def retrieve_consolidated_memory(*, scope_id: str, query: str,
         return ""
     lines = ["## Consolidated Memory"]
     for row in rows:
+        if row.get("status") == "conflicted":
+            continue
         claim = _text(row.get("claim"), limit=2_000)
         if claim:
             lines.append(f"- {claim}")

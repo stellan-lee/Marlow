@@ -219,7 +219,7 @@ class TestMemoryManager:
         mgr.add_provider(p2)
 
         result = mgr.prefetch_all("query")
-        assert result == "Has memories"
+        assert result == "[advisory recollection; source=builtin; authority=unverified_external]\nHas memories"
 
     def test_prefetch_exposes_metadata_only_hit_miss_and_failure_stats(self):
         mgr = MemoryManager()
@@ -230,7 +230,7 @@ class TestMemoryManager:
         mgr.add_provider(hit)
         mgr.add_provider(failed)
 
-        assert mgr.prefetch_all("private query", session_id="s1") == "remembered"
+        assert mgr.prefetch_all("private query", session_id="s1") == "[advisory recollection; source=builtin; authority=unverified_external]\nremembered"
         assert mgr.consume_prefetch_stats() == [
             {
                 "provider": "builtin",
@@ -838,6 +838,8 @@ class TestMemoryContextFencing:
         assert result.startswith("<memory-context>")
         assert result.rstrip().endswith("</memory-context>")
         assert "NOT new user input" in result
+        assert "advisory, fallible recollection" in result
+        assert "current user instructions" in result
         assert "user likes dark mode" in result
 
     def test_build_memory_context_block_empty_input(self):

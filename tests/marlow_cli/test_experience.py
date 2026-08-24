@@ -197,6 +197,10 @@ def test_capture_only_project_stays_capture_when_global_mode_is_assist(
         (["delete", "lesson_1", "--purge", "--yes"], "delete"),
         (["why", "--last"], "why"),
         (["why-last"], "why-last"),
+        (["status"], "status"),
+        (["doctor", "--repository-root", "."], "doctor"),
+        (["rebuild-index"], "rebuild-index"),
+        (["prune", "--apply"], "prune"),
     ],
 )
 def test_parser_exposes_governance_commands(argv: list[str], command: str) -> None:
@@ -466,6 +470,34 @@ def test_why_last_fails_cleanly_when_store_has_no_latest_lookup(monkeypatch, cap
         argparse.Namespace(project_root=None, json=False)
     ) == 0
     assert "not available in this Marlow build" in capsys.readouterr().out
+
+
+def test_status_doctor_rebuild_and_prune_commands_emit_metadata_only(monkeypatch, capsys) -> None:
+    class Store:
+        def schema_status(self):
+            return {"schema_version": "5", "schema_current": True}
+        def diagnostic_stats(self):
+            return {"retrieval_count": 1, "tag_count": 2, "link_count": 3}
+        def doctor(self, repository_root=None):
+            assert repository_root == "/repo"
+            return {"ok": True, "foreign_key_violations": [], "orphan_current_revisions": [], "supersession_cycles": [], "active_decision_authority_violations": [], "policy_anchor_violations": [], "stale_migration_mappings": [], "schema_current": True, "fts_current": True}
+        def rebuild_search_index(self):
+            return {"rebuilt": True, "fts_enabled": True}
+        def diagnostic_prune_plan(self, **kwargs):
+            return {"retrievals_to_remove": 1, "events_to_remove": 2}
+
+    monkeypatch.setattr(experience, "_open_store", lambda: _store_context(Store()))
+
+    assert experience._cmd_status(argparse.Namespace(json=True)) == 0
+    assert "schema_version" in capsys.readouterr().out
+    assert experience._cmd_doctor(argparse.Namespace(repository_root="/repo", json=True)) == 0
+    assert "ok" in capsys.readouterr().out
+    assert experience._cmd_rebuild_index(argparse.Namespace(json=True)) == 0
+    assert "rebuilt" in capsys.readouterr().out
+    assert experience._cmd_prune(
+        argparse.Namespace(apply=False, now=None, max_age_days=30, max_retrievals=10, max_events=20, json=True)
+    ) == 0
+    assert "retrievals_to_remove" in capsys.readouterr().out
 
 
 def test_latest_retrieval_uses_public_store_capability() -> None:

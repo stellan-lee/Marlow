@@ -2191,7 +2191,7 @@ class AIAgent:
             if _consolidation_cfg.get("enabled") and final_response and original_user_message:
                 from agent.memory_consolidation_runner import append_conversation_evidence
                 _scope_type = "user" if getattr(self, "_user_id", "") else "profile"
-                _scope_id = getattr(self, "_user_id", "") or getattr(self, "session_id", "") or "default"
+                _scope_id = getattr(self, "_user_id", "") or "local-owner"
                 append_conversation_evidence(
                     scope_id=str(_scope_id),
                     scope_type=_scope_type,

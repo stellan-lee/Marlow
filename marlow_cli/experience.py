@@ -40,6 +40,13 @@ _LESSON_STATUSES = (
     "rejected",
     "retracted",
 )
+_DECISION_STATUSES = (
+    "candidate",
+    "active",
+    "review_required",
+    "superseded",
+    "revoked",
+)
 _LATEST_RETRIEVAL_UNAVAILABLE = object()
 
 _PURGE_DISCLOSURE = (
@@ -214,6 +221,14 @@ def _promote_global_mode(requested_mode: str) -> None:
     )
 
 
+def _global_mode() -> str:
+    from marlow_cli.config import load_config
+
+    configured = load_config().get("experience", {})
+    mode = configured.get("mode", "off") if isinstance(configured, dict) else "off"
+    return mode if mode in _MODES else "off"
+
+
 def _cmd_policy_set(args: argparse.Namespace) -> int:
     policy = _make_policy(args)
     with _open_store() as store:
@@ -274,11 +289,81 @@ def _cmd_policy_show(args: argparse.Namespace) -> int:
     return 0
 
 
-def _global_mode() -> str:
-    from marlow_cli.config import load_config
+def _cmd_status(args: argparse.Namespace) -> int:
+    with _open_store() as store:
+        payload = store.schema_status()
+        payload.update(store.diagnostic_stats())
+    if args.json:
+        print(json.dumps(_plain(payload), indent=2, ensure_ascii=False))
+        return 0
+    print("Work Experience status")
+    print(f"  schema: {_field(payload, 'schema_version')} (current={_yes_no(_field(payload, 'schema_current'))})")
+    print(f"  FTS unicode61: {_yes_no(_field(payload, 'unicode61_index'))}")
+    print(f"  FTS trigram: {_yes_no(_field(payload, 'trigram_index'))}")
+    print(f"  revisions: {_field(payload, 'revision_count')}")
+    print(f"  retrievals: {_field(payload, 'retrieval_count')}")
+    print(f"  events: {_field(payload, 'event_count')}")
+    print(f"  tags: {_field(payload, 'tag_count')}")
+    print(f"  links: {_field(payload, 'link_count')}")
+    return 0
 
-    experience = load_config().get("experience", {})
-    return str(experience.get("mode", "off")) if isinstance(experience, dict) else "off"
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    with _open_store() as store:
+        report = store.doctor(repository_root=args.repository_root or os.getcwd())
+    if args.json:
+        print(json.dumps(_plain(report), indent=2, ensure_ascii=False))
+        return 0 if report["ok"] else 2
+    print("Work Experience doctor")
+    print(f"  ok: {_yes_no(report['ok'])}")
+    print(f"  schema_current: {_yes_no(report['schema_current'])}")
+    print(f"  FTS current: {_yes_no(report['fts_current'])}")
+    print(f"  foreign_key_violations: {len(report['foreign_key_violations'])}")
+    print(f"  orphan_current_revisions: {len(report['orphan_current_revisions'])}")
+    print(f"  supersession_cycles: {len(report['supersession_cycles'])}")
+    print(f"  active Decision authority violations: {len(report['active_decision_authority_violations'])}")
+    print(f"  policy anchor violations: {len(report['policy_anchor_violations'])}")
+    print(f"  stale migration mappings: {len(report['stale_migration_mappings'])}")
+    return 0 if report["ok"] else 2
+
+
+def _cmd_rebuild_index(args: argparse.Namespace) -> int:
+    with _open_store() as store:
+        result = store.rebuild_search_index()
+    if args.json:
+        print(json.dumps(_plain(result), indent=2, ensure_ascii=False))
+        return 0
+    if result.get("rebuilt"):
+        print("Work Experience search indexes rebuilt")
+    else:
+        print(f"Work Experience search indexes not rebuilt: {result.get('reason', 'unknown')}")
+    return 0
+
+
+def _cmd_prune(args: argparse.Namespace) -> int:
+    with _open_store() as store:
+        if args.apply:
+            result = store.prune_diagnostics(
+                now=args.now,
+                max_age_days=args.max_age_days,
+                max_retrievals=args.max_retrievals,
+                max_events=args.max_events,
+            )
+        else:
+            result = store.diagnostic_prune_plan(
+                now=args.now,
+                max_age_days=args.max_age_days,
+                max_retrievals=args.max_retrievals,
+                max_events=args.max_events,
+            )
+    if args.json:
+        print(json.dumps(_plain(result), indent=2, ensure_ascii=False))
+        return 0
+    action = "Would remove" if not args.apply else "Removed"
+    print(f"Work Experience diagnostics {action}:")
+    print(f"  retrievals: {_field(result, 'retrievals_to_remove', _field(result, 'retrievals_removed'))}")
+    print(f"  events: {_field(result, 'events_to_remove', _field(result, 'events_removed'))}")
+    return 0
 
 
 def _tags(args: argparse.Namespace) -> tuple[tuple[str, str], ...]:
@@ -324,6 +409,350 @@ def _cmd_add(args: argparse.Namespace) -> int:
         )
     print(f"Candidate lesson created: {_field(lesson, 'id')}")
     print("Approve it before it can enter normal recall.")
+    return 0
+
+
+def _decision_scope(store: Any, project_root: str | Path | None) -> Any:
+    resolved = _resolved_scope(store, project_root)
+    return resolved.as_ref()
+
+
+def _resolved_decision_scope(store: Any, project_root: str | Path | None) -> Any:
+    return _resolved_scope(store, project_root)
+
+
+def _decision_authority(raw_intent: str, *, approve: str | None = None, supersede: str | None = None, revoke: str | None = None) -> Any:
+    from agent.experience.authority import decision_authority_from_text
+
+    return decision_authority_from_text(
+        f"cli_turn_{int(time.time() * 1000)}",
+        f"cli_session_{_profile_namespace()}",
+        raw_intent,
+        approved_item_ids=(approve,) if approve else (),
+        supersede_target_ids=(supersede,) if supersede else (),
+        revoke_target_ids=(revoke,) if revoke else (),
+    )
+
+
+def _in_current_scope(item: Mapping[str, Any], scope: Any) -> bool:
+    return (
+        item.get("principal_id") == scope.principal_id
+        and item.get("scope_type") == scope.scope_type.value
+        and item.get("scope_id") == scope.scope_id
+        and item.get("repository_id") == scope.repository_id
+        and item.get("project_id") == scope.project_id
+    )
+
+
+def _require_scoped_decision(item: Any, scope: Any) -> None:
+    if not _in_current_scope(item, scope):
+        raise LookupError("decision is outside the current project scope")
+
+
+def _decision_body(args: argparse.Namespace, *, source_type: str, authority: str) -> dict[str, Any]:
+    from agent.experience.models import DecisionAuthority, DecisionSourceType
+
+    body = {
+        "statement": args.statement,
+        "rationale": args.rationale,
+        "source_type": DecisionSourceType(source_type).value,
+        "authority": DecisionAuthority(authority).value,
+        "effective_at": args.effective_at,
+    }
+    if args.expires_at is not None:
+        body["expires_at"] = args.expires_at
+    if getattr(args, "policy_anchor_path", None):
+        body["policy_anchor_path"] = args.policy_anchor_path
+    if getattr(args, "policy_anchor_hash", None):
+        body["policy_anchor_hash"] = args.policy_anchor_hash
+    return body
+
+
+def _print_decision(decision: Any) -> None:
+    revision = _field(decision, "revision")
+    body = _field(revision, "body")
+    print(f"{_field(decision, 'id')}  [{_enum_text(_field(decision, 'current_status'))}]")
+    print(f"Title: {_field(revision, 'title')}")
+    print(f"Summary: {_field(revision, 'summary')}")
+    print(f"Revision: {_field(revision, 'revision')}")
+    print(f"Statement: {_field(body, 'statement')}")
+    print(f"Rationale: {_field(body, 'rationale')}")
+    print(f"Authority: {_field(body, 'authority')}")
+    print(f"Source: {_field(body, 'source_type')}")
+    print(f"Scope: {_enum_text(_field(decision, 'scope_type'))}")
+    print(f"Sensitivity: {_enum_text(_field(decision, 'sensitivity'))}")
+    print(f"Egress: {_enum_text(_field(decision, 'egress_policy'))}")
+
+
+def _print_decision_links(links: Sequence[Mapping[str, Any]]) -> None:
+    if not links:
+        return
+    print("Relationships:")
+    for link in links:
+        print(
+            f"  {_field(link, 'from_item_id')} r{_field(link, 'from_revision')} "
+            f"{_field(link, 'relation')} "
+            f"{_field(link, 'to_item_id')} r{_field(link, 'to_revision')}"
+        )
+
+
+def _cmd_decision_add(args: argparse.Namespace) -> int:
+    with _open_store() as store:
+        scope = _decision_scope(store, args.project_root)
+        decision = store.create_decision(
+            principal_id=scope.principal_id,
+            scope_type=scope.scope_type,
+            scope_id=scope.scope_id,
+            repository_id=scope.repository_id,
+            project_id=scope.project_id,
+            title=args.title,
+            summary=args.summary,
+            body=_decision_body(args, source_type="manual_import", authority="unapproved"),
+            tags=_tags(args),
+            sensitivity=args.sensitivity,
+            egress_policy=args.egress,
+            created_by="user",
+        )
+    print(f"Candidate decision created: {_field(decision, 'id')}")
+    print("Approve it before it can enter normal recall.")
+    return 0
+
+
+def _cmd_decision_propose(args: argparse.Namespace) -> int:
+    with _open_store() as store:
+        scope = _decision_scope(store, args.project_root)
+        decision = store.create_decision(
+            principal_id=scope.principal_id,
+            scope_type=scope.scope_type,
+            scope_id=scope.scope_id,
+            repository_id=scope.repository_id,
+            project_id=scope.project_id,
+            title=args.title or "Agent Decision Proposal",
+            summary=args.summary or "",
+            body=_decision_body(args, source_type="agent_proposal", authority="unapproved"),
+            tags=_tags(args),
+            created_by="agent",
+        )
+    print(f"Candidate decision proposal created: {_field(decision, 'id')}")
+    return 0
+
+
+def _cmd_decision_list(args: argparse.Namespace) -> int:
+    with _open_store() as store:
+        resolved = None if args.all_scopes else _resolved_scope(store, args.project_root)
+        scope = None if resolved is None else resolved.as_ref()
+        decisions = store.list_decisions(
+            principal_id="local-owner",
+            repository_id=None if scope is None else scope.repository_id,
+            project_id=None if scope is None else scope.project_id,
+            status=args.status,
+            limit=args.limit,
+        )
+    if args.json:
+        print(json.dumps([_plain(item) for item in decisions], indent=2, ensure_ascii=False))
+        return 0
+    if not decisions:
+        print("No matching Work Experience decisions.")
+        return 0
+    for decision in decisions:
+        revision = _field(decision, "revision", {})
+        body = _field(revision, "body", {})
+        print(
+            f"{_field(decision, 'id')}  {_enum_text(_field(decision, 'current_status')):<14} "
+            f"r{_field(revision, 'revision', _field(decision, 'current_revision', '?'))}  "
+            f"{_field(body, 'authority'):<17} "
+            f"{_field(revision, 'title', _field(decision, 'title', ''))}"
+        )
+    return 0
+
+
+def _cmd_decision_show(args: argparse.Namespace) -> int:
+    with _open_store() as store:
+        decision = store.get_decision(args.decision_id, include_history=True)
+        if decision is None:
+            raise LookupError("decision not found")
+        scope = _resolved_decision_scope(store, args.project_root).as_ref()
+        _require_scoped_decision(decision, scope)
+        links = store.list_links(item_id=args.decision_id)
+    payload = _plain(decision)
+    if args.json:
+        payload["links"] = _plain(links)
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        _print_decision(decision)
+        _print_decision_links(links)
+    return 0
+
+
+def _cmd_decision_approve(args: argparse.Namespace) -> int:
+    with _open_store() as store:
+        resolved = _resolved_decision_scope(store, args.project_root)
+        scope = resolved.as_ref()
+        current = store.get_decision(args.decision_id)
+        if current is None:
+            raise LookupError("decision not found")
+        _require_scoped_decision(current, scope)
+        authority = _decision_authority(f"approve {args.decision_id}", approve=args.decision_id)
+        decision = store.activate_decision(
+            args.decision_id,
+            authority=authority,
+            repository_root=resolved.repository_root,
+            repository_id=scope.repository_id,
+            reason=args.reason or "approved by local owner",
+        )
+    print(f"Decision approved: {_field(decision, 'id')} (active)")
+    return 0
+
+
+def _cmd_decision_edit(args: argparse.Namespace) -> int:
+    kwargs: dict[str, Any] = {}
+    if args.reason is not None:
+        kwargs["edit_reason"] = args.reason
+    if args.title is not None:
+        kwargs["title"] = args.title
+    if args.summary is not None:
+        kwargs["summary"] = args.summary
+    if any(getattr(args, attr, None) for attr in ("task_type", "technology", "entity", "failure")):
+        kwargs["tags"] = _tags(args)
+    if args.review_after is not None:
+        kwargs["review_after"] = args.review_after
+    if not kwargs and not any(
+        getattr(args, attr, None) is not None
+        for attr in ("statement", "rationale", "effective_at", "expires_at", "policy_anchor_path", "policy_anchor_hash")
+    ):
+        raise ValueError("decision edit requires at least one content or metadata change")
+    with _open_store() as store:
+        scope = _resolved_decision_scope(store, args.project_root).as_ref()
+        current = store.get_decision(args.decision_id)
+        if current is None:
+            raise LookupError("decision not found")
+        _require_scoped_decision(current, scope)
+        if any(getattr(args, attr, None) is not None for attr in ("statement", "rationale", "effective_at", "expires_at", "policy_anchor_path", "policy_anchor_hash")):
+            body = dict(current["revision"]["body"])
+            if args.statement is not None:
+                body["statement"] = args.statement
+            if args.rationale is not None:
+                body["rationale"] = args.rationale
+            if args.effective_at is not None:
+                body["effective_at"] = args.effective_at
+            if args.expires_at is not None:
+                body["expires_at"] = args.expires_at
+            if args.policy_anchor_path is not None:
+                body["policy_anchor_path"] = args.policy_anchor_path
+            if args.policy_anchor_hash is not None:
+                body["policy_anchor_hash"] = args.policy_anchor_hash
+            kwargs["body"] = body
+        decision = store.edit_decision(args.decision_id, **kwargs)
+    print(f"Decision candidate revised: {_field(decision, 'id')} r{_field(decision, 'current_revision')}")
+    return 0
+
+
+def _cmd_decision_supersede(args: argparse.Namespace) -> int:
+    with _open_store() as store:
+        resolved = _resolved_decision_scope(store, args.project_root)
+        scope = resolved.as_ref()
+        old = store.get_decision(args.decision_id)
+        if old is None:
+            raise LookupError("decision not found")
+        _require_scoped_decision(old, scope)
+        authority = _decision_authority(f"supersede {args.decision_id}", supersede=args.decision_id)
+        decision = store.supersede_decision(
+            args.decision_id,
+            authority=authority,
+            principal_id=scope.principal_id,
+            scope_type=scope.scope_type,
+            scope_id=scope.scope_id,
+            repository_id=scope.repository_id,
+            project_id=scope.project_id,
+            title=args.title or "Superseding Decision",
+            summary=args.summary or "",
+            body=_decision_body(args, source_type="user_turn", authority="user"),
+            tags=_tags(args),
+            repository_root=resolved.repository_root,
+            reason=args.reason,
+        )
+    print(f"Decision superseded: {_field(old, 'id')} -> {_field(decision, 'id')}")
+    return 0
+
+
+def _cmd_decision_revoke(args: argparse.Namespace) -> int:
+    with _open_store() as store:
+        resolved = _resolved_decision_scope(store, args.project_root)
+        scope = resolved.as_ref()
+        current = store.get_decision(args.decision_id)
+        if current is None:
+            raise LookupError("decision not found")
+        _require_scoped_decision(current, scope)
+        authority = _decision_authority(f"revoke {args.decision_id}", revoke=args.decision_id)
+        decision = store.revoke_decision(
+            args.decision_id,
+            authority=authority,
+            reason=args.reason or "revoked by local owner",
+        )
+    print(f"Decision revoked: {_field(decision, 'id')}")
+    return 0
+
+
+def _cmd_decision_reapprove(args: argparse.Namespace) -> int:
+    with _open_store() as store:
+        resolved = _resolved_decision_scope(store, args.project_root)
+        scope = resolved.as_ref()
+        current = store.get_decision(args.decision_id)
+        if current is None:
+            raise LookupError("decision not found")
+        _require_scoped_decision(current, scope)
+        authority = _decision_authority(f"approve {args.decision_id}", approve=args.decision_id)
+        decision = store.reapprove_decision(
+            args.decision_id,
+            authority=authority,
+            repository_root=resolved.repository_root,
+            repository_id=scope.repository_id,
+            reason=args.reason or "reapproved by local owner",
+        )
+    print(f"Decision reapproved: {_field(decision, 'id')} (active)")
+    return 0
+
+
+def _cmd_decision_related(args: argparse.Namespace) -> int:
+    with _open_store() as store:
+        resolved = _resolved_decision_scope(store, args.project_root)
+        scope = resolved.as_ref()
+        decision = store.get_decision(args.decision_id, include_history=True)
+        if decision is None:
+            raise LookupError("decision not found")
+        _require_scoped_decision(decision, scope)
+        payload = {
+            "decision": _plain(decision),
+            "links": store.list_links(item_id=args.decision_id),
+            "related": store.related_decisions(item_id=args.decision_id),
+        }
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
+def _cmd_decision_import_policy(args: argparse.Namespace) -> int:
+    with _open_store() as store:
+        resolved = _resolved_decision_scope(store, args.project_root)
+        scope = resolved.as_ref()
+        decision = store.create_authorized_decision(
+            principal_id=scope.principal_id,
+            scope_type=scope.scope_type,
+            scope_id=scope.scope_id,
+            repository_id=scope.repository_id,
+            project_id=scope.project_id,
+            title=args.title,
+            summary=args.summary,
+            body=_decision_body(args, source_type="repository_policy", authority="repository_policy"),
+            tags=_tags(args),
+            created_by="import",
+            authority=_decision_authority(f"import policy {args.policy_anchor_path}"),
+            repository_root=resolved.repository_root,
+        )
+    if decision["current_status"] == "active":
+        print(f"Repository-policy decision imported: {_field(decision, 'id')}")
+    else:
+        print(f"Repository-policy decision candidate created: {_field(decision, 'id')}")
+        print("Review and approve it after fixing the anchored policy file.")
     return 0
 
 
@@ -418,16 +847,60 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     return 0
 
 
+def _legacy_consolidation_db_path() -> Path:
+    from marlow_constants import get_marlow_home
+
+    return Path(get_marlow_home()).expanduser().resolve() / "memory_consolidation.db"
+
+
+def _cmd_migrate_consolidation(args: argparse.Namespace) -> int:
+    from agent.experience.migrate_consolidation import apply_migration, plan_migration
+
+    source_path = Path(args.source).expanduser() if args.source else _legacy_consolidation_db_path()
+    if args.dry_run or not args.apply:
+        report = plan_migration(
+            source_path=source_path,
+            include_archived=args.include_archived,
+            limit=args.limit,
+        )
+    else:
+        report = apply_migration(
+            source_path=source_path,
+            target_path=_state_db_path(),
+            include_archived=args.include_archived,
+            limit=args.limit,
+        )
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 0
+    counts = report.get("counts", {})
+    print("Consolidation migration report")
+    print(f"  source: {source_path}")
+    print(f"  source_hash: {report.get('source_store_hash')}")
+    print(f"  scanned: {counts.get('scanned', 0)}")
+    print(f"  importable candidates: {counts.get('importable', 0)}")
+    print(f"  skipped: {counts.get('skipped', 0)}")
+    if "applied" in report:
+        print(f"  applied: {len(report.get('applied', []))}")
+        print(f"  already imported: {counts.get('already_imported', 0)}")
+        print(f"  needs manual review: {counts.get('needs_manual_review', 0)}")
+    print("Migrated decisions are candidates only and require review before recall.")
+    return 0
+
+
 def _cmd_purge(args: argparse.Namespace) -> int:
+    item_id = getattr(args, "item_id", None) or getattr(args, "lesson_id", None)
+    if not item_id:
+        raise ValueError("purge requires an item id")
     print(_PURGE_DISCLOSURE)
-    if not args.yes and not _confirm(f"Permanently purge {args.lesson_id}?"):
+    if not args.yes and not _confirm(f"Permanently purge {item_id}?"):
         print("Purge cancelled.")
         return 0
     with _open_store() as store:
-        purge_result = store.purge_item(args.lesson_id)
+        purge_result = store.purge_item(item_id)
     if not purge_result.get("purged"):
-        raise LookupError("lesson not found")
-    print(f"Purged {args.lesson_id} from the active experience database.")
+        raise LookupError("experience item not found")
+    print(f"Purged {item_id} from the active experience database.")
     print("Historical copies outside the active database may still exist as disclosed above.")
     return 0
 
@@ -464,8 +937,12 @@ def _cmd_why_last(args: argparse.Namespace) -> int:
         return 0
     for item in items:
         reasons = ", ".join(_field(item, "match_reasons", ()) or ()) or "no match reasons recorded"
+        kind = _enum_text(_field(item, "kind")) or "unknown"
+        title = _field(item, "title") or _field(item, "item_id")
+        status = _enum_text(_field(item, "status")) or "unknown"
         print(
             f"  #{_field(item, 'rank', '?')} {_field(item, 'item_id')} "
+            f"kind={kind} status={status} title={title} "
             f"[{_enum_text(_field(item, 'disposition', 'retrieved'))}] score={_field(item, 'score', '?')}"
         )
         print(f"     why: {reasons}")
@@ -749,6 +1226,131 @@ def register_cli(parent: argparse.ArgumentParser) -> None:
     add.add_argument("--producer-trust-domain")
     add.set_defaults(func=_dispatch(_cmd_add))
 
+    decision = commands.add_parser("decision", help="Govern Decision Memory records")
+    decision.set_defaults(func=lambda _args: decision.print_help())
+    decision_commands = decision.add_subparsers(dest="experience_decision_command", metavar="COMMAND")
+
+    decision_add = decision_commands.add_parser("add", help="Add a user-authored candidate Decision")
+    decision_add.add_argument("--project-root", help="Directory inside the configured project")
+    decision_add.add_argument("--title", required=True, help="Short Decision title")
+    decision_add.add_argument("--summary", required=True, help="Concise Decision summary")
+    decision_add.add_argument("--statement", required=True, help="Behavioral decision statement")
+    decision_add.add_argument("--rationale", required=True, help="Evidence-based rationale")
+    decision_add.add_argument("--effective-at", type=float, dest="effective_at", required=True)
+    decision_add.add_argument("--expires-at", type=float)
+    decision_add.add_argument("--task-type", action="append", default=[])
+    decision_add.add_argument("--technology", action="append", default=[])
+    decision_add.add_argument("--entity", action="append", default=[])
+    decision_add.add_argument("--failure", action="append", default=[])
+    decision_add.add_argument("--sensitivity", choices=_SENSITIVITIES, default="normal")
+    decision_add.add_argument("--egress", choices=_EGRESS_POLICIES, default="local_only")
+    decision_add.set_defaults(func=_dispatch(_cmd_decision_add))
+
+    decision_propose = decision_commands.add_parser("propose", help="Add an agent-authored Decision proposal")
+    decision_propose.add_argument("--project-root", help="Directory inside the configured project")
+    decision_propose.add_argument("--title", help="Short Decision title")
+    decision_propose.add_argument("--summary", default="", help="Concise Decision summary")
+    decision_propose.add_argument("--statement", required=True, help="Behavioral decision statement")
+    decision_propose.add_argument("--rationale", required=True, help="Evidence-based rationale")
+    decision_propose.add_argument("--effective-at", type=float, dest="effective_at", required=True)
+    decision_propose.add_argument("--expires-at", type=float)
+    decision_propose.add_argument("--task-type", action="append", default=[])
+    decision_propose.add_argument("--technology", action="append", default=[])
+    decision_propose.add_argument("--entity", action="append", default=[])
+    decision_propose.add_argument("--failure", action="append", default=[])
+    decision_propose.set_defaults(func=_dispatch(_cmd_decision_propose))
+
+    decision_list = decision_commands.add_parser("list", help="List Decisions in the current project")
+    decision_list.add_argument("--project-root", help="Directory inside the configured project")
+    decision_list.add_argument("--all-scopes", action="store_true", help="List Decisions across this profile")
+    decision_list.add_argument("--status", action="append", choices=_DECISION_STATUSES)
+    decision_list.add_argument("--limit", type=_positive_int, default=100)
+    decision_list.add_argument("--json", action="store_true")
+    decision_list.set_defaults(func=_dispatch(_cmd_decision_list))
+
+    decision_show = decision_commands.add_parser("show", help="Show one Decision")
+    decision_show.add_argument("decision_id")
+    decision_show.add_argument("--project-root", help="Directory inside the configured project")
+    decision_show.add_argument("--json", action="store_true")
+    decision_show.set_defaults(func=_dispatch(_cmd_decision_show))
+
+    decision_approve = decision_commands.add_parser("approve", help="Activate a candidate Decision")
+    decision_approve.add_argument("decision_id")
+    decision_approve.add_argument("--project-root", help="Directory inside the configured project")
+    decision_approve.add_argument("--reason")
+    decision_approve.set_defaults(func=_dispatch(_cmd_decision_approve))
+
+    decision_edit = decision_commands.add_parser("edit", help="Append an immutable Decision revision")
+    decision_edit.add_argument("decision_id")
+    decision_edit.add_argument("--project-root", help="Directory inside the configured project")
+    decision_edit.add_argument("--reason")
+    decision_edit.add_argument("--title")
+    decision_edit.add_argument("--summary")
+    decision_edit.add_argument("--statement")
+    decision_edit.add_argument("--rationale")
+    decision_edit.add_argument("--effective-at", type=float, dest="effective_at")
+    decision_edit.add_argument("--expires-at", type=float)
+    decision_edit.add_argument("--policy-anchor-path")
+    decision_edit.add_argument("--policy-anchor-hash")
+    decision_edit.add_argument("--task-type", action="append", default=[])
+    decision_edit.add_argument("--technology", action="append", default=[])
+    decision_edit.add_argument("--entity", action="append", default=[])
+    decision_edit.add_argument("--failure", action="append", default=[])
+    decision_edit.add_argument("--review-after", type=float)
+    decision_edit.set_defaults(func=_dispatch(_cmd_decision_edit))
+
+    decision_supersede = decision_commands.add_parser("supersede", help="Replace a Decision")
+    decision_supersede.add_argument("decision_id")
+    decision_supersede.add_argument("--project-root", help="Directory inside the configured project")
+    decision_supersede.add_argument("--title", help="Short replacement Decision title")
+    decision_supersede.add_argument("--summary", default="", help="Concise replacement summary")
+    decision_supersede.add_argument("--statement", required=True, help="Replacement decision statement")
+    decision_supersede.add_argument("--rationale", required=True, help="Replacement rationale")
+    decision_supersede.add_argument("--effective-at", type=float, dest="effective_at", required=True)
+    decision_supersede.add_argument("--expires-at", type=float)
+    decision_supersede.add_argument("--task-type", action="append", default=[])
+    decision_supersede.add_argument("--technology", action="append", default=[])
+    decision_supersede.add_argument("--entity", action="append", default=[])
+    decision_supersede.add_argument("--failure", action="append", default=[])
+    decision_supersede.add_argument("--reason")
+    decision_supersede.set_defaults(func=_dispatch(_cmd_decision_supersede))
+
+    decision_revoke = decision_commands.add_parser("revoke", help="Revoke a Decision")
+    decision_revoke.add_argument("decision_id")
+    decision_revoke.add_argument("--project-root", help="Directory inside the configured project")
+    decision_revoke.add_argument("--reason")
+    decision_revoke.set_defaults(func=_dispatch(_cmd_decision_revoke))
+
+    decision_reapprove = decision_commands.add_parser("reapprove", help="Reactivate a reviewed Decision")
+    decision_reapprove.add_argument("decision_id")
+    decision_reapprove.add_argument("--project-root", help="Directory inside the configured project")
+    decision_reapprove.add_argument("--reason")
+    decision_reapprove.set_defaults(func=_dispatch(_cmd_decision_reapprove))
+
+    decision_related = decision_commands.add_parser("related", help="Show Decision relationships")
+    decision_related.add_argument("decision_id")
+    decision_related.add_argument("--project-root", help="Directory inside the configured project")
+    decision_related.set_defaults(func=_dispatch(_cmd_decision_related))
+
+    decision_import_policy = decision_commands.add_parser(
+        "import-policy",
+        help="Import a repository-policy Decision candidate",
+    )
+    decision_import_policy.add_argument("--project-root", required=True, help="Configured project root")
+    decision_import_policy.add_argument("--title", required=True, help="Policy Decision title")
+    decision_import_policy.add_argument("--summary", required=True, help="Policy Decision summary")
+    decision_import_policy.add_argument("--statement", required=True, help="Policy Decision statement")
+    decision_import_policy.add_argument("--rationale", required=True, help="Policy Decision rationale")
+    decision_import_policy.add_argument("--effective-at", type=float, dest="effective_at", required=True)
+    decision_import_policy.add_argument("--expires-at", type=float)
+    decision_import_policy.add_argument("--policy-anchor-path", required=True)
+    decision_import_policy.add_argument("--policy-anchor-hash", required=True)
+    decision_import_policy.add_argument("--task-type", action="append", default=[])
+    decision_import_policy.add_argument("--technology", action="append", default=[])
+    decision_import_policy.add_argument("--entity", action="append", default=[])
+    decision_import_policy.add_argument("--failure", action="append", default=[])
+    decision_import_policy.set_defaults(func=_dispatch(_cmd_decision_import_policy))
+
     list_parser = commands.add_parser("list", help="List lessons in the current project")
     list_parser.add_argument("--project-root", help="Directory inside the configured project")
     list_parser.add_argument("--all-scopes", action="store_true", help="List lessons across this profile")
@@ -778,8 +1380,38 @@ def register_cli(parent: argparse.ArgumentParser) -> None:
     retract.add_argument("--reason", required=True)
     retract.set_defaults(func=_dispatch(_cmd_retract))
 
+    migrate = commands.add_parser("migrate", help="Migration helpers for legacy memory data")
+    migrate.set_defaults(func=lambda _args: migrate.print_help())
+    migrate_commands = migrate.add_subparsers(dest="experience_migrate_command", metavar="COMMAND")
+    migrate_consolidation = migrate_commands.add_parser(
+        "consolidation",
+        help="Migrate legacy memory consolidation records into review candidates",
+    )
+    migrate_consolidation.add_argument(
+        "--source",
+        help="Legacy memory_consolidation.db path; defaults to the active Marlow home",
+    )
+    migrate_consolidation.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would migrate without writing (default)",
+    )
+    migrate_consolidation.add_argument(
+        "--apply",
+        action="store_true",
+        help="Import active/conflicted legacy decisions as candidate Decisions",
+    )
+    migrate_consolidation.add_argument(
+        "--include-archived",
+        action="store_true",
+        help="Report archived/superseded legacy records without activating them",
+    )
+    migrate_consolidation.add_argument("--limit", type=_positive_int, default=100)
+    migrate_consolidation.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    migrate_consolidation.set_defaults(func=_dispatch(_cmd_migrate_consolidation))
+
     purge = commands.add_parser("purge", help="Best-effort permanent deletion from active state.db")
-    purge.add_argument("lesson_id")
+    purge.add_argument("item_id")
     purge.add_argument("-y", "--yes", action="store_true", help="Skip interactive confirmation")
     purge.set_defaults(func=_dispatch(_cmd_purge))
 
@@ -787,7 +1419,7 @@ def register_cli(parent: argparse.ArgumentParser) -> None:
         "delete",
         help="Compatibility alias for `purge`; requires the explicit --purge flag",
     )
-    delete.add_argument("lesson_id")
+    delete.add_argument("item_id")
     delete.add_argument(
         "--purge",
         action="store_true",
@@ -807,3 +1439,31 @@ def register_cli(parent: argparse.ArgumentParser) -> None:
     why_last.add_argument("--project-root", help="Directory inside the configured project")
     why_last.add_argument("--json", action="store_true")
     why_last.set_defaults(func=_dispatch(_cmd_why_last), last=True)
+
+    status = commands.add_parser("status", help="Show Work Experience schema, FTS, and metadata counts")
+    status.add_argument("--json", action="store_true")
+    status.set_defaults(func=_dispatch(_cmd_status))
+
+    doctor = commands.add_parser("doctor", help="Run metadata-only Work Experience integrity checks")
+    doctor.add_argument("--repository-root", help="Repository root for anchored policy checks")
+    doctor.add_argument("--json", action="store_true")
+    doctor.set_defaults(func=_dispatch(_cmd_doctor))
+
+    rebuild_index = commands.add_parser(
+        "rebuild-index",
+        help="Rebuild Work Experience unicode61 and trigram search indexes",
+    )
+    rebuild_index.add_argument("--json", action="store_true")
+    rebuild_index.set_defaults(func=_dispatch(_cmd_rebuild_index))
+
+    prune = commands.add_parser(
+        "prune",
+        help="Dry-run or apply bounded pruning for retrieval diagnostics",
+    )
+    prune.add_argument("--apply", action="store_true", help="Actually delete diagnostics")
+    prune.add_argument("--now", type=float)
+    prune.add_argument("--max-age-days", type=_positive_int, default=30)
+    prune.add_argument("--max-retrievals", type=_positive_int, default=10_000)
+    prune.add_argument("--max-events", type=_positive_int, default=10_000)
+    prune.add_argument("--json", action="store_true")
+    prune.set_defaults(func=_dispatch(_cmd_prune))

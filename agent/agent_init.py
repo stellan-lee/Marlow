@@ -666,6 +666,12 @@ def init_agent(
     if not skip_memory:
         try:
             mem_config = _agent_cfg.get("memory", {})
+            experience_config = _agent_cfg.get("experience", {})
+            canonical_decision_capture_enabled = bool(
+                experience_config.get("decisions", {}).get("enabled", True)
+            )
+            if canonical_decision_capture_enabled:
+                agent._memory_structured_cards_enabled = False
             agent._memory_enabled = mem_config.get("memory_enabled", False)
             agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
             agent._memory_post_turn_prefetch_enabled = bool(
@@ -698,6 +704,8 @@ def init_agent(
             agent._memory_structured_cards_enabled = bool(
                 mem_config.get("structured_cards_enabled", False)
             )
+            if canonical_decision_capture_enabled:
+                agent._memory_structured_cards_enabled = False
             agent._memory_structured_cards_max_per_turn = int(
                 mem_config.get("structured_cards_max_per_turn", 5) or 5
             )

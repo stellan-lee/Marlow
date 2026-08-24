@@ -1317,6 +1317,13 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     if block_message is not None:
         return json.dumps({"error": block_message}, ensure_ascii=False)
 
+    if function_name == "experience_decision":
+        from tools.experience_decision_tool import experience_decision_tool
+
+        return experience_decision_tool(
+            function_args,
+            runtime=getattr(agent, "_decision_turn", None),
+        )
     if function_name == "todo":
         from tools.todo_tool import todo_tool as _todo_tool
         return _todo_tool(

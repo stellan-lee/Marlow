@@ -30,13 +30,16 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, TypeVar
 
+from agent.experience.anchors import validate_repository_anchor
+from agent.experience.authority import DecisionTurnAuthority
+
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 _UNSET = object()
-_CURRENT_SCHEMA_VERSION = "2"
-_CURRENT_FTS_VERSION = "1"
+_CURRENT_SCHEMA_VERSION = "5"
+_CURRENT_FTS_VERSION = "2"
 _CURRENT_SCHEMA_TABLES = frozenset(
     {
         "experience_schema_meta",
@@ -48,11 +51,16 @@ _CURRENT_SCHEMA_TABLES = frozenset(
         "experience_retrieval_items",
         "experience_events",
         "experience_search_content",
+        "experience_links",
+        "experience_migration_sources",
     }
 )
 
 _LESSON_STATUSES = frozenset(
     {"candidate", "active", "disputed", "deprecated", "rejected", "retracted"}
+)
+_DECISION_STATUSES = frozenset(
+    {"candidate", "active", "review_required", "superseded", "revoked"}
 )
 _SCOPE_TYPES = frozenset({"project", "repository", "profile"})
 _SENSITIVITIES = frozenset({"normal", "private_repo", "local_only", "blocked"})
@@ -60,7 +68,9 @@ _EGRESS_POLICIES = frozenset(
     {"local_only", "same_provider_trust_domain", "explicit_any_provider"}
 )
 _CREATED_BY = frozenset({"user", "agent", "import"})
-_TAG_NAMESPACES = frozenset({"task_type", "technology", "entity", "failure"})
+_TAG_NAMESPACES = frozenset(
+    {"task_type", "technology", "entity", "failure", "component"}
+)
 _RETRIEVAL_DISPOSITIONS = frozenset({"retrieved"})
 _EVENT_TYPES = frozenset(
     {
@@ -71,6 +81,20 @@ _EVENT_TYPES = frozenset(
         "rejected",
         "retracted",
         "retrieved",
+        "candidate_created",
+        "activated",
+        "review_required",
+        "reapproved",
+        "anchor_invalidated",
+        "superseded",
+        "revoked",
+        "disclosed",
+        "declared_applied",
+        "overridden",
+        "not_applicable",
+        "migration_imported",
+        "migration_skipped",
+        "relation_added",
     }
 )
 _LESSON_TRANSITIONS: dict[str, frozenset[str]] = {
@@ -81,6 +105,25 @@ _LESSON_TRANSITIONS: dict[str, frozenset[str]] = {
     "rejected": frozenset(),
     "retracted": frozenset(),
 }
+_DECISION_TRANSITIONS: dict[str, frozenset[str]] = {
+    "candidate": frozenset({"review_required", "revoked"}),
+    "active": frozenset({"review_required", "superseded", "revoked"}),
+    "review_required": frozenset({"revoked", "superseded"}),
+    "superseded": frozenset(),
+    "revoked": frozenset(),
+}
+_MEANINGFUL_DECISION_BODY_FIELDS = frozenset(
+    {
+        "statement",
+        "rationale",
+        "source_type",
+        "authority",
+        "effective_at",
+        "expires_at",
+        "policy_anchor_path",
+        "policy_anchor_hash",
+    }
+)
 
 _MAX_TITLE_CHARS = 240
 _MAX_SUMMARY_CHARS = 2_000
@@ -96,7 +139,7 @@ _SAFE_TYPED_DIGEST_ID_RE = re.compile(
     r"(?:repo|project|workspace)_[0-9a-f]{64}\Z"
 )
 _SAFE_GENERATED_ID_RE = re.compile(
-    r"(?:turn|attempt|retrieval|event|lesson)_[0-9a-f]{32,64}\Z"
+    r"(?:turn|attempt|retrieval|event|lesson|decision)_[0-9a-f]{32,64}\Z"
 )
 _SAFE_INTERNAL_IDEMPOTENCY_RE = re.compile(
     r"retrieved:[A-Za-z0-9._-]+:[A-Za-z0-9._-]+\Z"
@@ -132,6 +175,9 @@ _FTS_TRIGGER_NAMES = (
     "experience_search_content_ai",
     "experience_search_content_ad",
     "experience_search_content_au",
+    "experience_search_trigram_ai",
+    "experience_search_trigram_ad",
+    "experience_search_trigram_au",
 )
 
 
@@ -174,7 +220,7 @@ _BASE_SCHEMA_STATEMENTS = (
             )) OR
             (kind = 'work_record' AND current_status IN ('recorded', 'archived')) OR
             (kind = 'decision' AND current_status IN (
-                'candidate', 'active', 'superseded', 'revoked'
+                'candidate', 'active', 'review_required', 'superseded', 'revoked'
             ))
         ),
         CHECK (
@@ -239,7 +285,7 @@ _BASE_SCHEMA_STATEMENTS = (
         item_id TEXT NOT NULL,
         revision INTEGER NOT NULL,
         namespace TEXT NOT NULL CHECK (
-            namespace IN ('task_type', 'technology', 'entity', 'failure')
+            namespace IN ('task_type', 'technology', 'entity', 'failure', 'component')
         ),
         value TEXT NOT NULL,
         PRIMARY KEY (item_id, revision, namespace, value),
@@ -305,7 +351,11 @@ _BASE_SCHEMA_STATEMENTS = (
         event_type TEXT NOT NULL CHECK (
             event_type IN (
                 'approved', 'edited', 'disputed', 'deprecated', 'rejected',
-                'retracted', 'retrieved'
+                'retracted', 'retrieved', 'candidate_created', 'activated',
+                'review_required', 'reapproved', 'anchor_invalidated',
+                'superseded', 'revoked', 'disclosed', 'declared_applied',
+                'overridden', 'not_applicable', 'migration_imported',
+                'migration_skipped', 'relation_added'
             )
         ),
         item_id TEXT,
@@ -322,6 +372,31 @@ _BASE_SCHEMA_STATEMENTS = (
         FOREIGN KEY (item_id, item_revision)
             REFERENCES experience_item_revisions(item_id, revision) ON DELETE CASCADE,
         FOREIGN KEY (retrieval_id) REFERENCES experience_retrievals(id) ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS experience_migration_sources (
+        source_system TEXT NOT NULL,
+        source_store_hash TEXT NOT NULL,
+        source_item_id TEXT NOT NULL,
+        source_revision INTEGER NOT NULL,
+        target_item_id TEXT,
+        target_revision INTEGER,
+        disposition TEXT NOT NULL CHECK (
+            disposition IN (
+                'imported_candidate',
+                'skipped',
+                'needs_manual_review'
+            )
+        ),
+        reason_code TEXT,
+        imported_at REAL NOT NULL,
+        PRIMARY KEY (
+            source_system,
+            source_store_hash,
+            source_item_id,
+            source_revision
+        )
     )
     """,
     """
@@ -348,6 +423,10 @@ _BASE_SCHEMA_STATEMENTS = (
     """
     CREATE INDEX IF NOT EXISTS idx_experience_items_family
         ON experience_items(family_id, created_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_experience_links_to
+        ON experience_links(to_item_id, to_revision, relation)
     """,
     """
     CREATE INDEX IF NOT EXISTS idx_experience_tags_lookup
@@ -430,6 +509,16 @@ _FTS_SCHEMA_STATEMENTS = (
     )
     """,
     """
+    CREATE VIRTUAL TABLE IF NOT EXISTS experience_search_trigram USING fts5(
+        title,
+        searchable_text,
+        tags,
+        content='experience_search_content',
+        content_rowid='rowid',
+        tokenize='trigram'
+    )
+    """,
+    """
     CREATE TRIGGER IF NOT EXISTS experience_search_content_ai
     AFTER INSERT ON experience_search_content
     BEGIN
@@ -447,6 +536,23 @@ _FTS_SCHEMA_STATEMENTS = (
     END
     """,
     """
+    CREATE TRIGGER IF NOT EXISTS experience_search_trigram_ai
+    AFTER INSERT ON experience_search_content
+    BEGIN
+        INSERT INTO experience_search_trigram(rowid, title, searchable_text, tags)
+        VALUES (new.rowid, new.title, new.searchable_text, new.tags);
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS experience_search_trigram_ad
+    AFTER DELETE ON experience_search_content
+    BEGIN
+        INSERT INTO experience_search_trigram(
+            experience_search_trigram, rowid, title, searchable_text, tags
+        ) VALUES ('delete', old.rowid, old.title, old.searchable_text, old.tags);
+    END
+    """,
+    """
     CREATE TRIGGER IF NOT EXISTS experience_search_content_au
     AFTER UPDATE ON experience_search_content
     BEGIN
@@ -454,6 +560,17 @@ _FTS_SCHEMA_STATEMENTS = (
             experience_search, rowid, title, searchable_text, tags
         ) VALUES ('delete', old.rowid, old.title, old.searchable_text, old.tags);
         INSERT INTO experience_search(rowid, title, searchable_text, tags)
+        VALUES (new.rowid, new.title, new.searchable_text, new.tags);
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS experience_search_trigram_au
+    AFTER UPDATE ON experience_search_content
+    BEGIN
+        INSERT INTO experience_search_trigram(
+            experience_search_trigram, rowid, title, searchable_text, tags
+        ) VALUES ('delete', old.rowid, old.title, old.searchable_text, old.tags);
+        INSERT INTO experience_search_trigram(rowid, title, searchable_text, tags)
         VALUES (new.rowid, new.title, new.searchable_text, new.tags);
     END
     """,
@@ -592,6 +709,57 @@ def _fts_query_terms(query: str, *, limit: int = 32) -> tuple[str, ...]:
     return tuple(result)
 
 
+def _is_cjk_codepoint(codepoint: int) -> bool:
+    return (
+        0x4E00 <= codepoint <= 0x9FFF
+        or 0x3400 <= codepoint <= 0x4DBF
+        or 0x20000 <= codepoint <= 0x2A6DF
+        or 0x3000 <= codepoint <= 0x303F
+        or 0x3040 <= codepoint <= 0x309F
+        or 0x30A0 <= codepoint <= 0x30FF
+        or 0xAC00 <= codepoint <= 0xD7AF
+    )
+
+
+def _contains_cjk(text: str) -> bool:
+    return any(_is_cjk_codepoint(ord(char)) for char in text)
+
+
+def _count_cjk(text: str) -> int:
+    return sum(1 for char in text if _is_cjk_codepoint(ord(char)))
+
+
+def _short_cjk_terms(query: str, *, limit: int = 8) -> tuple[str, ...]:
+    terms: list[str] = []
+    seen: set[str] = set()
+    for raw in re.findall(r"[^\W_]+", query, flags=re.UNICODE):
+        if not _contains_cjk(raw):
+            continue
+        count = _count_cjk(raw)
+        if 1 <= count < 3 and raw not in seen:
+            seen.add(raw)
+            terms.append(raw)
+            if len(terms) >= limit:
+                break
+    return tuple(terms)
+
+
+def _sanitize_trigram_query(query: str) -> str:
+    """Build a deterministic trigram query from CJK tokens of 3+ chars."""
+
+    parts: list[str] = []
+    for raw in re.findall(r"[^\W_]+", query, flags=re.UNICODE):
+        if not _contains_cjk(raw):
+            continue
+        folded = raw.casefold()
+        if folded in {"and", "or", "not"}:
+            continue
+        if _short_cjk_terms(raw):
+            continue
+        parts.append(f'"{raw}"')
+    return " OR ".join(dict.fromkeys(parts))
+
+
 def _sanitize_fts_query(query: str) -> str:
     """Make free text a literal, deterministic FTS5 prefix-OR query.
 
@@ -716,7 +884,7 @@ class ExperienceStore:
         sanitizer: Callable[[str], str] | None = None,
         return_sanitizer: Callable[[str], str] | None = None,
     ) -> "ExperienceStore":
-        """Open schema v2 after read-only validation, without setup writes."""
+        """Open the current schema after read-only validation, without setup writes."""
 
         return cls(
             state_db_path,
@@ -833,6 +1001,7 @@ class ExperienceStore:
                     "ADD COLUMN recall_allowed INTEGER NOT NULL DEFAULT 0 "
                     "CHECK (recall_allowed IN (0, 1))"
                 )
+            self._migrate_to_current_schema(conn)
             conn.execute(
                 "INSERT INTO experience_schema_meta(key, value) VALUES('version', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
@@ -910,6 +1079,230 @@ class ExperienceStore:
             )
             return
         self._fts_enabled = True
+
+    @staticmethod
+    def _rebuild_v3_items_table(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS experience_items_v3 (
+                id TEXT PRIMARY KEY,
+                family_id TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('work_record', 'lesson', 'decision')),
+                current_status TEXT NOT NULL,
+                current_revision INTEGER NOT NULL CHECK (current_revision >= 1),
+                principal_id TEXT NOT NULL CHECK (length(principal_id) > 0),
+                scope_type TEXT NOT NULL CHECK (scope_type IN ('project', 'repository', 'profile')),
+                scope_id TEXT NOT NULL CHECK (length(scope_id) > 0),
+                repository_id TEXT,
+                project_id TEXT,
+                sensitivity TEXT NOT NULL CHECK (
+                    sensitivity IN ('normal', 'private_repo', 'local_only', 'blocked')
+                ),
+                egress_policy TEXT NOT NULL CHECK (
+                    egress_policy IN (
+                        'local_only', 'same_provider_trust_domain', 'explicit_any_provider'
+                    )
+                ),
+                producer_trust_domain TEXT,
+                created_by TEXT NOT NULL CHECK (created_by IN ('user', 'agent', 'import')),
+                idempotency_key TEXT UNIQUE,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                deleted_at REAL,
+                CHECK (
+                    (kind = 'lesson' AND current_status IN (
+                        'candidate', 'active', 'disputed', 'deprecated', 'rejected', 'retracted'
+                    )) OR
+                    (kind = 'work_record' AND current_status IN ('recorded', 'archived')) OR
+                    (kind = 'decision' AND current_status IN (
+                        'candidate', 'active', 'review_required', 'superseded', 'revoked'
+                    ))
+                ),
+                CHECK (
+                    (scope_type = 'project' AND repository_id IS NOT NULL AND project_id IS NOT NULL)
+                    OR (scope_type = 'repository' AND repository_id IS NOT NULL)
+                    OR scope_type = 'profile'
+                ),
+                FOREIGN KEY (id, current_revision)
+                    REFERENCES experience_item_revisions(item_id, revision)
+                    DEFERRABLE INITIALLY DEFERRED
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO experience_items_v3(
+                id, family_id, kind, current_status, current_revision,
+                principal_id, scope_type, scope_id, repository_id, project_id,
+                sensitivity, egress_policy, producer_trust_domain, created_by,
+                idempotency_key, created_at, updated_at, deleted_at
+            )
+            SELECT
+                id, family_id, kind, current_status, current_revision,
+                principal_id, scope_type, scope_id, repository_id, project_id,
+                sensitivity, egress_policy, producer_trust_domain, created_by,
+                idempotency_key, created_at, updated_at, deleted_at
+            FROM experience_items
+            """
+        )
+        conn.execute("DROP TABLE experience_items")
+        conn.execute("ALTER TABLE experience_items_v3 RENAME TO experience_items")
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_experience_items_scope_status
+                ON experience_items(
+                    principal_id, repository_id, project_id, scope_type, scope_id,
+                    current_status, deleted_at
+                )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_experience_items_family
+                ON experience_items(family_id, created_at)
+            """
+        )
+
+    @staticmethod
+    def _rebuild_v3_tags_table(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS experience_tags_v3 (
+                item_id TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                namespace TEXT NOT NULL CHECK (
+                    namespace IN ('task_type', 'technology', 'entity', 'failure', 'component')
+                ),
+                value TEXT NOT NULL,
+                PRIMARY KEY (item_id, revision, namespace, value),
+                FOREIGN KEY (item_id, revision)
+                    REFERENCES experience_item_revisions(item_id, revision) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO experience_tags_v3(item_id, revision, namespace, value)
+            SELECT item_id, revision, namespace, value
+            FROM experience_tags
+            """
+        )
+        conn.execute("DROP TABLE experience_tags")
+        conn.execute("ALTER TABLE experience_tags_v3 RENAME TO experience_tags")
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_experience_tags_lookup
+                ON experience_tags(namespace, value, item_id, revision)
+            """
+        )
+
+    @staticmethod
+    def _rebuild_v3_events_table(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS experience_events_v3 (
+                id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL CHECK (
+                    event_type IN (
+                        'approved', 'edited', 'disputed', 'deprecated', 'rejected',
+                        'retracted', 'retrieved', 'candidate_created', 'activated',
+                        'review_required', 'reapproved', 'anchor_invalidated',
+                        'superseded', 'revoked', 'disclosed', 'declared_applied',
+                        'overridden', 'not_applicable', 'migration_imported',
+                        'migration_skipped', 'relation_added'
+                    )
+                ),
+                item_id TEXT,
+                item_revision INTEGER,
+                retrieval_id TEXT,
+                work_id TEXT,
+                payload_json TEXT NOT NULL,
+                idempotency_key TEXT UNIQUE,
+                created_at REAL NOT NULL,
+                CHECK (
+                    (item_id IS NULL AND item_revision IS NULL)
+                    OR (item_id IS NOT NULL AND item_revision IS NOT NULL)
+                ),
+                FOREIGN KEY (item_id, item_revision)
+                    REFERENCES experience_item_revisions(item_id, revision) ON DELETE CASCADE,
+                FOREIGN KEY (retrieval_id) REFERENCES experience_retrievals(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO experience_events_v3(
+                id, event_type, item_id, item_revision, retrieval_id,
+                work_id, payload_json, idempotency_key, created_at
+            )
+            SELECT
+                id, event_type, item_id, item_revision, retrieval_id,
+                work_id, payload_json, idempotency_key, created_at
+            FROM experience_events
+            """
+        )
+        conn.execute("DROP TABLE experience_events")
+        conn.execute("ALTER TABLE experience_events_v3 RENAME TO experience_events")
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_experience_events_created
+                ON experience_events(created_at)
+            """
+        )
+
+    @staticmethod
+    def _recreate_base_triggers(conn: sqlite3.Connection) -> None:
+        for statement in _BASE_SCHEMA_STATEMENTS:
+            if statement.lstrip().startswith("CREATE TRIGGER"):
+                conn.execute(statement)
+
+    def _migrate_to_current_schema(self, conn: sqlite3.Connection) -> None:
+        row = conn.execute(
+            "SELECT value FROM experience_schema_meta WHERE key = 'version'"
+        ).fetchone()
+        if row is None:
+            return
+        version = row["value"]
+        if version == _CURRENT_SCHEMA_VERSION:
+            return
+        if version == "2":
+            self._rebuild_v3_items_table(conn)
+            self._rebuild_v3_tags_table(conn)
+            self._rebuild_v3_events_table(conn)
+            self._recreate_base_triggers(conn)
+            version = "3"
+        if version == "3":
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS experience_migration_sources (
+                    source_system TEXT NOT NULL,
+                    source_store_hash TEXT NOT NULL,
+                    source_item_id TEXT NOT NULL,
+                    source_revision INTEGER NOT NULL,
+                    target_item_id TEXT,
+                    target_revision INTEGER,
+                    disposition TEXT NOT NULL CHECK (
+                        disposition IN (
+                            'imported_candidate',
+                            'skipped',
+                            'needs_manual_review'
+                        )
+                    ),
+                    reason_code TEXT,
+                    imported_at REAL NOT NULL,
+                    PRIMARY KEY (
+                        source_system,
+                        source_store_hash,
+                        source_item_id,
+                        source_revision
+                    )
+                )
+                """
+            )
+            return
+        raise ExperienceSchemaNotCurrentError(
+            f"unsupported experience schema version: {version}"
+        )
 
     def _verify_current_schema(self) -> None:
         """Validate current tables and FTS state using read-only statements."""
@@ -1175,9 +1568,15 @@ class ExperienceStore:
                 raise ValueError(f"{field} contains a non-finite number")
             return value
         if isinstance(value, str) or hasattr(value, "value"):
-            return self._text(
-                _enum_value(value), field, max_chars=_MAX_BODY_JSON_BYTES
-            )
+            raw = _enum_value(value)
+            if (
+                field.endswith("_hash")
+                and isinstance(raw, str)
+                and len(raw) == 64
+                and all(char in "0123456789abcdefABCDEF" for char in raw)
+            ):
+                return raw.casefold()
+            return self._text(raw, field, max_chars=_MAX_BODY_JSON_BYTES)
         if is_dataclass(value) and not isinstance(value, type):
             value = asdict(value)
         if isinstance(value, Mapping):
@@ -1243,6 +1642,9 @@ class ExperienceStore:
 
         def sanitize(item: Any, path: str) -> Any:
             if isinstance(item, str):
+                normalized = item.casefold()
+                if path.endswith(("_hash", "policy_anchor_hash")) and len(normalized) == 64 and all(char in "0123456789abcdef" for char in normalized):
+                    return normalized
                 return self._returned_text(item, path)
             if isinstance(item, list):
                 return [sanitize(child, f"{path}[]") for child in item]
@@ -1643,6 +2045,764 @@ class ExperienceStore:
         assert item is not None
         return item
 
+    @staticmethod
+    def _decision_body_search_text(body: Mapping[str, Any]) -> str:
+        fields = (body.get("statement"), body.get("rationale"))
+        return " ".join(str(value) for value in fields if value)
+
+    @staticmethod
+    def _decision_content_hash(
+        *,
+        scope_type: str,
+        scope_id: str,
+        title: str,
+        summary: str,
+        body: Mapping[str, Any],
+        tags: Sequence[tuple[str, str]],
+    ) -> str:
+        canonical = json.dumps(
+            {
+                "kind": "decision",
+                "scope_type": scope_type,
+                "scope_id": scope_id,
+                "title": title,
+                "summary": summary,
+                "body": body,
+                "tags": list(tags),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _validate_decision_body(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        allowed = {
+            "statement",
+            "rationale",
+            "source_type",
+            "authority",
+            "effective_at",
+            "expires_at",
+            "policy_anchor_path",
+            "policy_anchor_hash",
+        }
+        unknown = set(body) - allowed
+        if unknown:
+            raise ValueError(f"unknown decision body fields: {sorted(unknown)!r}")
+        statement = self._text(
+            body.get("statement", ""),
+            "statement",
+            max_chars=4_000,
+            allow_empty=False,
+        )
+        rationale = self._text(
+            body.get("rationale", ""),
+            "rationale",
+            max_chars=4_000,
+            allow_empty=False,
+        )
+        source_type = _require_choice(
+            "source_type",
+            body.get("source_type", "manual_import"),
+            {"user_turn", "repository_policy", "agent_proposal", "migration", "manual_import"},
+        )
+        authority = _require_choice(
+            "authority",
+            body.get("authority", "unapproved"),
+            {"unapproved", "user", "repository_policy"},
+        )
+        effective_at = _optional_timestamp(
+            body.get("effective_at", 0.0), "effective_at"
+        )
+        if effective_at is None:
+            raise ValueError("decision body requires effective_at")
+        expires_at = _optional_timestamp(body.get("expires_at"), "expires_at")
+        if expires_at is not None and expires_at < effective_at:
+            raise ValueError("expires_at must not be earlier than effective_at")
+        policy_anchor_path = self._text(
+            body.get("policy_anchor_path"),
+            "policy_anchor_path",
+            max_chars=1_024,
+            nullable=True,
+        )
+        if policy_anchor_path is not None:
+            path = PurePosixPath(policy_anchor_path)
+            if path.is_absolute() or ".." in path.parts or "\\" in policy_anchor_path:
+                raise ValueError("policy_anchor_path must be repository-relative")
+            policy_anchor_path = path.as_posix() or "."
+        policy_anchor_hash = self._digest(
+            body.get("policy_anchor_hash"), "policy_anchor_hash", nullable=True
+        )
+        if authority == "repository_policy":
+            if source_type != "repository_policy":
+                raise ValueError(
+                    "repository_policy authority requires repository_policy source_type"
+                )
+            if not policy_anchor_path or not policy_anchor_hash:
+                raise ValueError(
+                    "repository_policy authority requires policy_anchor_path and policy_anchor_hash"
+                )
+        if authority == "unapproved" and source_type == "repository_policy":
+            raise ValueError("repository_policy decisions cannot be unapproved")
+        if authority == "user" and source_type not in {
+            "user_turn", "agent_proposal", "manual_import"
+        }:
+            raise ValueError("user authority requires a user-approved source type")
+        return {
+            "statement": statement,
+            "rationale": rationale,
+            "source_type": source_type,
+            "authority": authority,
+            "effective_at": effective_at,
+            "expires_at": expires_at,
+            "policy_anchor_path": policy_anchor_path,
+            "policy_anchor_hash": policy_anchor_hash,
+        }
+
+    def create_decision(
+        self,
+        *,
+        principal_id: str,
+        scope_type: str,
+        scope_id: str,
+        repository_id: str | None,
+        project_id: str | None,
+        title: str,
+        body: Mapping[str, Any] | Any,
+        summary: str = "",
+        tags: Mapping[Any, Iterable[Any]] | Iterable[tuple[Any, Any]] | None = None,
+        sensitivity: str = "normal",
+        egress_policy: str = "local_only",
+        producer_trust_domain: str | None = None,
+        created_by: str = "agent",
+        source_session_id: str | None = None,
+        source_turn_id: str | None = None,
+        source_work_id: str | None = None,
+        source_hash: str | None = None,
+        producer: Mapping[str, Any] | Any | None = None,
+        review_after: float | None = None,
+        item_id: str | None = None,
+        family_id: str | None = None,
+        idempotency_key: str | None = None,
+        created_at: float | None = None,
+    ) -> dict[str, Any]:
+        """Create a candidate Decision at immutable revision 1.
+
+        PR 2 stores and inspects Decisions but does not activate, recall, or
+        inject them. Candidate Decisions are therefore never returned by the
+        Lesson retrieval path.
+        """
+        safe_principal = self._principal(principal_id)
+        safe_scope_type = _require_choice("scope_type", scope_type, _SCOPE_TYPES)
+        safe_scope_id = self._identifier(scope_id, "scope_id")
+        safe_repository = self._identifier(
+            repository_id, "repository_id", nullable=True
+        )
+        safe_project = self._identifier(project_id, "project_id", nullable=True)
+        if safe_scope_type == "project" and (not safe_repository or not safe_project):
+            raise ValueError("project-scoped decisions require repository_id and project_id")
+        if safe_scope_type == "repository" and not safe_repository:
+            raise ValueError("repository-scoped decisions require repository_id")
+        if safe_scope_type == "project" and safe_scope_id != safe_project:
+            raise ValueError("project scope_id must equal project_id")
+        if safe_scope_type == "repository" and (
+            safe_scope_id != safe_repository or safe_project is not None
+        ):
+            raise ValueError(
+                "repository scope_id must equal repository_id and project_id must be null"
+            )
+
+        safe_title = self._text(
+            title, "title", max_chars=_MAX_TITLE_CHARS, allow_empty=False
+        )
+        safe_summary = self._text(
+            summary, "summary", max_chars=_MAX_SUMMARY_CHARS
+        )
+        safe_body = self._validate_decision_body(self._mapping(body, "body"))
+        _, body_json = self._json_for_storage(safe_body, "body", _MAX_BODY_JSON_BYTES)
+        if safe_body["authority"] not in {"unapproved", "repository_policy"}:
+            raise ValueError("candidate decisions must be unapproved or repository_policy")
+        safe_tags = self._normalize_tags(tags)
+        safe_producer, producer_json = self._json_for_storage(
+            producer or {}, "producer", _MAX_PRODUCER_JSON_BYTES
+        )
+        del safe_producer
+
+        safe_sensitivity = _require_choice(
+            "sensitivity", sensitivity, _SENSITIVITIES
+        )
+        safe_egress = _require_choice(
+            "egress_policy", egress_policy, _EGRESS_POLICIES
+        )
+        safe_creator = _require_choice("created_by", created_by, _CREATED_BY)
+        safe_review_after = _optional_timestamp(review_after, "review_after")
+        safe_trust_domain = self._trust_domain(
+            producer_trust_domain, nullable=True
+        )
+        if safe_egress == "same_provider_trust_domain" and not safe_trust_domain:
+            raise ValueError(
+                "same_provider_trust_domain requires producer_trust_domain"
+            )
+
+        safe_item_id = self._identifier(
+            item_id or _new_id("decision"), "item_id"
+        )
+        safe_family_id = self._identifier(
+            family_id or safe_item_id, "family_id"
+        )
+        safe_idempotency = self._identifier(
+            idempotency_key, "idempotency_key", nullable=True
+        )
+        timestamp = _now(created_at)
+        content_hash = self._decision_content_hash(
+            scope_type=safe_scope_type,
+            scope_id=safe_scope_id,
+            title=safe_title or "",
+            summary=safe_summary or "",
+            body=safe_body,
+            tags=safe_tags,
+        )
+        searchable_text = self._decision_body_search_text(safe_body)
+        provenance = {
+            "source_session_id": self._identifier(
+                source_session_id, "source_session_id", nullable=True
+            ),
+            "source_turn_id": self._identifier(
+                source_turn_id, "source_turn_id", nullable=True
+            ),
+            "source_work_id": self._identifier(
+                source_work_id, "source_work_id", nullable=True
+            ),
+            "source_hash": self._digest(
+                source_hash, "source_hash", nullable=True
+            ),
+        }
+
+        def insert(conn: sqlite3.Connection) -> str:
+            existing = None
+            if safe_idempotency:
+                existing = conn.execute(
+                    "SELECT * FROM experience_items "
+                    "WHERE idempotency_key = ?",
+                    (safe_idempotency,),
+                ).fetchone()
+            if existing is None:
+                existing = conn.execute(
+                    "SELECT * FROM experience_items WHERE id = ?",
+                    (safe_item_id,),
+                ).fetchone()
+            if existing is not None:
+                revision = conn.execute(
+                    "SELECT * FROM experience_item_revisions "
+                    "WHERE item_id = ? AND revision = 1",
+                    (existing["id"],),
+                ).fetchone()
+                expected_item = (
+                    safe_principal,
+                    safe_scope_type,
+                    safe_scope_id,
+                    safe_repository,
+                    safe_project,
+                    safe_sensitivity,
+                    safe_egress,
+                    safe_trust_domain,
+                    safe_creator,
+                )
+                observed_item = tuple(
+                    existing[field]
+                    for field in (
+                        "principal_id",
+                        "scope_type",
+                        "scope_id",
+                        "repository_id",
+                        "project_id",
+                        "sensitivity",
+                        "egress_policy",
+                        "producer_trust_domain",
+                        "created_by",
+                    )
+                )
+                expected_revision = (
+                    content_hash,
+                    provenance["source_session_id"],
+                    provenance["source_turn_id"],
+                    provenance["source_work_id"],
+                    provenance["source_hash"],
+                    producer_json,
+                    safe_review_after,
+                )
+                observed_revision = (
+                    None
+                    if revision is None
+                    else tuple(
+                        revision[field]
+                        for field in (
+                            "content_hash",
+                            "source_session_id",
+                            "source_turn_id",
+                            "source_work_id",
+                            "source_hash",
+                            "producer_json",
+                            "review_after",
+                        )
+                    )
+                )
+                identity_mismatch = (
+                    (item_id is not None and existing["id"] != safe_item_id)
+                    or (
+                        (family_id is not None or item_id is not None)
+                        and existing["family_id"] != safe_family_id
+                    )
+                )
+                if (
+                    identity_mismatch
+                    or observed_item != expected_item
+                    or observed_revision != expected_revision
+                ):
+                    raise ValueError("idempotency key already identifies another decision")
+                return str(existing["id"])
+
+            conn.execute(
+                """
+                INSERT INTO experience_items(
+                    id, family_id, kind, current_status, current_revision,
+                    principal_id, scope_type, scope_id, repository_id, project_id,
+                    sensitivity, egress_policy, producer_trust_domain,
+                    created_by, idempotency_key, created_at, updated_at, deleted_at
+                ) VALUES (?, ?, 'decision', 'candidate', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    safe_item_id,
+                    safe_family_id,
+                    safe_principal,
+                    safe_scope_type,
+                    safe_scope_id,
+                    safe_repository,
+                    safe_project,
+                    safe_sensitivity,
+                    safe_egress,
+                    safe_trust_domain,
+                    safe_creator,
+                    safe_idempotency,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO experience_item_revisions(
+                    item_id, revision, title, summary, body_json, searchable_text,
+                    confidence, source_session_id, source_turn_id, source_work_id,
+                    source_hash, content_hash, editor, edit_reason, producer_json,
+                    idempotency_key, created_at, last_validated_at, review_after
+                ) VALUES (?, 1, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, NULL, ?)
+                """,
+                (
+                    safe_item_id,
+                    safe_title,
+                    safe_summary,
+                    body_json,
+                    searchable_text,
+                    provenance["source_session_id"],
+                    provenance["source_turn_id"],
+                    provenance["source_work_id"],
+                    provenance["source_hash"],
+                    content_hash,
+                    safe_creator,
+                    producer_json,
+                    timestamp,
+                    safe_review_after,
+                ),
+            )
+            conn.executemany(
+                "INSERT INTO experience_tags(item_id, revision, namespace, value) "
+                "VALUES (?, 1, ?, ?)",
+                [
+                    (safe_item_id, namespace, value)
+                    for namespace, value in safe_tags
+                ],
+            )
+            payload = self._json_dumps(
+                {"status": "candidate"}, "event payload", _MAX_EVENT_JSON_BYTES
+            )
+            event_id = self._identifier(_new_id("event"), "event_id")
+            conn.execute(
+                """
+                INSERT INTO experience_events(
+                    id, event_type, item_id, item_revision, retrieval_id,
+                    work_id, payload_json, idempotency_key, created_at
+                ) VALUES (?, 'candidate_created', ?, 1, NULL, NULL, ?, NULL, ?)
+                """,
+                (event_id, safe_item_id, payload, timestamp),
+            )
+            return safe_item_id
+
+        created_id = self._execute_write(insert)
+        item = self.get_item(created_id)
+        assert item is not None
+        return item
+
+    def create_authorized_decision(
+        self,
+        *,
+        principal_id: str,
+        scope_type: str,
+        scope_id: str,
+        repository_id: str | None,
+        project_id: str | None,
+        title: str,
+        body: Mapping[str, Any] | Any,
+        authority: DecisionTurnAuthority,
+        repository_root: str | Path | None = None,
+        policy_repository_id: str | None = None,
+        policy_project_id: str | None = None,
+        summary: str = "",
+        tags: Mapping[Any, Iterable[Any]] | Iterable[tuple[Any, Any]] | None = None,
+        sensitivity: str = "normal",
+        egress_policy: str = "local_only",
+        producer_trust_domain: str | None = None,
+        created_by: str = "user",
+        source_session_id: str | None = None,
+        source_turn_id: str | None = None,
+        source_work_id: str | None = None,
+        source_hash: str | None = None,
+        producer: Mapping[str, Any] | Any | None = None,
+        review_after: float | None = None,
+        item_id: str | None = None,
+        family_id: str | None = None,
+        idempotency_key: str | None = None,
+        created_at: float | None = None,
+    ) -> dict[str, Any]:
+        """Atomically create and activate a Decision when host authority is trusted."""
+
+        trusted_authority = self._require_decision_authority(authority)
+        safe_principal = self._principal(principal_id)
+        safe_scope_type = _require_choice("scope_type", scope_type, _SCOPE_TYPES)
+        safe_scope_id = self._identifier(scope_id, "scope_id")
+        safe_repository = self._identifier(
+            repository_id, "repository_id", nullable=True
+        )
+        safe_project = self._identifier(project_id, "project_id", nullable=True)
+        if safe_scope_type == "project" and (not safe_repository or not safe_project):
+            raise ValueError("project-scoped decisions require repository_id and project_id")
+        if safe_scope_type == "repository" and not safe_repository:
+            raise ValueError("repository-scoped decisions require repository_id")
+        if safe_scope_type == "project" and safe_scope_id != safe_project:
+            raise ValueError("project scope_id must equal project_id")
+        if safe_scope_type == "repository" and (
+            safe_scope_id != safe_repository or safe_project is not None
+        ):
+            raise ValueError(
+                "repository scope_id must equal repository_id and project_id must be null"
+            )
+
+        safe_title = self._text(
+            title, "title", max_chars=_MAX_TITLE_CHARS, allow_empty=False
+        )
+        safe_summary = self._text(
+            summary, "summary", max_chars=_MAX_SUMMARY_CHARS
+        )
+        safe_body = self._validate_decision_body(self._mapping(body, "body"))
+        if safe_body["authority"] == "repository_policy" and (
+            repository_root is None
+        ):
+            return self.create_decision(
+                principal_id=principal_id,
+                scope_type=scope_type,
+                scope_id=scope_id,
+                repository_id=repository_id,
+                project_id=project_id,
+                title=title,
+                summary=summary,
+                body=safe_body,
+                tags=tags,
+                sensitivity=sensitivity,
+                egress_policy=egress_policy,
+                producer_trust_domain=producer_trust_domain,
+                created_by=created_by,
+                source_session_id=source_session_id,
+                source_turn_id=source_turn_id,
+                source_work_id=source_work_id,
+                source_hash=source_hash,
+                producer=producer,
+                review_after=review_after,
+                item_id=item_id,
+                family_id=family_id,
+                idempotency_key=idempotency_key,
+                created_at=created_at,
+            )
+        if safe_body["authority"] == "repository_policy":
+            validation = validate_repository_anchor(
+                safe_body["policy_anchor_path"],
+                safe_body["policy_anchor_hash"],
+                repository_root=repository_root,
+            )
+            if not validation.valid:
+                return self.create_decision(
+                    principal_id=principal_id,
+                    scope_type=scope_type,
+                    scope_id=scope_id,
+                    repository_id=repository_id,
+                    project_id=project_id,
+                    title=title,
+                    summary=summary,
+                    body=safe_body,
+                    tags=tags,
+                    sensitivity=sensitivity,
+                    egress_policy=egress_policy,
+                    producer_trust_domain=producer_trust_domain,
+                    created_by=created_by,
+                    source_session_id=source_session_id,
+                    source_turn_id=source_turn_id,
+                    source_work_id=source_work_id,
+                    source_hash=source_hash,
+                    producer=producer,
+                    review_after=review_after,
+                    item_id=item_id,
+                    family_id=family_id,
+                    idempotency_key=idempotency_key,
+                    created_at=created_at,
+                )
+        elif safe_body["authority"] == "user":
+            provisional_item_id = item_id or _new_id("decision")
+            if not (
+                trusted_authority.approves(provisional_item_id)
+                or trusted_authority.matches_source_hash(source_hash)
+            ):
+                raise ValueError("active decision requires trusted user authority")
+        elif safe_body["authority"] == "unapproved":
+            provisional_item_id = item_id or _new_id("decision")
+            if not (
+                trusted_authority.approves(provisional_item_id)
+                or trusted_authority.matches_source_hash(source_hash)
+            ):
+                raise ValueError("authorized decision requires trusted user authority")
+            safe_body = dict(safe_body)
+            safe_body["authority"] = "user"
+        else:
+            raise ValueError("unsupported decision authority")
+        _, body_json = self._json_for_storage(safe_body, "body", _MAX_BODY_JSON_BYTES)
+        safe_tags = self._normalize_tags(tags)
+        safe_producer, producer_json = self._json_for_storage(
+            producer or {}, "producer", _MAX_PRODUCER_JSON_BYTES
+        )
+        del safe_producer
+
+        safe_sensitivity = _require_choice(
+            "sensitivity", sensitivity, _SENSITIVITIES
+        )
+        safe_egress = _require_choice(
+            "egress_policy", egress_policy, _EGRESS_POLICIES
+        )
+        safe_creator = _require_choice("created_by", created_by, _CREATED_BY)
+        safe_review_after = _optional_timestamp(review_after, "review_after")
+        safe_trust_domain = self._trust_domain(
+            producer_trust_domain, nullable=True
+        )
+        if safe_egress == "same_provider_trust_domain" and not safe_trust_domain:
+            raise ValueError(
+                "same_provider_trust_domain requires producer_trust_domain"
+            )
+
+        safe_item_id = self._identifier(
+            item_id or _new_id("decision"), "item_id"
+        )
+        safe_family_id = self._identifier(
+            family_id or safe_item_id, "family_id"
+        )
+        safe_idempotency = self._identifier(
+            idempotency_key, "idempotency_key", nullable=True
+        )
+        timestamp = _now(created_at)
+        content_hash = self._decision_content_hash(
+            scope_type=safe_scope_type,
+            scope_id=safe_scope_id,
+            title=safe_title or "",
+            summary=safe_summary or "",
+            body=safe_body,
+            tags=safe_tags,
+        )
+        searchable_text = self._decision_body_search_text(safe_body)
+        provenance = {
+            "source_session_id": self._identifier(
+                source_session_id, "source_session_id", nullable=True
+            ),
+            "source_turn_id": self._identifier(
+                source_turn_id, "source_turn_id", nullable=True
+            ),
+            "source_work_id": self._identifier(
+                source_work_id, "source_work_id", nullable=True
+            ),
+            "source_hash": self._digest(
+                source_hash, "source_hash", nullable=True
+            ),
+        }
+
+        def insert(conn: sqlite3.Connection) -> str:
+            expected_item = (
+                safe_principal,
+                safe_scope_type,
+                safe_scope_id,
+                safe_repository,
+                safe_project,
+                safe_sensitivity,
+                safe_egress,
+                safe_trust_domain,
+                safe_creator,
+            )
+            expected_revision = (
+                content_hash,
+                provenance["source_session_id"],
+                provenance["source_turn_id"],
+                provenance["source_work_id"],
+                provenance["source_hash"],
+                producer_json,
+                safe_review_after,
+            )
+            if safe_idempotency:
+                existing = conn.execute(
+                    "SELECT * FROM experience_items "
+                    "WHERE idempotency_key = ?", (safe_idempotency,)
+                ).fetchone()
+                if existing is not None:
+                    revision = conn.execute(
+                        "SELECT * FROM experience_item_revisions "
+                        "WHERE item_id = ? AND revision = 1",
+                        (existing["id"],),
+                    ).fetchone()
+                    observed_item = tuple(
+                        existing[field]
+                        for field in (
+                            "principal_id",
+                            "scope_type",
+                            "scope_id",
+                            "repository_id",
+                            "project_id",
+                            "sensitivity",
+                            "egress_policy",
+                            "producer_trust_domain",
+                            "created_by",
+                        )
+                    )
+                    observed_revision = (
+                        None
+                        if revision is None
+                        else tuple(
+                            revision[field]
+                            for field in (
+                                "content_hash",
+                                "source_session_id",
+                                "source_turn_id",
+                                "source_work_id",
+                                "source_hash",
+                                "producer_json",
+                                "review_after",
+                            )
+                        )
+                    )
+                    if observed_item != expected_item or observed_revision != expected_revision:
+                        raise ValueError(
+                            "authorized decision idempotency key identifies different content"
+                        )
+                    return str(existing["id"])
+            if conn.execute(
+                "SELECT 1 FROM experience_items WHERE id = ?", (safe_item_id,)
+            ).fetchone() is not None:
+                raise ValueError("authorized decision already exists")
+            conn.execute(
+                """
+                INSERT INTO experience_items(
+                    id, family_id, kind, current_status, current_revision,
+                    principal_id, scope_type, scope_id, repository_id, project_id,
+                    sensitivity, egress_policy, producer_trust_domain,
+                    created_by, idempotency_key, created_at, updated_at, deleted_at
+                ) VALUES (?, ?, 'decision', 'active', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    safe_item_id,
+                    safe_family_id,
+                    safe_principal,
+                    safe_scope_type,
+                    safe_scope_id,
+                    safe_repository,
+                    safe_project,
+                    safe_sensitivity,
+                    safe_egress,
+                    safe_trust_domain,
+                    safe_creator,
+                    safe_idempotency,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO experience_item_revisions(
+                    item_id, revision, title, summary, body_json, searchable_text,
+                    confidence, source_session_id, source_turn_id, source_work_id,
+                    source_hash, content_hash, editor, edit_reason, producer_json,
+                    idempotency_key, created_at, last_validated_at, review_after
+                ) VALUES (?, 1, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, NULL, ?)
+                """,
+                (
+                    safe_item_id,
+                    safe_title,
+                    safe_summary,
+                    body_json,
+                    searchable_text,
+                    provenance["source_session_id"],
+                    provenance["source_turn_id"],
+                    provenance["source_work_id"],
+                    provenance["source_hash"],
+                    content_hash,
+                    safe_creator,
+                    producer_json,
+                    timestamp,
+                    safe_review_after,
+                ),
+            )
+            conn.executemany(
+                "INSERT INTO experience_tags(item_id, revision, namespace, value) "
+                "VALUES (?, 1, ?, ?)",
+                [
+                    (safe_item_id, namespace, value)
+                    for namespace, value in safe_tags
+                ],
+            )
+            event_id = self._identifier(_new_id("event"), "event_id")
+            payload = self._decision_event_payload(
+                actor=safe_creator,
+                reason=None,
+                from_status="candidate",
+                to_status="active",
+            )
+            conn.execute(
+                """
+                INSERT INTO experience_events(
+                    id, event_type, item_id, item_revision, retrieval_id,
+                    work_id, payload_json, idempotency_key, created_at
+                ) VALUES (?, 'candidate_created', ?, 1, NULL, NULL, ?, NULL, ?)
+                """,
+                (event_id, safe_item_id, payload, timestamp),
+            )
+            event_id = self._identifier(_new_id("event"), "event_id")
+            conn.execute(
+                """
+                INSERT INTO experience_events(
+                    id, event_type, item_id, item_revision, retrieval_id,
+                    work_id, payload_json, idempotency_key, created_at
+                ) VALUES (?, 'activated', ?, 1, NULL, NULL, ?, NULL, ?)
+                """,
+                (event_id, safe_item_id, payload, timestamp),
+            )
+            return safe_item_id
+
+        created_id = self._execute_write(insert)
+        item = self.get_decision(created_id)
+        assert item is not None
+        return item
+
     def get_item(
         self,
         item_id: str,
@@ -1735,8 +2895,9 @@ class ExperienceStore:
         offset: int = 0,
     ) -> list[dict[str, Any]]:
         """List sanitized governance records in stable newest-first order."""
-        if kind != "lesson":
-            raise ValueError("the MVP store currently exposes lesson items only")
+        if kind not in {"lesson", "decision"}:
+            raise ValueError("kind must be lesson or decision")
+        status_choices = _LESSON_STATUSES if kind == "lesson" else _DECISION_STATUSES
         clauses = ["kind = ?"]
         params: list[Any] = [kind]
         if status is not None:
@@ -1747,7 +2908,7 @@ class ExperienceStore:
                 return []
             safe_statuses = tuple(
                 dict.fromkeys(
-                    _require_choice("status", value, _LESSON_STATUSES)
+                    _require_choice("status", value, status_choices)
                     for value in requested_statuses
                 )
             )
@@ -1779,6 +2940,504 @@ class ExperienceStore:
             if item is not None:
                 result.append(item)
         return result
+
+    def get_decision(
+        self,
+        item_id: str,
+        *,
+        revision: int | None = None,
+        include_history: bool = False,
+    ) -> dict[str, Any] | None:
+        """Return one Decision, rejecting kind mismatch."""
+        item = self.get_item(item_id, revision=revision, include_history=include_history)
+        if item is not None and item["kind"] != "decision":
+            raise KeyError(f"unknown decision {self._identifier(item_id, 'item_id')}")
+        return item
+
+    def list_decisions(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """List Decision governance records."""
+        return self.list_items(kind="decision", **kwargs)
+
+    def list_links(
+        self,
+        *,
+        item_id: str,
+        revision: int | None = None,
+        direction: str = "both",
+        relation: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return bounded direct relationship edges for one experience item."""
+        safe_item_id = self._identifier(item_id, "item_id")
+        safe_direction = _require_choice("direction", direction, frozenset({"in", "out", "both"}))
+        safe_relation = self._text(relation, "relation", max_chars=64, nullable=True)
+        if safe_relation is not None:
+            safe_relation = _require_choice(
+                "relation",
+                safe_relation,
+                frozenset({
+                    "evidence_for",
+                    "derived_from",
+                    "contradicts",
+                    "supersedes",
+                    "duplicate_of",
+                    "continues",
+                }),
+            )
+        clauses: list[str] = []
+        params: list[Any] = []
+        def add_clause(prefix: str) -> None:
+            parts = [f"{prefix}_item_id = ?"]
+            local_params = [safe_item_id]
+            if revision is not None:
+                if isinstance(revision, bool) or int(revision) < 1:
+                    raise ValueError("revision must be a positive integer")
+                parts.append(f"{prefix}_revision = ?")
+                local_params.append(int(revision))
+            if safe_relation is not None:
+                parts.append("relation = ?")
+                local_params.append(safe_relation)
+            clauses.append(f"({' AND '.join(parts)})")
+            params.extend(local_params)
+        if safe_direction in {"out", "both"}:
+            add_clause("from")
+        if safe_direction in {"in", "both"}:
+            add_clause("to")
+        if not clauses:
+            return []
+        query = f"""
+            SELECT * FROM experience_links
+            WHERE {' OR '.join(f'({clause})' for clause in clauses)}
+            ORDER BY created_at, from_item_id, relation, to_item_id
+            LIMIT 200
+        """
+        with self._lock:
+            rows = self._connection().execute(query, params).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            payload = dict(row)
+            payload["metadata"] = self._json_from_storage(row["metadata_json"], "link metadata")
+            payload.pop("metadata_json", None)
+            result.append(payload)
+        return result
+
+    def add_experience_link(
+        self,
+        *,
+        from_item_id: str,
+        from_revision: int,
+        relation: str,
+        to_item_id: str,
+        to_revision: int,
+        metadata: Mapping[str, Any] | None = None,
+        created_at: float | None = None,
+        event_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Append a bounded relationship edge between immutable experience revisions."""
+
+        safe_relation = _require_choice(
+            "relation",
+            relation,
+            frozenset({
+                "evidence_for",
+                "derived_from",
+                "contradicts",
+                "supersedes",
+                "duplicate_of",
+                "continues",
+            }),
+        )
+        safe_from_item = self._identifier(from_item_id, "from_item_id")
+        safe_to_item = self._identifier(to_item_id, "to_item_id")
+        if isinstance(from_revision, bool) or int(from_revision) < 1:
+            raise ValueError("from_revision must be a positive integer")
+        if isinstance(to_revision, bool) or int(to_revision) < 1:
+            raise ValueError("to_revision must be a positive integer")
+        safe_from_revision = int(from_revision)
+        safe_to_revision = int(to_revision)
+        safe_metadata, metadata_json = self._json_for_storage(
+            metadata or {}, "link metadata", _MAX_EVENT_JSON_BYTES
+        )
+        timestamp = _now(created_at)
+        safe_event_id = self._identifier(event_id or _new_id("event"), "event_id")
+
+        def add(conn: sqlite3.Connection) -> tuple[bool, dict[str, Any]]:
+            for item_id, revision in (
+                (safe_from_item, safe_from_revision),
+                (safe_to_item, safe_to_revision),
+            ):
+                if conn.execute(
+                    "SELECT 1 FROM experience_item_revisions "
+                    "WHERE item_id = ? AND revision = ?",
+                    (item_id, revision),
+                ).fetchone() is None:
+                    raise ValueError("relationship endpoint revision does not exist")
+            existing = conn.execute(
+                """
+                SELECT created_at FROM experience_links
+                WHERE from_item_id = ? AND from_revision = ?
+                  AND relation = ? AND to_item_id = ? AND to_revision = ?
+                """,
+                (
+                    safe_from_item,
+                    safe_from_revision,
+                    safe_relation,
+                    safe_to_item,
+                    safe_to_revision,
+                ),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO experience_links(
+                        from_item_id, from_revision, relation, to_item_id,
+                        to_revision, created_at, metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        safe_from_item,
+                        safe_from_revision,
+                        safe_relation,
+                        safe_to_item,
+                        safe_to_revision,
+                        timestamp,
+                        metadata_json,
+                    ),
+                )
+            if event_id:
+                existing_event = conn.execute(
+                    "SELECT * FROM experience_events WHERE id = ?", (safe_event_id,)
+                ).fetchone()
+                if existing_event is None:
+                    conn.execute(
+                        """
+                        INSERT INTO experience_events(
+                            id, event_type, item_id, item_revision, retrieval_id,
+                            work_id, payload_json, idempotency_key, created_at
+                        ) VALUES (?, 'relation_added', ?, ?, NULL, NULL, ?, NULL, ?)
+                        """,
+                        (
+                            safe_event_id,
+                            safe_from_item,
+                            safe_from_revision,
+                            self._json_dumps(
+                                {
+                                    "relation": safe_relation,
+                                    "to_item_id": safe_to_item,
+                                    "to_revision": safe_to_revision,
+                                },
+                                "event payload",
+                                _MAX_EVENT_JSON_BYTES,
+                            ),
+                            timestamp,
+                        ),
+                    )
+            return existing is not None, safe_metadata
+
+        replayed, metadata_value = self._execute_write(add)
+        return {
+            "from_item_id": safe_from_item,
+            "from_revision": safe_from_revision,
+            "relation": safe_relation,
+            "to_item_id": safe_to_item,
+            "to_revision": safe_to_revision,
+            "created_at": timestamp,
+            "metadata": metadata_value,
+            "replayed": replayed,
+        }
+
+    def related_decisions(
+        self,
+        *,
+        item_id: str,
+        max_depth: int = 2,
+        max_nodes: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Return shallow Decision relationship traversal without unbounded SQL."""
+        safe_item_id = self._identifier(item_id, "item_id")
+        initial = self.get_decision(safe_item_id, include_history=False)
+        if initial is None:
+            return []
+        initial_revision = int(initial["current_revision"])
+        safe_depth = max(0, min(int(max_depth), 3))
+        safe_nodes = max(1, min(int(max_nodes), 100))
+        visited: set[tuple[str, int]] = {(safe_item_id, initial_revision)}
+        frontier: list[tuple[str, int, int]] = [(safe_item_id, initial_revision, 0)]
+        related: list[dict[str, Any]] = []
+        while frontier and len(related) < safe_nodes:
+            current_id, current_revision, depth = frontier.pop(0)
+            if depth >= safe_depth:
+                continue
+            for link in self.list_links(
+                item_id=current_id,
+                revision=current_revision,
+                direction="both",
+                relation=None,
+            ):
+                from_id = str(link["from_item_id"])
+                to_id = str(link["to_item_id"])
+                for next_id, next_revision in (
+                    (from_id, int(link["from_revision"])),
+                    (to_id, int(link["to_revision"])),
+                ):
+                    key = (next_id, next_revision)
+                    if key in visited:
+                        continue
+                    visited.add(key)
+                    decision = self.get_decision(next_id, revision=next_revision, include_history=False)
+                    if decision is None or decision.get("kind") != "decision":
+                        continue
+                    related.append({
+                        "decision": decision,
+                        "link": link,
+                        "depth": depth + 1,
+                    })
+                    if len(related) >= safe_nodes:
+                        break
+                    frontier.append((next_id, next_revision, depth + 1))
+        return related
+
+    def record_influence_event(
+        self,
+        *,
+        event_type: str,
+        item_id: str,
+        item_revision: int,
+        retrieval_id: str | None,
+        work_id: str | None,
+        payload: Mapping[str, Any] | None = None,
+        created_at: float | None = None,
+        event_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Append a bounded, text-free influence event."""
+        safe_event_type = _require_choice("event_type", event_type, _EVENT_TYPES)
+        if safe_event_type not in {
+            "disclosed",
+            "declared_applied",
+            "overridden",
+            "not_applicable",
+            "retrieved",
+        }:
+            raise ValueError("event_type is not an influence event")
+        safe_item_id = self._identifier(item_id, "item_id")
+        if isinstance(item_revision, bool) or int(item_revision) < 1:
+            raise ValueError("item_revision must be a positive integer")
+        safe_revision = int(item_revision)
+        safe_retrieval_id = self._identifier(retrieval_id, "retrieval_id", nullable=True)
+        safe_work_id = self._identifier(work_id, "work_id", nullable=True)
+        safe_payload = self._json_dumps(payload or {}, "event payload", _MAX_EVENT_JSON_BYTES)
+        timestamp = _now(created_at)
+        safe_event_id = self._identifier(event_id or _new_id("event"), "event_id")
+
+        def insert(conn: sqlite3.Connection) -> None:
+            existing = conn.execute(
+                "SELECT * FROM experience_events WHERE id = ?", (safe_event_id,)
+            ).fetchone()
+            if existing is not None:
+                return
+            conn.execute(
+                """
+                INSERT INTO experience_events(
+                    id, event_type, item_id, item_revision, retrieval_id,
+                    work_id, payload_json, idempotency_key, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)
+                """,
+                (
+                    safe_event_id,
+                    safe_event_type,
+                    safe_item_id,
+                    safe_revision,
+                    safe_retrieval_id,
+                    safe_work_id,
+                    safe_payload,
+                    timestamp,
+                ),
+            )
+
+        self._execute_write(insert)
+        return {
+            "id": safe_event_id,
+            "event_type": safe_event_type,
+            "item_id": safe_item_id,
+            "item_revision": safe_revision,
+            "retrieval_id": safe_retrieval_id,
+            "work_id": safe_work_id,
+            "created_at": timestamp,
+        }
+
+    def list_influence_events(
+        self,
+        *,
+        item_id: str | None = None,
+        retrieval_id: str | None = None,
+        event_type: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return bounded influence events without memory text."""
+        safe_item_id = self._identifier(item_id, "item_id", nullable=True)
+        safe_retrieval_id = self._identifier(retrieval_id, "retrieval_id", nullable=True)
+        safe_event_type = _require_choice("event_type", event_type, _EVENT_TYPES) if event_type else None
+        clauses: list[str] = []
+        params: list[Any] = []
+        if safe_item_id is not None:
+            clauses.append("item_id = ?")
+            params.append(safe_item_id)
+        if safe_retrieval_id is not None:
+            clauses.append("retrieval_id = ?")
+            params.append(safe_retrieval_id)
+        if safe_event_type is not None:
+            clauses.append("event_type = ?")
+            params.append(safe_event_type)
+        safe_limit = max(0, min(int(limit), 500))
+        where = f"AND {' AND '.join(clauses)}" if clauses else ""
+        query = f"""
+            SELECT * FROM experience_events
+            WHERE event_type IN (
+                'disclosed', 'declared_applied', 'overridden',
+                'not_applicable', 'retrieved'
+            )
+            {where}
+            ORDER BY created_at DESC, id
+            LIMIT ?
+        """
+        with self._lock:
+            rows = self._connection().execute(query, (*params, safe_limit)).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            payload = dict(row)
+            payload["payload"] = self._json_from_storage(row["payload_json"], "event payload")
+            payload.pop("payload_json", None)
+            result.append(payload)
+        return result
+
+    def record_migration_source(
+        self,
+        *,
+        source_system: str,
+        source_store_hash: str,
+        source_item_id: str,
+        source_revision: int,
+        target_item_id: str | None,
+        target_revision: int | None = None,
+        disposition: str = "imported_candidate",
+        reason_code: str | None = None,
+        imported_at: float | None = None,
+    ) -> dict[str, Any]:
+        """Persist an idempotent legacy migration mapping."""
+        safe_source_system = self._text(source_system, "source_system", max_chars=128)
+        safe_store_hash = self._digest(source_store_hash, "source_store_hash")
+        safe_source_item_id = self._text(source_item_id, "source_item_id", max_chars=256)
+        if isinstance(source_revision, bool) or int(source_revision) < 1:
+            raise ValueError("source_revision must be a positive integer")
+        safe_source_revision = int(source_revision)
+        safe_target_item_id = self._identifier(
+            target_item_id, "target_item_id", nullable=True
+        )
+        safe_target_revision = None
+        if target_revision is not None:
+            if isinstance(target_revision, bool) or int(target_revision) < 1:
+                raise ValueError("target_revision must be a positive integer")
+            safe_target_revision = int(target_revision)
+        safe_disposition = _require_choice(
+            "disposition",
+            disposition,
+            frozenset({"imported_candidate", "skipped", "needs_manual_review"}),
+        )
+        safe_reason = self._text(reason_code, "reason_code", max_chars=128, nullable=True)
+        timestamp = _now(imported_at)
+
+        def upsert(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                """
+                INSERT INTO experience_migration_sources(
+                    source_system, source_store_hash, source_item_id,
+                    source_revision, target_item_id, target_revision,
+                    disposition, reason_code, imported_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(
+                    source_system, source_store_hash, source_item_id, source_revision
+                ) DO UPDATE SET
+                    target_item_id = excluded.target_item_id,
+                    target_revision = excluded.target_revision,
+                    disposition = excluded.disposition,
+                    reason_code = excluded.reason_code,
+                    imported_at = excluded.imported_at
+                """,
+                (
+                    safe_source_system,
+                    safe_store_hash,
+                    safe_source_item_id,
+                    safe_source_revision,
+                    safe_target_item_id,
+                    safe_target_revision,
+                    safe_disposition,
+                    safe_reason,
+                    timestamp,
+                ),
+            )
+
+        self._execute_write(upsert)
+        return {
+            "source_system": safe_source_system,
+            "source_store_hash": safe_store_hash,
+            "source_item_id": safe_source_item_id,
+            "source_revision": safe_source_revision,
+            "target_item_id": safe_target_item_id,
+            "target_revision": safe_target_revision,
+            "disposition": safe_disposition,
+            "reason_code": safe_reason,
+            "imported_at": timestamp,
+        }
+
+    def list_migration_sources(
+        self,
+        *,
+        source_system: str | None = None,
+        source_store_hash: str | None = None,
+        source_item_id: str | None = None,
+        source_revision: int | None = None,
+        disposition: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return bounded migration mappings by source identity."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if source_system is not None:
+            clauses.append("source_system = ?")
+            params.append(self._text(source_system, "source_system", max_chars=128))
+        if source_store_hash is not None:
+            clauses.append("source_store_hash = ?")
+            params.append(self._digest(source_store_hash, "source_store_hash"))
+        if source_item_id is not None:
+            clauses.append("source_item_id = ?")
+            params.append(self._text(source_item_id, "source_item_id", max_chars=256))
+        if source_revision is not None:
+            if isinstance(source_revision, bool) or int(source_revision) < 1:
+                raise ValueError("source_revision must be a positive integer")
+            clauses.append("source_revision = ?")
+            params.append(int(source_revision))
+        if disposition is not None:
+            clauses.append("disposition = ?")
+            params.append(
+                _require_choice(
+                    "disposition",
+                    disposition,
+                    frozenset({"imported_candidate", "skipped", "needs_manual_review"}),
+                )
+            )
+        safe_limit = max(0, min(int(limit), 1_000))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(safe_limit)
+        with self._lock:
+            rows = self._connection().execute(
+                f"""
+                SELECT * FROM experience_migration_sources
+                {where}
+                ORDER BY imported_at DESC, source_item_id, source_revision
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def edit_lesson(
         self,
@@ -2019,6 +3678,1288 @@ class ExperienceStore:
         assert item is not None
         return item
 
+    def edit_decision(
+        self,
+        item_id: str,
+        *,
+        title: Any = _UNSET,
+        summary: Any = _UNSET,
+        body: Any = _UNSET,
+        tags: Any = _UNSET,
+        source_session_id: Any = _UNSET,
+        source_turn_id: Any = _UNSET,
+        source_work_id: Any = _UNSET,
+        source_hash: Any = _UNSET,
+        producer: Any = _UNSET,
+        review_after: Any = _UNSET,
+        editor: str = "user",
+        edit_reason: str | None = None,
+        idempotency_key: str | None = None,
+        edited_at: float | None = None,
+        event_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Append an immutable revision to a nonterminal Decision.
+
+        Meaningful edits to active Decisions become review_required rather
+        than silently changing an active constraint.
+        """
+        safe_item_id = self._identifier(item_id, "item_id")
+        safe_editor = self._text(
+            editor, "editor", max_chars=128, allow_empty=False
+        )
+        safe_reason = self._text(
+            edit_reason,
+            "edit_reason",
+            max_chars=_MAX_REASON_CHARS,
+            nullable=True,
+        )
+        safe_idempotency = self._identifier(
+            idempotency_key, "idempotency_key", nullable=True
+        )
+        safe_event_id = self._identifier(
+            event_id or _new_id("event"), "event_id"
+        )
+        timestamp = _now(edited_at)
+
+        def edit(conn: sqlite3.Connection) -> int:
+            item = conn.execute(
+                "SELECT * FROM experience_items WHERE id = ?", (safe_item_id,)
+            ).fetchone()
+            if item is None or item["kind"] != "decision":
+                raise KeyError(f"unknown decision {safe_item_id}")
+            if item["current_status"] not in {"candidate", "active", "review_required"}:
+                raise ValueError(
+                    f"can only edit nonterminal decisions, current status is {item['current_status']}"
+                )
+            replay = None
+            if safe_idempotency:
+                replay = conn.execute(
+                    "SELECT revision FROM experience_item_revisions "
+                    "WHERE item_id = ? AND idempotency_key = ?",
+                    (safe_item_id, safe_idempotency),
+                ).fetchone()
+
+            current_revision = int(item["current_revision"])
+            current = conn.execute(
+                "SELECT * FROM experience_item_revisions "
+                "WHERE item_id = ? AND revision = ?",
+                (safe_item_id, current_revision),
+            ).fetchone()
+            if current is None:
+                raise RuntimeError("decision current revision is missing")
+            current_tags = tuple(
+                (row["namespace"], row["value"])
+                for row in conn.execute(
+                    "SELECT namespace, value FROM experience_tags "
+                    "WHERE item_id = ? AND revision = ? ORDER BY namespace, value",
+                    (safe_item_id, current_revision),
+                ).fetchall()
+            )
+
+            new_title = (
+                current["title"]
+                if title is _UNSET
+                else self._text(
+                    title, "title", max_chars=_MAX_TITLE_CHARS, allow_empty=False
+                )
+            )
+            new_summary = (
+                current["summary"]
+                if summary is _UNSET
+                else self._text(summary, "summary", max_chars=_MAX_SUMMARY_CHARS)
+            )
+            if body is _UNSET:
+                new_body = json.loads(current["body_json"])
+                new_body_json = current["body_json"]
+            else:
+                new_body = self._validate_decision_body(self._mapping(body, "body"))
+                _, new_body_json = self._json_for_storage(
+                    new_body, "body", _MAX_BODY_JSON_BYTES
+                )
+                if item["current_status"] == "candidate" and new_body["authority"] not in {"unapproved", "repository_policy"}:
+                    raise ValueError("candidate decisions must be unapproved or repository_policy")
+            new_tags = current_tags if tags is _UNSET else self._normalize_tags(tags)
+            meaningful_body_change = False
+            if body is not _UNSET:
+                old_body = json.loads(current["body_json"])
+                meaningful_body_change = any(
+                    new_body.get(field) != old_body.get(field)
+                    for field in _MEANINGFUL_DECISION_BODY_FIELDS
+                )
+            status_after_edit = (
+                "review_required"
+                if item["current_status"] == "active" and meaningful_body_change
+                else item["current_status"]
+            )
+
+            def inherited_identifier(value: Any, column: str) -> str | None:
+                if value is _UNSET:
+                    return current[column]
+                return self._identifier(value, column, nullable=True)
+
+            def inherited_digest(value: Any, column: str) -> str | None:
+                if value is _UNSET:
+                    return current[column]
+                return self._digest(value, column, nullable=True)
+
+            new_source_session = inherited_identifier(
+                source_session_id, "source_session_id"
+            )
+            new_source_turn = inherited_identifier(source_turn_id, "source_turn_id")
+            new_source_work = inherited_identifier(source_work_id, "source_work_id")
+            new_source_hash = inherited_digest(source_hash, "source_hash")
+            if producer is _UNSET:
+                new_producer_json = current["producer_json"]
+            else:
+                _, new_producer_json = self._json_for_storage(
+                    producer or {}, "producer", _MAX_PRODUCER_JSON_BYTES
+                )
+            new_review_after = (
+                current["review_after"]
+                if review_after is _UNSET
+                else _optional_timestamp(review_after, "review_after")
+            )
+            new_content_hash = self._decision_content_hash(
+                scope_type=item["scope_type"],
+                scope_id=item["scope_id"],
+                title=new_title or "",
+                summary=new_summary or "",
+                body=new_body,
+                tags=new_tags,
+            )
+            if (
+                new_content_hash == current["content_hash"]
+                and new_source_session == current["source_session_id"]
+                and new_source_turn == current["source_turn_id"]
+                and new_source_work == current["source_work_id"]
+                and new_source_hash == current["source_hash"]
+                and new_producer_json == current["producer_json"]
+                and new_review_after == current["review_after"]
+            ):
+                return current_revision
+
+            if replay is not None:
+                raise ValueError(
+                    "idempotent edit replay has different sanitized content"
+                )
+            if timestamp <= float(item["updated_at"]):
+                raise ValueError("edited_at must be newer than the current decision")
+
+            new_revision = current_revision + 1
+            conn.execute(
+                """
+                INSERT INTO experience_item_revisions(
+                    item_id, revision, title, summary, body_json, searchable_text,
+                    confidence, source_session_id, source_turn_id, source_work_id,
+                    source_hash, content_hash, editor, edit_reason, producer_json,
+                    idempotency_key, created_at, last_validated_at, review_after
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+                """,
+                (
+                    safe_item_id,
+                    new_revision,
+                    new_title,
+                    new_summary,
+                    new_body_json,
+                    self._decision_body_search_text(new_body),
+                    new_source_session,
+                    new_source_turn,
+                    new_source_work,
+                    new_source_hash,
+                    new_content_hash,
+                    safe_editor,
+                    safe_reason,
+                    new_producer_json,
+                    safe_idempotency,
+                    timestamp,
+                    new_review_after,
+                ),
+            )
+            conn.executemany(
+                "INSERT INTO experience_tags(item_id, revision, namespace, value) "
+                "VALUES (?, ?, ?, ?)",
+                [
+                    (safe_item_id, new_revision, namespace, value)
+                    for namespace, value in new_tags
+                ],
+            )
+            conn.execute(
+                "UPDATE experience_items SET current_revision = ?, current_status = ?, "
+                "updated_at = ?, deleted_at = NULL WHERE id = ?",
+                (new_revision, status_after_edit, timestamp, safe_item_id),
+            )
+            payload = self._json_dumps(
+                {
+                    "editor": safe_editor,
+                    "edit_reason": safe_reason,
+                    "from_revision": current_revision,
+                    "to_revision": new_revision,
+                },
+                "event payload",
+                _MAX_EVENT_JSON_BYTES,
+            )
+            conn.execute(
+                """
+                INSERT INTO experience_events(
+                    id, event_type, item_id, item_revision, retrieval_id,
+                    work_id, payload_json, idempotency_key, created_at
+                ) VALUES (?, 'edited', ?, ?, NULL, NULL, ?, NULL, ?)
+                """,
+                (safe_event_id, safe_item_id, new_revision, payload, timestamp),
+            )
+            if status_after_edit == "review_required" and item["current_status"] == "active":
+                review_payload = self._decision_event_payload(
+                    actor=safe_editor,
+                    reason="meaningful decision edit requires review",
+                    from_status="active",
+                    to_status="review_required",
+                    extra={"from_revision": current_revision, "to_revision": new_revision},
+                )
+                self._insert_decision_event(
+                    conn,
+                    event_id=_new_id("event"),
+                    event_type="review_required",
+                    item_id=safe_item_id,
+                    item_revision=new_revision,
+                    payload=review_payload,
+                    idempotency_key=None,
+                    created_at=timestamp,
+                )
+            return new_revision
+
+        revision_number = self._execute_write(edit)
+        item = self.get_item(safe_item_id, revision=revision_number)
+        assert item is not None
+        return item
+
+    def _decision_scope_for_hash(self, conn: sqlite3.Connection, item_id: str) -> tuple[str, str]:
+        row = conn.execute(
+            "SELECT scope_type, scope_id FROM experience_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"unknown decision {item_id}")
+        return str(row["scope_type"]), str(row["scope_id"])
+
+    def _decision_content_hash_for_item(
+        self,
+        conn: sqlite3.Connection,
+        item_id: str,
+        *,
+        title: str,
+        summary: str,
+        body: Mapping[str, Any],
+        tags: Sequence[tuple[str, str]],
+    ) -> str:
+        scope_type, scope_id = self._decision_scope_for_hash(conn, item_id)
+        return self._decision_content_hash(
+            scope_type=scope_type,
+            scope_id=scope_id,
+            title=title or "",
+            summary=summary or "",
+            body=body,
+            tags=tags,
+        )
+
+    def _insert_decision_revision(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        item_id: str,
+        revision: int,
+        title: str,
+        summary: str,
+        body: Mapping[str, Any],
+        tags: Sequence[tuple[str, str]],
+        editor: str,
+        edit_reason: str | None,
+        source_session_id: str | None,
+        source_turn_id: str | None,
+        source_work_id: str | None,
+        source_hash: str | None,
+        producer_json: str,
+        idempotency_key: str | None,
+        created_at: float,
+        review_after: float | None,
+    ) -> str:
+        content_hash = self._decision_content_hash_for_item(
+            conn,
+            item_id,
+            title=title,
+            summary=summary,
+            body=body,
+            tags=tags,
+        )
+        conn.execute(
+            """
+            INSERT INTO experience_item_revisions(
+                item_id, revision, title, summary, body_json, searchable_text,
+                confidence, source_session_id, source_turn_id, source_work_id,
+                source_hash, content_hash, editor, edit_reason, producer_json,
+                idempotency_key, created_at, last_validated_at, review_after
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+            """,
+            (
+                item_id,
+                revision,
+                title,
+                summary,
+                self._json_dumps(body, "body", _MAX_BODY_JSON_BYTES),
+                self._decision_body_search_text(body),
+                source_session_id,
+                source_turn_id,
+                source_work_id,
+                source_hash,
+                content_hash,
+                editor,
+                edit_reason,
+                producer_json,
+                idempotency_key,
+                created_at,
+                review_after,
+            ),
+        )
+        conn.executemany(
+            "INSERT INTO experience_tags(item_id, revision, namespace, value) "
+            "VALUES (?, ?, ?, ?)",
+            [
+                (item_id, revision, namespace, value)
+                for namespace, value in tags
+            ],
+        )
+        return content_hash
+
+    @staticmethod
+    def _require_decision_authority(authority: Any) -> DecisionTurnAuthority:
+        if not isinstance(authority, DecisionTurnAuthority):
+            raise TypeError("authority must be a DecisionTurnAuthority")
+        return authority
+
+    def _decision_event_payload(
+        self,
+        *,
+        actor: str,
+        reason: str | None,
+        from_status: str,
+        to_status: str,
+        extra: Mapping[str, Any] | None = None,
+    ) -> str:
+        payload: dict[str, Any] = {
+            "actor": actor,
+            "from_status": from_status,
+            "reason": reason,
+            "to_status": to_status,
+        }
+        if extra:
+            payload.update(extra)
+        return self._json_dumps(payload, "event payload", _MAX_EVENT_JSON_BYTES)
+
+    def _insert_decision_event(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        event_id: str,
+        event_type: str,
+        item_id: str,
+        item_revision: int,
+        payload: str,
+        idempotency_key: str | None,
+        created_at: float,
+    ) -> None:
+        if idempotency_key:
+            replay = conn.execute(
+                "SELECT * FROM experience_events WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if replay is not None:
+                try:
+                    replay_payload = json.loads(replay["payload_json"])
+                except (TypeError, ValueError):
+                    replay_payload = {}
+                payload_obj = json.loads(payload)
+                if (
+                    replay["event_type"] != event_type
+                    or replay["item_id"] != item_id
+                    or replay_payload.get("actor") != payload_obj.get("actor")
+                    or replay_payload.get("reason") != payload_obj.get("reason")
+                    or replay_payload.get("to_status") != payload_obj.get("to_status")
+                ):
+                    raise ValueError(
+                        "idempotency key already identifies another decision transition"
+                    )
+                return
+        conn.execute(
+            """
+            INSERT INTO experience_events(
+                id, event_type, item_id, item_revision, retrieval_id,
+                work_id, payload_json, idempotency_key, created_at
+            ) VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?)
+            """,
+            (
+                event_id,
+                event_type,
+                item_id,
+                item_revision,
+                payload,
+                idempotency_key,
+                created_at,
+            ),
+        )
+
+    def _decision_revision_fields(
+        self,
+        conn: sqlite3.Connection,
+        item: sqlite3.Row,
+        current: sqlite3.Row,
+        current_tags: tuple[tuple[str, str], ...],
+        *,
+        title: Any = _UNSET,
+        summary: Any = _UNSET,
+        body: Any = _UNSET,
+        tags: Any = _UNSET,
+        source_session_id: Any = _UNSET,
+        source_turn_id: Any = _UNSET,
+        source_work_id: Any = _UNSET,
+        source_hash: Any = _UNSET,
+        producer: Any = _UNSET,
+        review_after: Any = _UNSET,
+    ) -> dict[str, Any]:
+        new_title = (
+            current["title"]
+            if title is _UNSET
+            else self._text(title, "title", max_chars=_MAX_TITLE_CHARS, allow_empty=False)
+        )
+        new_summary = (
+            current["summary"]
+            if summary is _UNSET
+            else self._text(summary, "summary", max_chars=_MAX_SUMMARY_CHARS)
+        )
+        if body is _UNSET:
+            new_body = json.loads(current["body_json"])
+            new_body_json = current["body_json"]
+        else:
+            new_body = self._validate_decision_body(self._mapping(body, "body"))
+            _, new_body_json = self._json_for_storage(new_body, "body", _MAX_BODY_JSON_BYTES)
+        new_tags = current_tags if tags is _UNSET else self._normalize_tags(tags)
+
+        def inherited_identifier(value: Any, column: str) -> str | None:
+            return current[column] if value is _UNSET else self._identifier(value, column, nullable=True)
+
+        def inherited_digest(value: Any, column: str) -> str | None:
+            return current[column] if value is _UNSET else self._digest(value, column, nullable=True)
+
+        new_source_session = inherited_identifier(source_session_id, "source_session_id")
+        new_source_turn = inherited_identifier(source_turn_id, "source_turn_id")
+        new_source_work = inherited_identifier(source_work_id, "source_work_id")
+        new_source_hash = inherited_digest(source_hash, "source_hash")
+        new_producer_json = (
+            current["producer_json"]
+            if producer is _UNSET
+            else self._json_for_storage(producer or {}, "producer", _MAX_PRODUCER_JSON_BYTES)[1]
+        )
+        new_review_after = (
+            current["review_after"]
+            if review_after is _UNSET
+            else _optional_timestamp(review_after, "review_after")
+        )
+        new_content_hash = self._decision_content_hash_for_item(
+            conn,
+            str(item["id"]),
+            title=new_title or "",
+            summary=new_summary or "",
+            body=new_body,
+            tags=new_tags,
+        )
+        return {
+            "title": new_title,
+            "summary": new_summary,
+            "body": new_body,
+            "body_json": new_body_json,
+            "tags": new_tags,
+            "source_session_id": new_source_session,
+            "source_turn_id": new_source_turn,
+            "source_work_id": new_source_work,
+            "source_hash": new_source_hash,
+            "producer_json": new_producer_json,
+            "review_after": new_review_after,
+            "content_hash": new_content_hash,
+        }
+
+    def _decision_authority_revision(
+        self,
+        conn: sqlite3.Connection,
+        item: sqlite3.Row,
+        current: sqlite3.Row,
+        current_tags: tuple[tuple[str, str], ...],
+        *,
+        authority: DecisionTurnAuthority,
+        repository_root: str | Path | None,
+        repository_id: str | None = None,
+        title: Any = _UNSET,
+        summary: Any = _UNSET,
+        body: Any = _UNSET,
+        tags: Any = _UNSET,
+        source_session_id: Any = _UNSET,
+        source_turn_id: Any = _UNSET,
+        source_work_id: Any = _UNSET,
+        source_hash: Any = _UNSET,
+        producer: Any = _UNSET,
+        review_after: Any = _UNSET,
+    ) -> dict[str, Any]:
+        fields = self._decision_revision_fields(
+            conn,
+            item,
+            current,
+            current_tags,
+            title=title,
+            summary=summary,
+            body=body,
+            tags=tags,
+            source_session_id=source_session_id,
+            source_turn_id=source_turn_id,
+            source_work_id=source_work_id,
+            source_hash=source_hash,
+            producer=producer,
+            review_after=review_after,
+        )
+        new_body = dict(fields["body"])
+        if repository_id is not None and item["repository_id"] != repository_id:
+            raise ValueError("repository_id does not match the current decision")
+        if new_body["authority"] == "repository_policy":
+            if repository_root is None:
+                raise ValueError("repository_root is required for repository_policy decisions")
+            validation = validate_repository_anchor(
+                new_body["policy_anchor_path"],
+                new_body["policy_anchor_hash"],
+                repository_root=repository_root,
+            )
+            if not validation.valid:
+                raise ValueError(f"repository policy anchor invalid: {validation.reason}")
+            fields["anchor_validation"] = validation
+        elif new_body["authority"] == "user":
+            if not (
+                authority.approves(str(item["id"]))
+                or authority.matches_source_hash(fields["source_hash"])
+            ):
+                raise ValueError("active decision requires trusted user authority")
+        elif new_body["authority"] == "unapproved":
+            if not (
+                authority.approves(str(item["id"]))
+                or authority.matches_source_hash(fields["source_hash"])
+            ):
+                raise ValueError("candidate decision requires trusted user authority")
+            new_body["authority"] = "user"
+            _, fields["body_json"] = self._json_for_storage(new_body, "body", _MAX_BODY_JSON_BYTES)
+            fields["body"] = new_body
+            fields["content_hash"] = self._decision_content_hash_for_item(
+                conn,
+                str(item["id"]),
+                title=fields["title"] or "",
+                summary=fields["summary"] or "",
+                body=new_body,
+                tags=fields["tags"],
+            )
+        else:
+            raise ValueError("unsupported decision authority")
+        return fields
+
+    def activate_decision(
+        self,
+        item_id: str,
+        *,
+        authority: DecisionTurnAuthority,
+        repository_root: str | Path | None = None,
+        repository_id: str | None = None,
+        actor: str = "user",
+        reason: str | None = None,
+        transitioned_at: float | None = None,
+        event_id: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Activate a Decision only through trusted host authority."""
+
+        trusted_authority = self._require_decision_authority(authority)
+        safe_item_id = self._identifier(item_id, "item_id")
+        safe_actor = self._text(actor, "actor", max_chars=128, allow_empty=False)
+        safe_reason = self._text(reason, "reason", max_chars=_MAX_REASON_CHARS, nullable=True)
+        safe_event_id = self._identifier(event_id or _new_id("event"), "event_id")
+        safe_idempotency = self._identifier(idempotency_key, "idempotency_key", nullable=True)
+        timestamp = _now(transitioned_at)
+
+        def activate(conn: sqlite3.Connection) -> int:
+            item = conn.execute("SELECT * FROM experience_items WHERE id = ?", (safe_item_id,)).fetchone()
+            if item is None or item["kind"] != "decision":
+                raise KeyError(f"unknown decision {safe_item_id}")
+            if item["current_status"] != "candidate":
+                raise ValueError("only candidate decisions can be activated")
+            current_revision = int(item["current_revision"])
+            current = conn.execute(
+                "SELECT * FROM experience_item_revisions WHERE item_id = ? AND revision = ?",
+                (safe_item_id, current_revision),
+            ).fetchone()
+            if current is None:
+                raise RuntimeError("decision current revision is missing")
+            current_tags = tuple(
+                (row["namespace"], row["value"])
+                for row in conn.execute(
+                    "SELECT namespace, value FROM experience_tags "
+                    "WHERE item_id = ? AND revision = ? ORDER BY namespace, value",
+                    (safe_item_id, current_revision),
+                ).fetchall()
+            )
+            fields = self._decision_authority_revision(
+                conn,
+                item,
+                current,
+                current_tags,
+                authority=trusted_authority,
+                repository_root=repository_root,
+                repository_id=repository_id,
+            )
+            if fields["content_hash"] != current["content_hash"]:
+                current_revision += 1
+                self._insert_decision_revision(
+                    conn,
+                    item_id=safe_item_id,
+                    revision=current_revision,
+                    title=fields["title"],
+                    summary=fields["summary"],
+                    body=fields["body"],
+                    tags=fields["tags"],
+                    editor=safe_actor,
+                    edit_reason=safe_reason,
+                    source_session_id=fields["source_session_id"],
+                    source_turn_id=fields["source_turn_id"],
+                    source_work_id=fields["source_work_id"],
+                    source_hash=fields["source_hash"],
+                    producer_json=fields["producer_json"],
+                    idempotency_key=safe_idempotency,
+                    created_at=timestamp,
+                    review_after=fields["review_after"],
+                )
+            conn.execute(
+                "UPDATE experience_items SET current_revision = ?, current_status = 'active', "
+                "updated_at = ?, deleted_at = NULL WHERE id = ?",
+                (current_revision, timestamp, safe_item_id),
+            )
+            payload = self._decision_event_payload(
+                actor=safe_actor,
+                reason=safe_reason,
+                from_status=str(item["current_status"]),
+                to_status="active",
+            )
+            self._insert_decision_event(
+                conn,
+                event_id=safe_event_id,
+                event_type="activated",
+                item_id=safe_item_id,
+                item_revision=current_revision,
+                payload=payload,
+                idempotency_key=safe_idempotency,
+                created_at=timestamp,
+            )
+            return current_revision
+
+        revision_number = self._execute_write(activate)
+        result = self.get_decision(safe_item_id, revision=revision_number)
+        assert result is not None
+        return result
+
+    def mark_decision_review_required(
+        self,
+        item_id: str,
+        *,
+        actor: str = "user",
+        reason: str | None = None,
+        repository_root: str | Path | None = None,
+        transitioned_at: float | None = None,
+        event_id: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Move a Decision into the non-injectable review state."""
+
+        safe_item_id = self._identifier(item_id, "item_id")
+        safe_actor = self._text(actor, "actor", max_chars=128, allow_empty=False)
+        safe_reason = self._text(reason, "reason", max_chars=_MAX_REASON_CHARS, nullable=True)
+        safe_event_id = self._identifier(event_id or _new_id("event"), "event_id")
+        safe_idempotency = self._identifier(idempotency_key, "idempotency_key", nullable=True)
+        timestamp = _now(transitioned_at)
+
+        def review(conn: sqlite3.Connection) -> tuple[int, str]:
+            item = conn.execute("SELECT * FROM experience_items WHERE id = ?", (safe_item_id,)).fetchone()
+            if item is None or item["kind"] != "decision":
+                raise KeyError(f"unknown decision {safe_item_id}")
+            if item["current_status"] not in {"candidate", "active", "review_required"}:
+                raise ValueError("only nonterminal decisions can enter review_required")
+            current_revision = int(item["current_revision"])
+            current = conn.execute(
+                "SELECT * FROM experience_item_revisions WHERE item_id = ? AND revision = ?",
+                (safe_item_id, current_revision),
+            ).fetchone()
+            event_type = "review_required"
+            review_reason = safe_reason
+            if repository_root is not None:
+                body = json.loads(current["body_json"])
+                if body["authority"] == "repository_policy":
+                    validation = validate_repository_anchor(
+                        body["policy_anchor_path"],
+                        body["policy_anchor_hash"],
+                        repository_root=repository_root,
+                    )
+                    if not validation.valid:
+                        event_type = "anchor_invalidated"
+                        review_reason = review_reason or validation.reason
+            if safe_idempotency:
+                replay = conn.execute(
+                    "SELECT * FROM experience_events WHERE idempotency_key = ?",
+                    (safe_idempotency,),
+                ).fetchone()
+                if replay is not None:
+                    try:
+                        replay_payload = json.loads(replay["payload_json"])
+                    except (TypeError, ValueError):
+                        replay_payload = {}
+                    if (
+                        replay["event_type"] != event_type
+                        or replay["item_id"] != safe_item_id
+                        or replay_payload.get("actor") != safe_actor
+                        or replay_payload.get("reason") != review_reason
+                        or replay_payload.get("to_status") != "review_required"
+                    ):
+                        raise ValueError(
+                            "idempotency key already identifies another decision review"
+                        )
+                    return current_revision, event_type
+            if item["current_status"] == "review_required":
+                return current_revision, event_type
+            conn.execute(
+                "UPDATE experience_items SET current_status = 'review_required', "
+                "updated_at = ?, deleted_at = NULL WHERE id = ?",
+                (timestamp, safe_item_id),
+            )
+            payload = self._decision_event_payload(
+                actor=safe_actor,
+                reason=review_reason,
+                from_status=str(item["current_status"]),
+                to_status="review_required",
+            )
+            self._insert_decision_event(
+                conn,
+                event_id=safe_event_id,
+                event_type=event_type,
+                item_id=safe_item_id,
+                item_revision=current_revision,
+                payload=payload,
+                idempotency_key=safe_idempotency,
+                created_at=timestamp,
+            )
+            return current_revision, event_type
+
+        revision_number, _event_type = self._execute_write(review)
+        result = self.get_decision(safe_item_id, revision=revision_number)
+        assert result is not None
+        return result
+
+    def reapprove_decision(
+        self,
+        item_id: str,
+        *,
+        authority: DecisionTurnAuthority,
+        repository_root: str | Path | None = None,
+        repository_id: str | None = None,
+        title: Any = _UNSET,
+        summary: Any = _UNSET,
+        body: Any = _UNSET,
+        tags: Any = _UNSET,
+        source_session_id: Any = _UNSET,
+        source_turn_id: Any = _UNSET,
+        source_work_id: Any = _UNSET,
+        source_hash: Any = _UNSET,
+        producer: Any = _UNSET,
+        review_after: Any = _UNSET,
+        actor: str = "user",
+        reason: str | None = None,
+        transitioned_at: float | None = None,
+        event_id: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Reapprove a reviewed Decision and transition it back to active."""
+
+        trusted_authority = self._require_decision_authority(authority)
+        safe_item_id = self._identifier(item_id, "item_id")
+        safe_actor = self._text(actor, "actor", max_chars=128, allow_empty=False)
+        safe_reason = self._text(reason, "reason", max_chars=_MAX_REASON_CHARS, nullable=True)
+        safe_event_id = self._identifier(event_id or _new_id("event"), "event_id")
+        safe_idempotency = self._identifier(idempotency_key, "idempotency_key", nullable=True)
+        timestamp = _now(transitioned_at)
+
+        def reapprove(conn: sqlite3.Connection) -> int:
+            item = conn.execute("SELECT * FROM experience_items WHERE id = ?", (safe_item_id,)).fetchone()
+            if item is None or item["kind"] != "decision":
+                raise KeyError(f"unknown decision {safe_item_id}")
+            if item["current_status"] != "review_required":
+                raise ValueError("only review_required decisions can be reapproved")
+            if repository_id is not None and item["repository_id"] != repository_id:
+                raise ValueError("repository_id does not match the current decision")
+            current_revision = int(item["current_revision"])
+            current = conn.execute(
+                "SELECT * FROM experience_item_revisions WHERE item_id = ? AND revision = ?",
+                (safe_item_id, current_revision),
+            ).fetchone()
+            if current is None:
+                raise RuntimeError("decision current revision is missing")
+            current_tags = tuple(
+                (row["namespace"], row["value"])
+                for row in conn.execute(
+                    "SELECT namespace, value FROM experience_tags "
+                    "WHERE item_id = ? AND revision = ? ORDER BY namespace, value",
+                    (safe_item_id, current_revision),
+                ).fetchall()
+            )
+            fields = self._decision_authority_revision(
+                conn,
+                item,
+                current,
+                current_tags,
+                authority=trusted_authority,
+                repository_root=repository_root,
+                title=title,
+                summary=summary,
+                body=body,
+                tags=tags,
+                source_session_id=source_session_id,
+                source_turn_id=source_turn_id,
+                source_work_id=source_work_id,
+                source_hash=source_hash,
+                producer=producer,
+                review_after=review_after,
+            )
+            changed = fields["content_hash"] != current["content_hash"]
+            changed = changed or fields["source_session_id"] != current["source_session_id"]
+            changed = changed or fields["source_turn_id"] != current["source_turn_id"]
+            changed = changed or fields["source_work_id"] != current["source_work_id"]
+            changed = changed or fields["source_hash"] != current["source_hash"]
+            changed = changed or fields["producer_json"] != current["producer_json"]
+            changed = changed or fields["review_after"] != current["review_after"]
+            if changed or item["current_status"] != "active":
+                current_revision += 1
+                self._insert_decision_revision(
+                    conn,
+                    item_id=safe_item_id,
+                    revision=current_revision,
+                    title=fields["title"],
+                    summary=fields["summary"],
+                    body=fields["body"],
+                    tags=fields["tags"],
+                    editor=safe_actor,
+                    edit_reason=safe_reason,
+                    source_session_id=fields["source_session_id"],
+                    source_turn_id=fields["source_turn_id"],
+                    source_work_id=fields["source_work_id"],
+                    source_hash=fields["source_hash"],
+                    producer_json=fields["producer_json"],
+                    idempotency_key=safe_idempotency,
+                    created_at=timestamp,
+                    review_after=fields["review_after"],
+                )
+            conn.execute(
+                "UPDATE experience_items SET current_revision = ?, current_status = 'active', "
+                "updated_at = ?, deleted_at = NULL WHERE id = ?",
+                (current_revision, timestamp, safe_item_id),
+            )
+            payload = self._decision_event_payload(
+                actor=safe_actor,
+                reason=safe_reason,
+                from_status=str(item["current_status"]),
+                to_status="active",
+            )
+            self._insert_decision_event(
+                conn,
+                event_id=safe_event_id,
+                event_type="reapproved",
+                item_id=safe_item_id,
+                item_revision=current_revision,
+                payload=payload,
+                idempotency_key=safe_idempotency,
+                created_at=timestamp,
+            )
+            return current_revision
+
+        revision_number = self._execute_write(reapprove)
+        result = self.get_decision(safe_item_id, revision=revision_number)
+        assert result is not None
+        return result
+
+    def supersede_decision(
+        self,
+        old_item_id: str,
+        *,
+        authority: DecisionTurnAuthority,
+        principal_id: str,
+        scope_type: str,
+        scope_id: str,
+        repository_id: str | None,
+        project_id: str | None,
+        title: str,
+        body: Mapping[str, Any] | Any,
+        summary: str = "",
+        tags: Mapping[Any, Iterable[Any]] | Iterable[tuple[Any, Any]] | None = None,
+        sensitivity: str = "normal",
+        egress_policy: str = "local_only",
+        producer_trust_domain: str | None = None,
+        created_by: str = "user",
+        source_session_id: str | None = None,
+        source_turn_id: str | None = None,
+        source_work_id: str | None = None,
+        source_hash: str | None = None,
+        producer: Mapping[str, Any] | Any | None = None,
+        review_after: float | None = None,
+        item_id: str | None = None,
+        family_id: str | None = None,
+        repository_root: str | Path | None = None,
+        reason: str | None = None,
+        transitioned_at: float | None = None,
+        event_id: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically create a replacement Decision and supersede the old one."""
+
+        trusted_authority = self._require_decision_authority(authority)
+        safe_old_item_id = self._identifier(old_item_id, "item_id")
+        safe_principal = self._principal(principal_id)
+        safe_scope_type = _require_choice("scope_type", scope_type, _SCOPE_TYPES)
+        safe_scope_id = self._identifier(scope_id, "scope_id")
+        safe_repository = self._identifier(repository_id, "repository_id", nullable=True)
+        safe_project = self._identifier(project_id, "project_id", nullable=True)
+        if safe_scope_type == "project" and (not safe_repository or not safe_project):
+            raise ValueError("project-scoped decisions require repository_id and project_id")
+        if safe_scope_type == "repository" and not safe_repository:
+            raise ValueError("repository-scoped decisions require repository_id")
+        if safe_scope_type == "project" and safe_scope_id != safe_project:
+            raise ValueError("project scope_id must equal project_id")
+        if safe_scope_type == "repository" and (
+            safe_scope_id != safe_repository or safe_project is not None
+        ):
+            raise ValueError("repository scope_id must equal repository_id and project_id must be null")
+
+        safe_title = self._text(title, "title", max_chars=_MAX_TITLE_CHARS, allow_empty=False)
+        safe_summary = self._text(summary, "summary", max_chars=_MAX_SUMMARY_CHARS)
+        safe_body = self._validate_decision_body(self._mapping(body, "body"))
+        _, safe_body_json = self._json_for_storage(safe_body, "body", _MAX_BODY_JSON_BYTES)
+        safe_tags = self._normalize_tags(tags)
+        safe_producer, safe_producer_json = self._json_for_storage(
+            producer or {}, "producer", _MAX_PRODUCER_JSON_BYTES
+        )
+        del safe_producer
+        safe_sensitivity = _require_choice("sensitivity", sensitivity, _SENSITIVITIES)
+        safe_egress = _require_choice("egress_policy", egress_policy, _EGRESS_POLICIES)
+        safe_creator = _require_choice("created_by", created_by, _CREATED_BY)
+        safe_review_after = _optional_timestamp(review_after, "review_after")
+        safe_trust_domain = self._trust_domain(producer_trust_domain, nullable=True)
+        if safe_egress == "same_provider_trust_domain" and not safe_trust_domain:
+            raise ValueError("same_provider_trust_domain requires producer_trust_domain")
+        safe_item_id = self._identifier(item_id or _new_id("decision"), "item_id")
+        safe_family_id = self._identifier(family_id or safe_item_id, "family_id")
+        safe_idempotency = self._identifier(idempotency_key, "idempotency_key", nullable=True)
+        safe_event_id = self._identifier(event_id or _new_id("event"), "event_id")
+        timestamp = _now(transitioned_at)
+        safe_reason = self._text(reason, "reason", max_chars=_MAX_REASON_CHARS, nullable=True)
+        safe_actor = self._principal(safe_principal)
+        provenance = {
+            "source_session_id": self._identifier(source_session_id, "source_session_id", nullable=True),
+            "source_turn_id": self._identifier(source_turn_id, "source_turn_id", nullable=True),
+            "source_work_id": self._identifier(source_work_id, "source_work_id", nullable=True),
+            "source_hash": self._digest(source_hash, "source_hash", nullable=True),
+        }
+
+        def supersede(conn: sqlite3.Connection) -> tuple[str, int]:
+            old_item = conn.execute(
+                "SELECT * FROM experience_items WHERE id = ?",
+                (safe_old_item_id,),
+            ).fetchone()
+            if old_item is None or old_item["kind"] != "decision":
+                raise KeyError(f"unknown decision {safe_old_item_id}")
+            if old_item["current_status"] not in {"active", "review_required"}:
+                raise ValueError("only active or review_required decisions can be superseded")
+            if old_item["principal_id"] != safe_principal:
+                raise ValueError("replacement decision principal must match the old decision")
+            if not trusted_authority.supersedes(safe_old_item_id):
+                raise ValueError("supersession requires explicit trusted user authority")
+            if repository_id is not None and old_item["repository_id"] != repository_id:
+                raise ValueError("repository_id does not match the current decision")
+            from agent.experience.authority import require_scope_not_broadened
+
+            require_scope_not_broadened(
+                old_item["scope_type"],
+                old_item["scope_id"],
+                old_item["repository_id"],
+                old_item["project_id"],
+                safe_scope_type,
+                safe_scope_id,
+                safe_repository,
+                safe_project,
+            )
+            replacement_body = safe_body
+            replacement_body_json = safe_body_json
+            body_authority = replacement_body["authority"]
+            if body_authority == "repository_policy":
+                if repository_root is None:
+                    raise ValueError("repository_root is required for repository_policy decisions")
+                validation = validate_repository_anchor(
+                    replacement_body["policy_anchor_path"],
+                    replacement_body["policy_anchor_hash"],
+                    repository_root=repository_root,
+                )
+                if not validation.valid:
+                    raise ValueError(f"repository policy anchor invalid: {validation.reason}")
+            elif body_authority == "user":
+                if not trusted_authority.supersedes(safe_old_item_id):
+                    raise ValueError("replacement decision requires trusted user authority")
+            elif body_authority == "unapproved":
+                replacement_body = dict(replacement_body)
+                if trusted_authority.supersedes(safe_old_item_id):
+                    replacement_body["authority"] = "user"
+                    _, replacement_body_json = self._json_for_storage(replacement_body, "body", _MAX_BODY_JSON_BYTES)
+            else:
+                raise ValueError("unsupported decision authority")
+            replacement_status = "active" if replacement_body["authority"] in {"user", "repository_policy"} else "candidate"
+            old_revision = conn.execute(
+                "SELECT * FROM experience_item_revisions "
+                "WHERE item_id = ? AND revision = ?",
+                (safe_old_item_id, old_item["current_revision"]),
+            ).fetchone()
+            if old_revision is None:
+                raise RuntimeError("superseded decision current revision is missing")
+            replacement_content_hash = self._decision_content_hash(
+                scope_type=safe_scope_type,
+                scope_id=safe_scope_id,
+                title=safe_title or "",
+                summary=safe_summary or "",
+                body=replacement_body,
+                tags=safe_tags,
+            )
+            if (
+                replacement_content_hash == self._decision_content_hash(
+                    scope_type=old_item["scope_type"],
+                    scope_id=old_item["scope_id"],
+                    title=old_revision["title"],
+                    summary=old_revision["summary"],
+                    body=json.loads(old_revision["body_json"]),
+                    tags=tuple(
+                        (row["namespace"], row["value"])
+                        for row in conn.execute(
+                            "SELECT namespace, value FROM experience_tags "
+                            "WHERE item_id = ? AND revision = ? ORDER BY namespace, value",
+                            (safe_old_item_id, old_item["current_revision"]),
+                        ).fetchall()
+                    ),
+                )
+                and safe_scope_type == old_item["scope_type"]
+                and safe_scope_id == old_item["scope_id"]
+                and safe_repository == old_item["repository_id"]
+                and safe_project == old_item["project_id"]
+            ):
+                raise ValueError("replacement decision is an exact duplicate")
+            if safe_idempotency:
+                existing = conn.execute(
+                    "SELECT * FROM experience_items WHERE idempotency_key = ?",
+                    (safe_idempotency,),
+                ).fetchone()
+                if existing is not None and existing["id"] != safe_item_id:
+                    raise ValueError("idempotency key already identifies another decision")
+            if not safe_idempotency and conn.execute(
+                "SELECT 1 FROM experience_items WHERE id = ?",
+                (safe_item_id,),
+            ).fetchone() is not None:
+                raise ValueError("replacement decision already exists")
+            conn.execute(
+                """
+                INSERT INTO experience_items(
+                    id, family_id, kind, current_status, current_revision,
+                    principal_id, scope_type, scope_id, repository_id, project_id,
+                    sensitivity, egress_policy, producer_trust_domain,
+                    created_by, idempotency_key, created_at, updated_at, deleted_at
+                ) VALUES (?, ?, 'decision', ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    safe_item_id,
+                    safe_family_id,
+                    replacement_status,
+                    safe_principal,
+                    safe_scope_type,
+                    safe_scope_id,
+                    safe_repository,
+                    safe_project,
+                    safe_sensitivity,
+                    safe_egress,
+                    safe_trust_domain,
+                    safe_creator,
+                    safe_idempotency,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO experience_item_revisions(
+                    item_id, revision, title, summary, body_json, searchable_text,
+                    confidence, source_session_id, source_turn_id, source_work_id,
+                    source_hash, content_hash, editor, edit_reason, producer_json,
+                    idempotency_key, created_at, last_validated_at, review_after
+                ) VALUES (?, 1, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+                """,
+                (
+                    safe_item_id,
+                    safe_title,
+                    safe_summary,
+                    replacement_body_json,
+                    self._decision_body_search_text(replacement_body),
+                    provenance["source_session_id"],
+                    provenance["source_turn_id"],
+                    provenance["source_work_id"],
+                    provenance["source_hash"],
+                    replacement_content_hash,
+                    safe_actor,
+                    safe_reason,
+                    safe_producer_json,
+                    safe_idempotency,
+                    timestamp,
+                    safe_review_after,
+                ),
+            )
+            conn.executemany(
+                "INSERT INTO experience_tags(item_id, revision, namespace, value) "
+                "VALUES (?, 1, ?, ?)",
+                [
+                    (safe_item_id, namespace, value)
+                    for namespace, value in safe_tags
+                ],
+            )
+            conn.execute(
+                """
+                INSERT INTO experience_links(
+                    from_item_id, from_revision, relation, to_item_id,
+                    to_revision, created_at, metadata_json
+                ) VALUES (?, 1, 'supersedes', ?, ?, ?, ?)
+                """,
+                (
+                    safe_item_id,
+                    safe_old_item_id,
+                    old_item["current_revision"],
+                    timestamp,
+                    self._json_dumps({"reason": safe_reason}, "event payload", _MAX_EVENT_JSON_BYTES),
+                ),
+            )
+            old_event_type = None
+            if replacement_status == "active":
+                conn.execute(
+                    "UPDATE experience_items SET current_status = 'superseded', "
+                    "updated_at = ?, deleted_at = ? WHERE id = ?",
+                    (timestamp, timestamp, safe_old_item_id),
+                )
+                old_event_type = "superseded"
+            activation_payload = self._decision_event_payload(
+                actor=safe_actor,
+                reason=safe_reason,
+                from_status="candidate",
+                to_status=replacement_status,
+                extra={"supersedes": safe_old_item_id},
+            )
+            self._insert_decision_event(
+                conn,
+                event_id=safe_event_id,
+                event_type="activated" if replacement_status == "active" else "candidate_created",
+                item_id=safe_item_id,
+                item_revision=1,
+                payload=activation_payload,
+                idempotency_key=safe_idempotency,
+                created_at=timestamp,
+            )
+            if old_event_type is not None:
+                old_payload = self._decision_event_payload(
+                    actor=safe_actor,
+                    reason=safe_reason,
+                    from_status=str(old_item["current_status"]),
+                    to_status=old_event_type,
+                    extra={"superseded_by": safe_item_id},
+                )
+                self._insert_decision_event(
+                    conn,
+                    event_id=_new_id("event"),
+                    event_type=old_event_type,
+                    item_id=safe_old_item_id,
+                    item_revision=old_item["current_revision"],
+                    payload=old_payload,
+                    idempotency_key=None,
+                    created_at=timestamp,
+                )
+            return safe_item_id, 1
+
+        replacement_id, revision_number = self._execute_write(supersede)
+        result = self.get_decision(replacement_id, revision=revision_number)
+        assert result is not None
+        return result
+
+    def revoke_decision(
+        self,
+        item_id: str,
+        *,
+        authority: DecisionTurnAuthority,
+        actor: str = "user",
+        reason: str | None = None,
+        transitioned_at: float | None = None,
+        event_id: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Terminal logical deletion for a Decision with explicit authority."""
+
+        trusted_authority = self._require_decision_authority(authority)
+        safe_item_id = self._identifier(item_id, "item_id")
+        safe_actor = self._text(actor, "actor", max_chars=128, allow_empty=False)
+        safe_reason = self._text(reason, "reason", max_chars=_MAX_REASON_CHARS, nullable=True)
+        safe_event_id = self._identifier(event_id or _new_id("event"), "event_id")
+        safe_idempotency = self._identifier(idempotency_key, "idempotency_key", nullable=True)
+        timestamp = _now(transitioned_at)
+
+        def revoke(conn: sqlite3.Connection) -> int:
+            item = conn.execute("SELECT * FROM experience_items WHERE id = ?", (safe_item_id,)).fetchone()
+            if item is None or item["kind"] != "decision":
+                raise KeyError(f"unknown decision {safe_item_id}")
+            if item["current_status"] not in {"candidate", "active", "review_required"}:
+                raise ValueError("terminal decisions cannot be revoked again")
+            if not trusted_authority.revokes(safe_item_id):
+                raise ValueError("revocation requires explicit trusted user authority")
+            if item["current_status"] == "revoked":
+                return int(item["current_revision"])
+            conn.execute(
+                "UPDATE experience_items SET current_status = 'revoked', "
+                "updated_at = ?, deleted_at = ? WHERE id = ?",
+                (timestamp, timestamp, safe_item_id),
+            )
+            payload = self._decision_event_payload(
+                actor=safe_actor,
+                reason=safe_reason,
+                from_status=str(item["current_status"]),
+                to_status="revoked",
+            )
+            self._insert_decision_event(
+                conn,
+                event_id=safe_event_id,
+                event_type="revoked",
+                item_id=safe_item_id,
+                item_revision=item["current_revision"],
+                payload=payload,
+                idempotency_key=safe_idempotency,
+                created_at=timestamp,
+            )
+            return int(item["current_revision"])
+
+        revision_number = self._execute_write(revoke)
+        result = self.get_decision(safe_item_id, revision=revision_number)
+        assert result is not None
+        return result
+
+
     def transition_lesson(
         self,
         item_id: str,
@@ -2100,6 +5041,110 @@ class ExperienceStore:
                 (safe_status, timestamp, deleted_at, safe_item_id),
             )
             event_type = "approved" if safe_status == "active" else safe_status
+            payload = self._json_dumps(
+                {
+                    "actor": safe_actor,
+                    "from_status": old_status,
+                    "reason": safe_reason,
+                    "to_status": safe_status,
+                },
+                "event payload",
+                _MAX_EVENT_JSON_BYTES,
+            )
+            conn.execute(
+                """
+                INSERT INTO experience_events(
+                    id, event_type, item_id, item_revision, retrieval_id,
+                    work_id, payload_json, idempotency_key, created_at
+                ) VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?)
+                """,
+                (
+                    safe_event_id,
+                    event_type,
+                    safe_item_id,
+                    item["current_revision"],
+                    payload,
+                    safe_idempotency,
+                    timestamp,
+                ),
+            )
+
+        self._execute_write(transition)
+        result = self.get_item(safe_item_id)
+        assert result is not None
+        return result
+    def transition_decision(self, item_id: str, status: str, **kwargs: Any) -> dict[str, Any]:
+        """Apply a bounded Decision lifecycle transition.
+
+        This generic transition path never activates Decisions. Use
+        activate_decision or reapprove_decision with trusted host authority.
+        """
+        safe_item_id = self._identifier(item_id, "item_id")
+        safe_status = _require_choice("status", status, _DECISION_STATUSES)
+        safe_actor = self._text(
+            kwargs.get("actor", "user"), "actor", max_chars=128, allow_empty=False
+        )
+        safe_reason = self._text(
+            kwargs.get("reason"), "reason", max_chars=1_000, nullable=True
+        )
+        safe_idempotency = self._identifier(
+            kwargs.get("idempotency_key"), "idempotency_key", nullable=True
+        )
+        safe_event_id = self._identifier(
+            kwargs.get("event_id") or _new_id("event"), "event_id"
+        )
+        timestamp = _now(kwargs.get("transitioned_at"))
+        event_type = {
+            "review_required": "review_required",
+            "superseded": "superseded",
+            "revoked": "revoked",
+        }.get(safe_status, safe_status)
+
+        def transition(conn: sqlite3.Connection) -> None:
+            item = conn.execute(
+                "SELECT kind, current_status, current_revision, updated_at "
+                "FROM experience_items WHERE id = ?", (safe_item_id,)
+            ).fetchone()
+            if item is None or item["kind"] != "decision":
+                raise KeyError(f"unknown decision {safe_item_id}")
+            if safe_idempotency:
+                replay = conn.execute(
+                    "SELECT * FROM experience_events WHERE idempotency_key = ?",
+                    (safe_idempotency,),
+                ).fetchone()
+                if replay is not None:
+                    try:
+                        replay_payload = json.loads(replay["payload_json"])
+                    except (TypeError, ValueError):
+                        replay_payload = {}
+                    if (
+                        replay["event_type"] != event_type
+                        or replay["item_id"] != safe_item_id
+                        or replay_payload.get("actor") != safe_actor
+                        or replay_payload.get("reason") != safe_reason
+                        or replay_payload.get("to_status") != safe_status
+                    ):
+                        raise ValueError(
+                            "idempotency key already identifies another decision transition"
+                        )
+                    return
+            old_status = str(item["current_status"])
+            if old_status == safe_status:
+                return
+            if safe_status not in _DECISION_TRANSITIONS[old_status]:
+                raise ValueError(
+                    f"invalid decision transition {old_status} -> {safe_status}"
+                )
+            if safe_status == "active":
+                raise ValueError("activate_decision requires trusted authority")
+            if timestamp <= float(item["updated_at"]):
+                raise ValueError("transitioned_at must be newer than the current decision")
+            deleted_at = timestamp if safe_status in {"superseded", "revoked"} else None
+            conn.execute(
+                "UPDATE experience_items SET current_status = ?, updated_at = ?, "
+                "deleted_at = ? WHERE id = ?",
+                (safe_status, timestamp, deleted_at, safe_item_id),
+            )
             payload = self._json_dumps(
                 {
                     "actor": safe_actor,
@@ -2382,12 +5427,29 @@ class ExperienceStore:
     def _authorization_sql(
         *,
         require_injection_allowed: bool,
+        kind: str = "lesson",
+        require_decision_validity: bool = False,
     ) -> str:
+        safe_kind = _require_choice("kind", kind, {"lesson", "decision"})
         injection_clause = (
             "AND p.injection_allowed = 1" if require_injection_allowed else ""
         )
+        decision_validity_clause = ""
+        if require_decision_validity:
+            decision_validity_clause = """
+                AND json_extract(r.body_json, '$.authority') IN ('user', 'repository_policy')
+                AND json_extract(r.body_json, '$.effective_at') <= ?
+                AND (
+                    json_extract(r.body_json, '$.expires_at') IS NULL
+                    OR json_extract(r.body_json, '$.expires_at') > ?
+                )
+                AND (
+                    r.review_after IS NULL
+                    OR r.review_after > ?
+                )
+            """
         return f"""
-            i.kind = 'lesson'
+            i.kind = '{safe_kind}'
             AND i.current_status = 'active'
             AND i.deleted_at IS NULL
             AND i.principal_id = ?
@@ -2420,6 +5482,7 @@ class ExperienceStore:
                     )
                 )
             )
+            {decision_validity_clause}
             {injection_clause}
         """
 
@@ -2443,6 +5506,553 @@ class ExperienceStore:
             int(provider_is_local),
             provider_trust_domain,
         )
+
+    @staticmethod
+    def _decision_authority_params(now: float) -> tuple[float, float, float]:
+        return (now, now, now)
+
+    def _trigram_table_available(self, conn: sqlite3.Connection) -> bool:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'experience_search_trigram'"
+        ).fetchone()
+        return row is not None
+
+    def _search_trigram(
+        self,
+        *,
+        ids: Sequence[str],
+        query: str,
+    ) -> tuple[dict[str, int], dict[str, int]]:
+        if not query or not ids:
+            return {}, {}
+        trigram_order: dict[str, int] = {}
+        trigram_match_counts: dict[str, int] = {}
+        with self._lock:
+            conn = self._connection()
+            if not self._trigram_table_available(conn):
+                return trigram_order, trigram_match_counts
+            try:
+                for start in range(0, len(ids), 200):
+                    chunk = ids[start : start + 200]
+                    chunk_placeholders = ",".join("?" for _ in chunk)
+                    trigram_rows = conn.execute(
+                        f"""
+                        SELECT c.item_id, c.revision, c.title,
+                               c.searchable_text, c.tags,
+                               bm25(experience_search_trigram) AS text_rank
+                        FROM experience_search_trigram
+                        JOIN experience_search_content AS c
+                          ON c.rowid = experience_search_trigram.rowid
+                        WHERE experience_search_trigram MATCH ?
+                          AND c.item_id IN ({chunk_placeholders})
+                        ORDER BY text_rank, c.item_id
+                        """,
+                        (query, *chunk),
+                    ).fetchall()
+                for row in trigram_rows:
+                    item_id = row["item_id"]
+                    if item_id not in trigram_order:
+                        trigram_order[item_id] = len(trigram_order)
+                        trigram_match_counts[item_id] = 1
+                    else:
+                        trigram_match_counts[item_id] += 1
+            except sqlite3.OperationalError:
+                trigram_order = {}
+                trigram_match_counts = {}
+        return trigram_order, trigram_match_counts
+
+    def _search_unicode61(
+        self,
+        *,
+        ids: Sequence[str],
+        query: str,
+    ) -> tuple[dict[str, int], dict[str, int]]:
+        if not query or not ids:
+            return {}, {}
+        fts_order: dict[str, int] = {}
+        fts_match_counts: dict[str, int] = {}
+        with self._lock:
+            conn = self._connection()
+            try:
+                for start in range(0, len(ids), 200):
+                    chunk = ids[start : start + 200]
+                    chunk_placeholders = ",".join("?" for _ in chunk)
+                    fts_rows = conn.execute(
+                        f"""
+                        SELECT c.item_id, c.revision, c.title,
+                               c.searchable_text, c.tags,
+                               bm25(experience_search) AS text_rank
+                        FROM experience_search
+                        JOIN experience_search_content AS c
+                          ON c.rowid = experience_search.rowid
+                        WHERE experience_search MATCH ?
+                          AND c.item_id IN ({chunk_placeholders})
+                        ORDER BY text_rank, c.item_id
+                        """,
+                        (query, *chunk),
+                    ).fetchall()
+                for row in fts_rows:
+                    item_id = row["item_id"]
+                    if item_id not in fts_order:
+                        fts_order[item_id] = len(fts_order)
+                        fts_match_counts[item_id] = 1
+                    else:
+                        fts_match_counts[item_id] += 1
+            except sqlite3.OperationalError:
+                fts_order = {}
+                fts_match_counts = {}
+        return fts_order, fts_match_counts
+
+    def _search_short_cjk(
+        self,
+        *,
+        ids: Sequence[str],
+        terms: Sequence[str],
+    ) -> dict[str, int]:
+        if not terms or not ids:
+            return {}
+        matches: dict[str, int] = {}
+        like_clauses = " OR ".join(
+            "title LIKE ? ESCAPE '\\' OR searchable_text LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\'" for _ in terms
+        )
+        params = [f"%{term}%" for term in terms for _ in range(3)]
+        with self._lock:
+            conn = self._connection()
+            for start in range(0, len(ids), 200):
+                chunk = ids[start : start + 200]
+                chunk_placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"""
+                    SELECT DISTINCT item_id, revision
+                    FROM experience_search_content
+                    WHERE item_id IN ({chunk_placeholders})
+                      AND ({like_clauses})
+                    """,
+                    (*chunk, *params),
+                ).fetchall()
+                for row in rows:
+                    matches[row["item_id"]] = matches.get(row["item_id"], 0) + 1
+        return matches
+
+    def search_decisions(
+        self,
+        *,
+        principal_id: str,
+        scope_type: str,
+        scope_id: str,
+        repository_id: str | None,
+        project_id: str | None,
+        provider_trust_domain: str,
+        provider_is_local: bool = False,
+        query: str = "",
+        tags: Mapping[Any, Iterable[Any]] | Iterable[tuple[Any, Any]] | None = None,
+        min_confidence: float = 0.0,
+        require_injection_allowed: bool = True,
+        limit: int = 20,
+        repository_root: str | Path | None = None,
+        policy_repository_id: str | None = None,
+        policy_project_id: str | None = None,
+        now: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Retrieve exact-scope active decisions with hard pre-text filters.
+
+        Decision retrieval is intentionally stricter than lesson retrieval:
+        only active, non-expired, non-review-required decisions with valid
+        authority and egress policy may be returned. Repository-policy
+        decisions are additionally rechecked against the live anchor when
+        ``repository_root`` is supplied.
+        """
+        safe_principal = self._principal(principal_id)
+        safe_scope_type = _require_choice("scope_type", scope_type, _SCOPE_TYPES)
+        safe_scope_id = self._identifier(scope_id, "scope_id")
+        safe_repository = self._identifier(repository_id, "repository_id", nullable=True)
+        safe_project = self._identifier(project_id, "project_id", nullable=True)
+        safe_provider = self._trust_domain(provider_trust_domain)
+        if not isinstance(provider_is_local, bool):
+            raise TypeError("provider_is_local must be bool")
+        if not isinstance(require_injection_allowed, bool):
+            raise TypeError("require_injection_allowed must be bool")
+        if safe_scope_type == "project" and (not safe_repository or not safe_project):
+            raise ValueError("project retrieval requires repository_id and project_id")
+        if safe_scope_type == "repository" and not safe_repository:
+            raise ValueError("repository retrieval requires repository_id")
+        if safe_scope_type == "project" and safe_scope_id != safe_project:
+            raise ValueError("project scope_id must equal project_id")
+        if safe_scope_type == "repository" and safe_scope_id != safe_repository:
+            raise ValueError("repository scope_id must equal repository_id")
+        safe_query = self._text(query, "retrieval query", max_chars=4_000) or ""
+        requested_tags = self._normalize_tags(tags)
+        safe_min_confidence = _validate_confidence(float(min_confidence))
+        assert safe_min_confidence is not None
+        safe_limit = max(0, min(int(limit), 100))
+        if safe_limit == 0:
+            return []
+        policy_repository = (
+            self._identifier(policy_repository_id, "policy_repository_id", nullable=True)
+            if policy_repository_id is not None
+            else safe_repository
+        )
+        policy_project = (
+            self._identifier(policy_project_id, "policy_project_id", nullable=True)
+            if policy_project_id is not None
+            else safe_project
+        )
+        if not policy_repository or not policy_project:
+            raise ValueError("retrieval requires a current repository and project policy")
+        current_time = float(time.time() if now is None else now)
+        auth_sql = self._authorization_sql(
+            require_injection_allowed=require_injection_allowed,
+            kind="decision",
+            require_decision_validity=True,
+        )
+        item_repository = safe_repository if safe_scope_type != "profile" else None
+        item_project = safe_project if safe_scope_type == "project" else None
+        auth_params = self._authorization_params(
+            principal_id=safe_principal,
+            scope_type=safe_scope_type,
+            scope_id=safe_scope_id,
+            repository_id=item_repository,
+            project_id=item_project,
+            provider_trust_domain=safe_provider,
+            provider_is_local=bool(provider_is_local),
+        ) + self._decision_authority_params(current_time)
+        with self._lock:
+            eligible_rows = self._connection().execute(
+                f"""
+                SELECT i.id, i.current_revision, i.created_at, i.updated_at,
+                       r.confidence, r.last_validated_at
+                FROM experience_items AS i
+                JOIN experience_item_revisions AS r
+                  ON r.item_id = i.id AND r.revision = i.current_revision
+                JOIN experience_scope_policies AS p
+                  ON p.principal_id = i.principal_id
+                 AND p.repository_id = ?
+                 AND p.project_id = ?
+                WHERE {auth_sql}
+                  AND COALESCE(r.confidence, 0) >= ?
+                ORDER BY i.id
+                """,
+                (
+                    policy_repository,
+                    policy_project,
+                    *auth_params,
+                    safe_min_confidence,
+                ),
+            ).fetchall()
+        if not eligible_rows:
+            return []
+        eligible = {
+            row["id"]: {
+                "revision": int(row["current_revision"]),
+                "confidence": float(row["confidence"] or 0.0),
+                "created_at": float(row["created_at"]),
+                "updated_at": float(row["updated_at"]),
+                "last_validated_at": row["last_validated_at"],
+            }
+            for row in eligible_rows
+        }
+        ids = sorted(eligible)
+        requested_tag_pairs = list(requested_tags)
+        if requested_tag_pairs and not safe_query:
+            pair_sql = " OR ".join(
+                "(t.namespace = ? AND t.value = ?)"
+                for _ in requested_tag_pairs
+            )
+            tag_rows: list[sqlite3.Row] = []
+            with self._lock:
+                for start in range(0, len(ids), 200):
+                    chunk = ids[start : start + 200]
+                    placeholders = ",".join("?" for _ in chunk)
+                    tag_rows.extend(
+                        self._connection().execute(
+                            f"""
+                            SELECT DISTINCT t.item_id, t.revision,
+                                   t.namespace, t.value
+                            FROM experience_tags AS t
+                            JOIN experience_items AS i
+                              ON i.id = t.item_id
+                             AND i.current_revision = t.revision
+                            WHERE ({pair_sql})
+                              AND i.id IN ({placeholders})
+                            """,
+                            (
+                                *(
+                                    value
+                                    for namespace, value in requested_tag_pairs
+                                    for value in (namespace, value)
+                                ),
+                                *chunk,
+                            ),
+                        ).fetchall()
+                    )
+            if not tag_rows:
+                return []
+            ids = sorted({row["item_id"] for row in tag_rows} & set(ids))
+        else:
+            tag_rows: list[sqlite3.Row] = []
+        for start in range(0, len(ids), 200):
+            chunk = ids[start : start + 200]
+            placeholders = ",".join("?" for _ in chunk)
+            with self._lock:
+                tag_rows.extend(
+                    self._connection().execute(
+                        f"""
+                        SELECT item_id, revision, namespace, value
+                        FROM experience_tags
+                        WHERE item_id IN ({placeholders})
+                        ORDER BY item_id, namespace, value
+                        """,
+                        chunk,
+                    ).fetchall()
+                )
+        tags_by_item: dict[str, set[tuple[str, str]]] = {
+            item_id: set() for item_id in ids
+        }
+        for row in tag_rows:
+            if int(row["revision"]) == eligible[row["item_id"]]["revision"]:
+                tags_by_item[row["item_id"]].add((row["namespace"], row["value"]))
+        namespace_weights = {
+            "failure": 8.0,
+            "task_type": 6.0,
+            "technology": 4.0,
+            "component": 3.0,
+            "entity": 2.0,
+        }
+        namespace_order = {
+            "failure": 0,
+            "task_type": 1,
+            "technology": 2,
+            "component": 3,
+            "entity": 4,
+        }
+        requested_set = set(requested_tags)
+        query_terms = set(_fts_query_terms(safe_query))
+        metadata_matches: dict[str, list[tuple[str, str]]] = {}
+        inferred_metadata_matches: dict[str, list[tuple[str, str]]] = {}
+        for item_id in ids:
+            metadata_matches[item_id] = sorted(
+                tags_by_item[item_id] & requested_set,
+                key=lambda pair: (namespace_order[pair[0]], pair[1]),
+            )
+            inferred_metadata_matches[item_id] = sorted(
+                (
+                    pair
+                    for pair in tags_by_item[item_id] - requested_set
+                    if self._fts_enabled
+                    and (tag_terms := set(_fts_query_terms(pair[1], limit=8)))
+                    and tag_terms.issubset(query_terms)
+                ),
+                key=lambda pair: (namespace_order[pair[0]], pair[1]),
+            )
+        ascii_query = _sanitize_fts_query(" ".join(sorted(term for term in _fts_query_terms(safe_query) if not _contains_cjk(term))))
+        trigram_query = _sanitize_trigram_query(safe_query)
+        short_cjk_terms = _short_cjk_terms(safe_query)
+        fts_order, fts_match_counts = self._search_unicode61(ids=ids, query=ascii_query)
+        trigram_order, trigram_match_counts = self._search_trigram(ids=ids, query=trigram_query)
+        short_cjk_matches = self._search_short_cjk(ids=ids, terms=short_cjk_terms)
+        ranked: list[dict[str, Any]] = []
+        for item_id in ids:
+            exact_tags = metadata_matches[item_id]
+            inferred_tags = inferred_metadata_matches[item_id]
+            has_text_match = item_id in fts_order
+            has_trigram_match = item_id in trigram_order
+            has_short_cjk_match = item_id in short_cjk_matches
+            if (
+                (safe_query or requested_tags)
+                and not exact_tags
+                and not inferred_tags
+                and not has_text_match
+                and not has_trigram_match
+                and not has_short_cjk_match
+            ):
+                continue
+            reasons = [f"{safe_scope_type} exact"]
+            tag_score = 0.0
+            for namespace, value in exact_tags:
+                tag_score += namespace_weights[namespace]
+                reasons.append(f"{namespace.replace('_', ' ')} exact: {value}")
+            for namespace, value in inferred_tags:
+                tag_score += namespace_weights[namespace] * 0.75
+                reasons.append(f"{namespace.replace('_', ' ')} query match: {value}")
+            text_score = 0.0
+            if has_text_match:
+                text_score = 1.0 / (1.0 + fts_order[item_id])
+                reasons.append(f"text term overlap ({fts_match_counts[item_id]})")
+            if has_trigram_match:
+                text_score += 1.5 / (1.0 + trigram_order[item_id])
+                reasons.append(f"trigram term overlap ({trigram_match_counts[item_id]})")
+            if has_short_cjk_match:
+                text_score += 0.75
+                reasons.append(f"short CJK fallback ({short_cjk_matches[item_id]})")
+            confidence_score = eligible[item_id]["confidence"]
+            ranked.append(
+                {
+                    "item_id": item_id,
+                    "revision": eligible[item_id]["revision"],
+                    "score": tag_score + text_score + confidence_score,
+                    "confidence": confidence_score,
+                    "match_reasons": reasons,
+                    "last_validated_at": eligible[item_id]["last_validated_at"],
+                    "updated_at": eligible[item_id]["updated_at"],
+                }
+            )
+        ranked.sort(
+            key=lambda result: (
+                -result["score"],
+                -result["confidence"],
+                -float(result["last_validated_at"] or 0.0),
+                -result["updated_at"],
+                result["item_id"],
+            )
+        )
+        results: list[dict[str, Any]] = []
+        for candidate in ranked[:safe_limit]:
+            authorized = self._get_authorized_item(
+                candidate["item_id"],
+                revision=candidate["revision"],
+                repository_id=safe_repository,
+                project_id=safe_project,
+                policy_repository_id=policy_repository,
+                policy_project_id=policy_project,
+                auth_sql=auth_sql,
+                auth_params=auth_params,
+            )
+            if authorized is None:
+                continue
+            body = authorized["revision"]["body"]
+            if repository_root is not None and body.get("authority") == "repository_policy":
+                validation = validate_repository_anchor(
+                    body["policy_anchor_path"],
+                    body["policy_anchor_hash"],
+                    repository_root=repository_root,
+                )
+                if not validation.valid:
+                    continue
+            authorized["score"] = candidate["score"]
+            authorized["match_reasons"] = [
+                self._returned_text(reason, "match reason")
+                for reason in candidate["match_reasons"]
+            ]
+            results.append(authorized)
+        return results
+
+    def authorized_decision_revisions(
+        self,
+        *,
+        principal_id: str,
+        scope_type: str,
+        scope_id: str,
+        repository_id: str | None,
+        project_id: str | None,
+        provider_trust_domain: str,
+        provider_is_local: bool = False,
+        candidates: Iterable[tuple[str, int]],
+        require_injection_allowed: bool = True,
+        now: float | None = None,
+        repository_root: str | Path | None = None,
+        policy_repository_id: str | None = None,
+        policy_project_id: str | None = None,
+    ) -> set[tuple[str, int]]:
+        """Revalidate a bounded cached Decision candidate set without reading text."""
+        safe_principal = self._principal(principal_id)
+        safe_scope_type = _require_choice("scope_type", scope_type, _SCOPE_TYPES)
+        safe_scope_id = self._identifier(scope_id, "scope_id")
+        safe_repository = self._identifier(repository_id, "repository_id", nullable=True)
+        safe_project = self._identifier(project_id, "project_id", nullable=True)
+        safe_provider = self._trust_domain(provider_trust_domain)
+        if not isinstance(provider_is_local, bool):
+            raise TypeError("provider_is_local must be bool")
+        if not isinstance(require_injection_allowed, bool):
+            raise TypeError("require_injection_allowed must be bool")
+        policy_repository = (
+            self._identifier(policy_repository_id, "policy_repository_id", nullable=True)
+            if policy_repository_id is not None
+            else safe_repository
+        )
+        policy_project = (
+            self._identifier(policy_project_id, "policy_project_id", nullable=True)
+            if policy_project_id is not None
+            else safe_project
+        )
+        if not policy_repository or not policy_project:
+            raise ValueError("authorization requires a current repository and project policy")
+        if safe_scope_type == "project" and safe_scope_id != safe_project:
+            raise ValueError("project scope_id must equal project_id")
+        if safe_scope_type == "repository" and safe_scope_id != safe_repository:
+            raise ValueError("repository scope_id must equal repository_id")
+        requested: list[tuple[str, int]] = []
+        seen: set[tuple[str, int]] = set()
+        for item_id, revision in candidates:
+            safe_item = self._identifier(item_id, "item_id")
+            if isinstance(revision, bool) or int(revision) < 1:
+                raise ValueError("revision must be a positive integer")
+            key = (safe_item, int(revision))
+            if key not in seen:
+                seen.add(key)
+                requested.append(key)
+            if len(requested) > 100:
+                raise ValueError("authorization candidate set exceeds 100 items")
+        if not requested:
+            return set()
+        current_time = float(time.time() if now is None else now)
+        auth_sql = self._authorization_sql(
+            require_injection_allowed=require_injection_allowed,
+            kind="decision",
+            require_decision_validity=True,
+        )
+        item_repository = safe_repository if safe_scope_type != "profile" else None
+        item_project = safe_project if safe_scope_type == "project" else None
+        auth_params = self._authorization_params(
+            principal_id=safe_principal,
+            scope_type=safe_scope_type,
+            scope_id=safe_scope_id,
+            repository_id=item_repository,
+            project_id=item_project,
+            provider_trust_domain=safe_provider,
+            provider_is_local=provider_is_local,
+        ) + self._decision_authority_params(current_time)
+        values_sql = ", ".join("(?, ?)" for _ in requested)
+        requested_params = [value for pair in requested for value in pair]
+        with self._lock:
+            rows = self._connection().execute(
+                f"""
+                WITH requested(item_id, revision) AS (VALUES {values_sql})
+                SELECT i.id, i.current_revision, r.body_json
+                FROM requested AS q
+                JOIN experience_items AS i
+                  ON i.id = q.item_id AND i.current_revision = q.revision
+                JOIN experience_item_revisions AS r
+                  ON r.item_id = i.id AND r.revision = i.current_revision
+                JOIN experience_scope_policies AS p
+                  ON p.principal_id = i.principal_id
+                 AND p.repository_id = ?
+                 AND p.project_id = ?
+                WHERE {auth_sql}
+                ORDER BY i.id
+                """,
+                (
+                    *requested_params,
+                    policy_repository,
+                    policy_project,
+                    *auth_params,
+                ),
+            ).fetchall()
+        authorized: set[tuple[str, int]] = set()
+        for row in rows:
+            item_id = str(row["id"])
+            revision = int(row["current_revision"])
+            body = json.loads(row["body_json"])
+            if repository_root is not None and body.get("authority") == "repository_policy":
+                validation = validate_repository_anchor(
+                    body["policy_anchor_path"],
+                    body["policy_anchor_hash"],
+                    repository_root=repository_root,
+                )
+                if not validation.valid:
+                    continue
+            authorized.add((item_id, revision))
+        return authorized
 
     def search_lessons(
         self,
@@ -2480,9 +6090,7 @@ class ExperienceStore:
             raise TypeError("provider_is_local must be bool")
         if not isinstance(require_injection_allowed, bool):
             raise TypeError("require_injection_allowed must be bool")
-        if safe_scope_type == "project" and (not safe_repository or not safe_project):
-            raise ValueError("project retrieval requires repository_id and project_id")
-        if not safe_repository or not safe_project:
+        if safe_scope_type != "profile" and (not safe_repository or not safe_project):
             raise ValueError("retrieval requires a current repository and project policy")
         if safe_scope_type == "project" and safe_scope_id != safe_project:
             raise ValueError("project scope_id must equal project_id")
@@ -2513,29 +6121,65 @@ class ExperienceStore:
             provider_is_local=bool(provider_is_local),
         )
         with self._lock:
-            # This first stage intentionally selects no revision text.
-            eligible_rows = self._connection().execute(
-                f"""
-                SELECT i.id, i.current_revision, i.created_at, i.updated_at,
-                       r.confidence, r.last_validated_at
-                FROM experience_items AS i
-                JOIN experience_item_revisions AS r
-                  ON r.item_id = i.id AND r.revision = i.current_revision
-                JOIN experience_scope_policies AS p
-                  ON p.principal_id = i.principal_id
-                 AND p.repository_id = ?
-                 AND p.project_id = ?
-                WHERE {auth_sql}
-                  AND COALESCE(r.confidence, 0) >= ?
-                ORDER BY i.id
-                """,
-                (
-                    safe_repository,
-                    safe_project,
-                    *auth_params,
-                    safe_min_confidence,
-                ),
-            ).fetchall()
+            if requested_tags and not safe_query:
+                pair_sql = " OR ".join(
+                    "(t.namespace = ? AND t.value = ?)"
+                    for _ in requested_tags
+                )
+                # Tag-only retrieval is the hot path for scoped engineering
+                # guidance. Start from the tag index rather than scanning all
+                # active lessons in the project.
+                eligible_rows = self._connection().execute(
+                    f"""
+                    SELECT DISTINCT i.id, i.current_revision, i.created_at,
+                           i.updated_at, r.confidence, r.last_validated_at
+                    FROM experience_tags AS t
+                    JOIN experience_items AS i
+                      ON i.id = t.item_id
+                     AND i.current_revision = t.revision
+                    JOIN experience_item_revisions AS r
+                      ON r.item_id = i.id AND r.revision = i.current_revision
+                    JOIN experience_scope_policies AS p
+                      ON p.principal_id = i.principal_id
+                     AND p.repository_id = i.repository_id
+                     AND p.project_id = i.project_id
+                    WHERE ({pair_sql})
+                      AND {auth_sql}
+                      AND COALESCE(r.confidence, 0) >= ?
+                    ORDER BY i.id
+                    """,
+                    (
+                        *(
+                            value
+                            for namespace, value in requested_tags
+                            for value in (namespace, value)
+                        ),
+                        *auth_params,
+                        safe_min_confidence,
+                    ),
+                ).fetchall()
+            else:
+                # This first stage intentionally selects no revision text.
+                eligible_rows = self._connection().execute(
+                    f"""
+                    SELECT i.id, i.current_revision, i.created_at, i.updated_at,
+                           r.confidence, r.last_validated_at
+                    FROM experience_items AS i
+                    JOIN experience_item_revisions AS r
+                      ON r.item_id = i.id AND r.revision = i.current_revision
+                    JOIN experience_scope_policies AS p
+                      ON p.principal_id = i.principal_id
+                     AND p.repository_id = i.repository_id
+                     AND p.project_id = i.project_id
+                    WHERE {auth_sql}
+                      AND COALESCE(r.confidence, 0) >= ?
+                    ORDER BY i.id
+                    """,
+                    (
+                        *auth_params,
+                        safe_min_confidence,
+                    ),
+                ).fetchall()
         if not eligible_rows:
             return []
 
@@ -2550,7 +6194,44 @@ class ExperienceStore:
             for row in eligible_rows
         }
         ids = sorted(eligible)
-        tag_rows: list[sqlite3.Row] = []
+        requested_tag_pairs = list(requested_tags)
+        if requested_tag_pairs and not safe_query:
+            pair_sql = " OR ".join(
+                "(t.namespace = ? AND t.value = ?)"
+                for _ in requested_tag_pairs
+            )
+            tag_rows: list[sqlite3.Row] = []
+            with self._lock:
+                for start in range(0, len(ids), 200):
+                    chunk = ids[start : start + 200]
+                    placeholders = ",".join("?" for _ in chunk)
+                    tag_rows.extend(
+                        self._connection().execute(
+                            f"""
+                            SELECT DISTINCT t.item_id, t.revision,
+                                   t.namespace, t.value
+                            FROM experience_tags AS t
+                            JOIN experience_items AS i
+                              ON i.id = t.item_id
+                             AND i.current_revision = t.revision
+                            WHERE ({pair_sql})
+                              AND i.id IN ({placeholders})
+                            """,
+                            (
+                                *(
+                                    value
+                                    for namespace, value in requested_tag_pairs
+                                    for value in (namespace, value)
+                                ),
+                                *chunk,
+                            ),
+                        ).fetchall()
+                    )
+            if not tag_rows:
+                return []
+            ids = sorted({row["item_id"] for row in tag_rows} & set(ids))
+        else:
+            tag_rows: list[sqlite3.Row] = []
         for start in range(0, len(ids), 200):
             chunk = ids[start : start + 200]
             placeholders = ",".join("?" for _ in chunk)
@@ -2580,13 +6261,15 @@ class ExperienceStore:
             "failure": 8.0,
             "task_type": 6.0,
             "technology": 4.0,
+            "component": 3.0,
             "entity": 2.0,
         }
         namespace_order = {
             "failure": 0,
             "task_type": 1,
             "technology": 2,
-            "entity": 3,
+            "component": 3,
+            "entity": 4,
         }
         requested_set = set(requested_tags)
         query_terms = set(_fts_query_terms(safe_query))
@@ -2774,8 +6457,10 @@ class ExperienceStore:
             raise TypeError("provider_is_local must be bool")
         if not isinstance(require_injection_allowed, bool):
             raise TypeError("require_injection_allowed must be bool")
-        if not safe_repository or not safe_project:
-            raise ValueError("authorization requires a repository and project policy")
+        if safe_scope_type == "project" and (not safe_repository or not safe_project):
+            raise ValueError("project authorization requires repository_id and project_id")
+        if safe_scope_type == "repository" and not safe_repository:
+            raise ValueError("repository authorization requires repository_id")
         if safe_scope_type == "project" and safe_scope_id != safe_project:
             raise ValueError("project scope_id must equal project_id")
         if safe_scope_type == "repository" and safe_scope_id != safe_repository:
@@ -2816,10 +6501,12 @@ class ExperienceStore:
             rows = self._connection().execute(
                 f"""
                 WITH requested(item_id, revision) AS (VALUES {values_sql})
-                SELECT i.id, i.current_revision
+                SELECT i.id, i.current_revision, r.body_json
                 FROM requested AS q
                 JOIN experience_items AS i
                   ON i.id = q.item_id AND i.current_revision = q.revision
+                JOIN experience_item_revisions AS r
+                  ON r.item_id = i.id AND r.revision = i.current_revision
                 JOIN experience_scope_policies AS p
                   ON p.principal_id = i.principal_id
                  AND p.repository_id = ?
@@ -2834,7 +6521,12 @@ class ExperienceStore:
                     *auth_params,
                 ),
             ).fetchall()
-        return {(row["id"], int(row["current_revision"])) for row in rows}
+        authorized: set[tuple[str, int]] = set()
+        for row in rows:
+            item_id = str(row["id"])
+            revision = int(row["current_revision"])
+            authorized.add((item_id, revision))
+        return authorized
 
     def _get_authorized_item(
         self,
@@ -2843,6 +6535,8 @@ class ExperienceStore:
         revision: int,
         repository_id: str | None,
         project_id: str | None,
+        policy_repository_id: str | None = None,
+        policy_project_id: str | None = None,
         auth_sql: str,
         auth_params: tuple[Any, ...],
     ) -> dict[str, Any] | None:
@@ -2880,8 +6574,8 @@ class ExperienceStore:
                 WHERE i.id = ? AND i.current_revision = ? AND {auth_sql}
                 """,
                 (
-                    repository_id,
-                    project_id,
+                    policy_repository_id or repository_id,
+                    policy_project_id or project_id,
                     item_id,
                     revision,
                     *auth_params,
@@ -3182,8 +6876,16 @@ class ExperienceStore:
             if row is None:
                 return None
             items = conn.execute(
-                "SELECT * FROM experience_retrieval_items "
-                "WHERE retrieval_id = ? ORDER BY rank, item_id",
+                """
+                SELECT ri.*, i.kind, i.current_status, r.title
+                FROM experience_retrieval_items AS ri
+                LEFT JOIN experience_items AS i
+                  ON i.id = ri.item_id
+                LEFT JOIN experience_item_revisions AS r
+                  ON r.item_id = i.id AND r.revision = ri.item_revision
+                WHERE ri.retrieval_id = ?
+                ORDER BY ri.rank, ri.item_id
+                """,
                 (safe_id,),
             ).fetchall()
         result = dict(row)
@@ -3193,6 +6895,9 @@ class ExperienceStore:
             item["match_reasons"] = self._json_from_storage(
                 item.pop("match_reasons_json"), "match reasons"
             )
+            item["kind"] = item.get("kind")
+            item["status"] = item.get("current_status")
+            item["title"] = self._returned_text(item.get("title"), "title")
             # Older pre-release schemas may still carry this deferred field.
             item.pop("planned_effect", None)
             result["items"].append(item)
@@ -3332,9 +7037,458 @@ class ExperienceStore:
                 "SELECT COUNT(*) AS count, MIN(created_at) AS oldest "
                 "FROM experience_events"
             ).fetchone()
+            tags = conn.execute(
+                "SELECT COUNT(*) AS count FROM experience_tags t JOIN experience_items i ON i.id = t.item_id AND i.current_revision = t.revision"
+            ).fetchone()
+            links = conn.execute(
+                "SELECT COUNT(*) AS count FROM experience_links"
+            ).fetchone()
         return {
             "retrieval_count": int(retrieval["count"]),
             "oldest_retrieval_at": retrieval["oldest"],
             "event_count": int(events["count"]),
             "oldest_event_at": events["oldest"],
+            "tag_count": int(tags["count"]),
+            "link_count": int(links["count"]),
         }
+
+    def schema_status(self) -> dict[str, Any]:
+        """Return metadata-only schema, FTS, and governance counts."""
+
+        with self._lock:
+            conn = self._connection()
+            version = conn.execute(
+                "SELECT value FROM experience_schema_meta WHERE key = 'version'"
+            ).fetchone()
+            fts_version = conn.execute(
+                "SELECT value FROM experience_schema_meta "
+                "WHERE key = 'fts_rebuild_version'"
+            ).fetchone()
+            fts_module = conn.execute(
+                "SELECT 1 FROM pragma_module_list WHERE name = 'fts5'"
+            ).fetchone() is not None
+            unicode61 = conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'experience_search'"
+            ).fetchone() is not None
+            trigram = conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'experience_search_trigram'"
+            ).fetchone() is not None
+            revisions = conn.execute(
+                "SELECT COUNT(*) AS count FROM experience_item_revisions"
+            ).fetchone()
+            search_content = conn.execute(
+                "SELECT COUNT(*) AS count FROM experience_search_content"
+            ).fetchone()
+            search_rows = 0
+            trigram_rows = 0
+            if unicode61:
+                search_rows = int(
+                    conn.execute(
+                        "SELECT COUNT(*) AS count FROM experience_search"
+                    ).fetchone()["count"]
+                )
+            if trigram:
+                trigram_rows = int(
+                    conn.execute(
+                        "SELECT COUNT(*) AS count FROM experience_search_trigram"
+                    ).fetchone()["count"]
+                )
+            counts_rows = conn.execute(
+                """
+                SELECT kind, current_status, COUNT(*) AS count
+                FROM experience_items
+                GROUP BY kind, current_status
+                ORDER BY kind, current_status
+                """
+            ).fetchall()
+            migration_rows = conn.execute(
+                """
+                SELECT source_system, source_store_hash, COUNT(*) AS count,
+                       MAX(imported_at) AS latest_imported_at
+                FROM experience_migration_sources
+                GROUP BY source_system, source_store_hash
+                ORDER BY latest_imported_at DESC, source_system
+                """
+            ).fetchall()
+            latest_retrieval = conn.execute(
+                """
+                SELECT id, created_at
+                FROM experience_retrievals
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        return {
+            "schema_version": version["value"] if version else None,
+            "schema_current": (
+                version is not None and version["value"] == _CURRENT_SCHEMA_VERSION
+            ),
+            "fts_rebuild_version": fts_version["value"] if fts_version else None,
+            "fts_current": (
+                fts_version is not None
+                and fts_version["value"] == _CURRENT_FTS_VERSION
+            ),
+            "fts_module_available": fts_module,
+            "unicode61_index": unicode61,
+            "trigram_index": trigram,
+            "revision_count": int(revisions["count"]),
+            "search_content_count": int(search_content["count"]),
+            "unicode61_row_count": search_rows,
+            "trigram_row_count": trigram_rows,
+            "counts_by_kind_status": {
+                f"{row['kind']}.{row['current_status']}": int(row["count"])
+                for row in counts_rows
+            },
+            "migration_sources": [
+                {
+                    "source_system": row["source_system"],
+                    "source_store_hash": row["source_store_hash"],
+                    "count": int(row["count"]),
+                    "latest_imported_at": row["latest_imported_at"],
+                }
+                for row in migration_rows
+            ],
+            "latest_retrieval": (
+                {
+                    "id": latest_retrieval["id"],
+                    "created_at": latest_retrieval["created_at"],
+                }
+                if latest_retrieval
+                else None
+            ),
+        }
+
+    def rebuild_search_index(self) -> dict[str, Any]:
+        """Rebuild unicode61 and trigram FTS indexes metadata-only."""
+
+        with self._lock:
+            conn = self._connection()
+            module_available = conn.execute(
+                "SELECT 1 FROM pragma_module_list WHERE name = 'fts5'"
+            ).fetchone() is not None
+            if not module_available:
+                self._disable_fts_triggers()
+                logger.warning(
+                    "SQLite FTS5 unavailable; experience search indexes disabled"
+                )
+                return {
+                    "rebuilt": False,
+                    "fts_enabled": False,
+                    "reason": "fts5_unavailable",
+                }
+            conn.execute(
+                "INSERT INTO experience_search(experience_search) VALUES('rebuild')"
+            )
+            conn.execute(
+                "INSERT INTO experience_search_trigram("
+                "experience_search_trigram) VALUES('rebuild')"
+            )
+            conn.execute(
+                "INSERT INTO experience_schema_meta(key, value) "
+                "VALUES('fts_rebuild_version', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (_CURRENT_FTS_VERSION,),
+            )
+        self._fts_enabled = True
+        return {
+            "rebuilt": True,
+            "fts_enabled": True,
+            "fts_rebuild_version": _CURRENT_FTS_VERSION,
+        }
+
+    def diagnostic_prune_plan(
+        self,
+        *,
+        now: float | None = None,
+        max_age_days: int = 30,
+        max_retrievals: int = 10_000,
+        max_events: int = 10_000,
+    ) -> dict[str, Any]:
+        """Return metadata-only diagnostic pruning counts without deleting."""
+
+        if max_age_days < 0 or max_retrievals < 0 or max_events < 0:
+            raise ValueError("diagnostic retention bounds must be non-negative")
+        cutoff = _now(now) - (int(max_age_days) * 86_400.0)
+        with self._lock:
+            conn = self._connection()
+            retrievals_removed = conn.execute(
+                "SELECT COUNT(*) AS count FROM experience_retrievals "
+                "WHERE created_at < ?",
+                (cutoff,),
+            ).fetchone()["count"]
+            events_removed = conn.execute(
+                "SELECT COUNT(*) AS count FROM experience_events WHERE created_at < ?",
+                (cutoff,),
+            ).fetchone()["count"]
+            if max_retrievals == 0:
+                retrievals_removed += conn.execute(
+                    "SELECT COUNT(*) AS count FROM experience_retrievals"
+                ).fetchone()["count"]
+            else:
+                retrievals_removed += conn.execute(
+                    """
+                    SELECT COUNT(*) AS count FROM experience_retrievals
+                    WHERE id NOT IN (
+                        SELECT id FROM experience_retrievals
+                        ORDER BY created_at DESC, id DESC LIMIT ?
+                    )
+                    """,
+                    (int(max_retrievals),),
+                ).fetchone()["count"]
+            if max_events == 0:
+                events_removed += conn.execute(
+                    "SELECT COUNT(*) AS count FROM experience_events"
+                ).fetchone()["count"]
+            else:
+                events_removed += conn.execute(
+                    """
+                    SELECT COUNT(*) AS count FROM experience_events
+                    WHERE id NOT IN (
+                        SELECT id FROM experience_events
+                        ORDER BY created_at DESC, id DESC LIMIT ?
+                    )
+                    """,
+                    (int(max_events),),
+                ).fetchone()["count"]
+        return {
+            "dry_run": True,
+            "retrievals_to_remove": int(retrievals_removed),
+            "events_to_remove": int(events_removed),
+            "max_age_days": int(max_age_days),
+            "max_retrievals": int(max_retrievals),
+            "max_events": int(max_events),
+        }
+
+    def doctor(
+        self,
+        *,
+        repository_root: str | Path | None = None,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Run metadata-only integrity and governance checks."""
+
+        current_time = float(time.time() if now is None else now)
+        with self._lock:
+            conn = self._connection()
+            version = conn.execute(
+                "SELECT value FROM experience_schema_meta WHERE key = 'version'"
+            ).fetchone()
+            foreign_key_rows = conn.execute("PRAGMA foreign_key_check").fetchall()
+            orphan_current_revisions = [
+                row["id"]
+                for row in conn.execute(
+                    """
+                    SELECT i.id
+                    FROM experience_items AS i
+                    LEFT JOIN experience_item_revisions AS r
+                      ON r.item_id = i.id AND r.revision = i.current_revision
+                    WHERE r.item_id IS NULL
+                    """
+                ).fetchall()
+            ]
+            revision_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS count FROM experience_item_revisions"
+                ).fetchone()["count"]
+            )
+            search_content_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS count FROM experience_search_content"
+                ).fetchone()["count"]
+            )
+            unicode61 = conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'experience_search'"
+            ).fetchone() is not None
+            trigram = conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'experience_search_trigram'"
+            ).fetchone() is not None
+            search_count = 0
+            trigram_count = 0
+            fts_marker = conn.execute(
+                "SELECT value FROM experience_schema_meta "
+                "WHERE key = 'fts_rebuild_version'"
+            ).fetchone()
+            if unicode61:
+                search_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) AS count FROM experience_search"
+                    ).fetchone()["count"]
+                )
+            if trigram:
+                trigram_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) AS count FROM experience_search_trigram"
+                    ).fetchone()["count"]
+                )
+            authority_violations = [
+                row["id"]
+                for row in conn.execute(
+                    """
+                    SELECT i.id
+                    FROM experience_items AS i
+                    JOIN experience_item_revisions AS r
+                      ON r.item_id = i.id AND r.revision = i.current_revision
+                    WHERE i.kind = 'decision'
+                      AND i.current_status = 'active'
+                      AND (
+                        json_extract(r.body_json, '$.authority') NOT IN ('user', 'repository_policy')
+                        OR json_extract(r.body_json, '$.effective_at') > ?
+                        OR (
+                          json_extract(r.body_json, '$.expires_at') IS NOT NULL
+                          AND json_extract(r.body_json, '$.expires_at') <= ?
+                        )
+                        OR (
+                          r.review_after IS NOT NULL
+                          AND r.review_after <= ?
+                        )
+                      )
+                    """,
+                    (current_time, current_time, current_time),
+                ).fetchall()
+            ]
+            stale_migration_rows = conn.execute(
+                """
+                SELECT source_system, source_store_hash, source_item_id,
+                       source_revision, target_item_id, disposition, reason_code
+                FROM experience_migration_sources
+                WHERE target_item_id IS NULL
+                ORDER BY imported_at DESC, source_system, source_item_id
+                LIMIT 100
+                """
+            ).fetchall()
+        schema_current = version is not None and version["value"] == _CURRENT_SCHEMA_VERSION
+        fts_current = (
+            fts_marker is not None and fts_marker["value"] == _CURRENT_FTS_VERSION
+        )
+        active_decisions = self.list_decisions(status="active")
+        policy_anchor_violations = self._doctor_policy_anchor_violations(
+            active_decisions,
+            repository_root=repository_root,
+        )
+        supersession_cycles = self._doctor_supersession_cycles()
+        db_mode = stat.S_IMODE(self.db_path.stat().st_mode) if self.db_path.exists() else None
+        parent_mode = (
+            stat.S_IMODE(self.db_path.parent.stat().st_mode)
+            if self.db_path.parent.exists()
+            else None
+        )
+        return {
+            "ok": (
+                schema_current
+                and not foreign_key_rows
+                and not orphan_current_revisions
+                and revision_count == search_content_count
+                and (not unicode61 or search_count == revision_count)
+                and (not trigram or trigram_count == revision_count)
+                and not authority_violations
+                and not supersession_cycles
+                and not policy_anchor_violations
+                and db_mode == 0o600
+                and parent_mode == 0o700
+            ),
+            "schema_version": version["value"] if version else None,
+            "schema_current": schema_current,
+            "fts_current": fts_current,
+            "foreign_key_violations": [dict(row) for row in foreign_key_rows],
+            "orphan_current_revisions": orphan_current_revisions,
+            "fts": {
+                "unicode61_index": unicode61,
+                "trigram_index": trigram,
+                "revision_count": revision_count,
+                "search_content_count": search_content_count,
+                "unicode61_row_count": search_count,
+                "trigram_row_count": trigram_count,
+                "consistent": revision_count == search_content_count
+                and (not unicode61 or search_count == revision_count)
+                and (not trigram or trigram_count == revision_count),
+            },
+            "supersession_cycles": supersession_cycles,
+            "active_decision_authority_violations": authority_violations,
+            "file_permissions": {
+                "db_mode": oct(db_mode) if db_mode is not None else None,
+                "parent_mode": oct(parent_mode) if parent_mode is not None else None,
+                "ok": db_mode == 0o600 and parent_mode == 0o700,
+            },
+            "stale_migration_mappings": [dict(row) for row in stale_migration_rows],
+            "policy_anchor_violations": policy_anchor_violations,
+        }
+
+    def _doctor_policy_anchor_violations(
+        self,
+        active_decisions: Sequence[dict[str, Any]],
+        *,
+        repository_root: str | Path | None,
+    ) -> list[dict[str, Any]]:
+        violations: list[dict[str, Any]] = []
+        for decision in active_decisions:
+            body = decision["revision"]["body"]
+            if body.get("authority") != "repository_policy":
+                continue
+            if repository_root is None:
+                violations.append({
+                    "item_id": decision["id"],
+                    "reason": "repository_root_required_for_anchor_check",
+                })
+                continue
+            validation = validate_repository_anchor(
+                body["policy_anchor_path"],
+                body["policy_anchor_hash"],
+                repository_root=repository_root,
+            )
+            if not validation.valid:
+                violations.append({
+                    "item_id": decision["id"],
+                    "path": validation.path,
+                    "reason": validation.reason,
+                })
+        return violations
+
+    def _doctor_supersession_cycles(self) -> list[dict[str, Any]]:
+        """Return bounded supersession cycles without body text."""
+
+        with self._lock:
+            rows = self._connection().execute(
+                """
+                SELECT from_item_id, from_revision, to_item_id, to_revision
+                FROM experience_links
+                WHERE relation = 'supersedes'
+                ORDER BY from_item_id, from_revision, to_item_id, to_revision
+                """
+            ).fetchall()
+        graph: dict[tuple[str, int], set[tuple[str, int]]] = {}
+        for row in rows:
+            graph.setdefault(
+                (row["from_item_id"], int(row["from_revision"])), set()
+            ).add((row["to_item_id"], int(row["to_revision"])))
+        cycles: list[dict[str, Any]] = []
+        seen_cycles: set[tuple[tuple[str, int], ...]] = set()
+        for start in graph:
+            stack: list[tuple[tuple[str, int], tuple[tuple[str, int], ...]]] = [
+                (start, (start,))
+            ]
+            while stack:
+                node, path = stack.pop()
+                for nxt in graph.get(node, ()):  # noqa: SIM118
+                    if nxt == start:
+                        cycle_key = self._canonical_cycle(path)
+                        if cycle_key in seen_cycles:
+                            continue
+                        seen_cycles.add(cycle_key)
+                        cycles.append({
+                            "cycle": [
+                                {"item_id": item_id, "revision": revision}
+                                for item_id, revision in path
+                            ],
+                        })
+                    elif nxt not in path and len(path) < 100:
+                        stack.append((nxt, (*path, nxt)))
+        return cycles
+
+    @staticmethod
+    def _canonical_cycle(path: tuple[tuple[str, int], ...]) -> tuple[tuple[str, int], ...]:
+        rotations = [path[index:] + path[:index] for index in range(len(path))]
+        return min(rotations)

@@ -1265,6 +1265,9 @@ DEFAULT_CONFIG = {
         # disabled by default; enabling it requires an explicit rollout choice.
         "consolidation": {
             "enabled": False,
+            # Compatibility-only runtime recall. Canonical typed Experience
+            # recall must not silently concatenate this legacy text source.
+            "legacy_recall_enabled": False,
             "schedule": "0 23 * * *",
             "dry_run": True,
             "phase": "observe",
@@ -1385,6 +1388,10 @@ DEFAULT_CONFIG = {
     # the database policy is the canonical consent and scope boundary.
     "experience": {
         "mode": "off",  # off | capture | shadow | assist
+        "decisions": {
+            "enabled": True,
+            "explicit_capture_enabled": True,
+        },
         "max_retrieved_items": 3,
         "max_injected_chars": 1500,
         "min_retrieval_confidence": 0.55,

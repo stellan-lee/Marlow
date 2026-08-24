@@ -28,6 +28,13 @@ _LESSON_STATUSES = (
     "rejected",
     "retracted",
 )
+_DECISION_STATUSES = (
+    "candidate",
+    "active",
+    "review_required",
+    "superseded",
+    "revoked",
+)
 
 
 def _get_state_db_path() -> Path:
@@ -99,6 +106,7 @@ def _tags(
 def _item_in_scope(item: dict[str, Any], resolved: Any) -> bool:
     return (
         item.get("principal_id") == resolved.principal_id
+        and item.get("scope_type") == resolved.scope_type.value
         and item.get("repository_id") == resolved.repository_id
         and item.get("project_id") == resolved.project_id
     )
@@ -166,6 +174,7 @@ def _item_payload(
     global_mode: str | None = None,
 ) -> dict[str, Any]:
     revision = item.get("revision") or {}
+    body = revision.get("body") or {}
     allowed = _content_allowed(item, policy, global_mode=global_mode)
     payload = {
         "id": item.get("id"),
@@ -185,6 +194,104 @@ def _item_payload(
     elif allowed:
         payload["title"] = revision.get("title")
     return payload
+
+
+def _require_scoped_decision(
+    store: Any,
+    resolved: Any,
+    decision_id: str,
+    *,
+    include_history: bool = False,
+) -> dict[str, Any]:
+    item = store.get_decision(decision_id, include_history=include_history)
+    if item is None or not _item_in_scope(item, resolved):
+        raise LookupError("decision is not available in this MCP project")
+    return item
+
+
+def _decision_revision_payload(revision: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: revision.get(key)
+        for key in (
+            "revision",
+            "title",
+            "summary",
+            "body",
+            "tags",
+            "confidence",
+            "editor",
+            "edit_reason",
+            "created_at",
+            "last_validated_at",
+            "review_after",
+        )
+    }
+
+
+def _decision_payload(
+    item: dict[str, Any],
+    policy: Any,
+    *,
+    include_content: bool,
+    global_mode: str | None = None,
+) -> dict[str, Any]:
+    revision = item.get("revision") or {}
+    body = revision.get("body") or {}
+    allowed = _content_allowed(item, policy, global_mode=global_mode)
+    payload = {
+        "id": item.get("id"),
+        "family_id": item.get("family_id"),
+        "kind": item.get("kind"),
+        "status": item.get("current_status"),
+        "current_revision": item.get("current_revision"),
+        "scope_type": item.get("scope_type"),
+        "scope_id": item.get("scope_id"),
+        "repository_id": item.get("repository_id"),
+        "project_id": item.get("project_id"),
+        "sensitivity": item.get("sensitivity"),
+        "egress_policy": item.get("egress_policy"),
+        "created_by": item.get("created_by"),
+        "created_at": item.get("created_at"),
+        "updated_at": item.get("updated_at"),
+        "authority": body.get("authority"),
+        "source_type": body.get("source_type"),
+        "effective_at": body.get("effective_at"),
+        "expires_at": body.get("expires_at"),
+        "content_available": allowed,
+    }
+    if allowed and include_content:
+        payload["revision"] = _decision_revision_payload(revision)
+        payload["revisions"] = [
+            _decision_revision_payload(rev)
+            for rev in item.get("revisions") or []
+        ]
+    elif allowed:
+        payload["title"] = revision.get("title")
+        payload["summary"] = revision.get("summary")
+        payload["statement"] = body.get("statement")
+    return payload
+
+
+def _mcp_decision_authority(
+    *,
+    reason: str,
+    approve: str | None = None,
+    supersede: str | None = None,
+    revoke: str | None = None,
+) -> Any:
+    import hashlib
+    from agent.experience.authority import DecisionTurnAuthority
+
+    approval_text = reason.strip() or "mcp decision approval"
+    return DecisionTurnAuthority(
+        source_turn_id=f"mcp_approval_{uuid.uuid4().hex}",
+        source_session_id="mcp-client",
+        raw_user_text_hash=hashlib.sha256(approval_text.encode("utf-8")).hexdigest(),
+        explicit_remember_grant=False,
+        approved_item_ids=(approve,) if approve is not None else (),
+        supersede_target_ids=(supersede,) if supersede is not None else (),
+        revoke_target_ids=(revoke,) if revoke is not None else (),
+    )
 
 
 def _response(operation: str, callback: Callable[[], dict[str, Any]]) -> str:
@@ -492,6 +599,253 @@ def retract_work_experience(lesson_id: str, *, reason: str) -> str:
     return _response("retract", run)
 
 
+def list_decision_work_experience(
+    *,
+    statuses: Optional[List[str]] = None,
+    limit: int = 100,
+) -> str:
+    def run() -> dict[str, Any]:
+        requested = tuple(statuses or ()) or None
+        if requested and any(status not in _DECISION_STATUSES for status in requested):
+            raise ValueError("unsupported decision status")
+        with _open_current_scope() as (store, resolved):
+            global_mode = _global_mode()
+            items = store.list_decisions(
+                principal_id=resolved.principal_id,
+                repository_id=resolved.repository_id,
+                project_id=resolved.project_id,
+                status=requested,
+                limit=_bounded_int(limit, default=100, minimum=1, maximum=200),
+            )
+            decisions = [
+                _decision_payload(
+                    item,
+                    resolved.policy,
+                    include_content=False,
+                    global_mode=global_mode,
+                )
+                for item in items
+            ]
+        return {"status": "ok", "count": len(decisions), "decisions": decisions}
+
+    return _response("decision_list", run)
+
+
+def show_decision_work_experience(decision_id: str) -> str:
+    def run() -> dict[str, Any]:
+        with _open_current_scope() as (store, resolved):
+            item = _require_scoped_decision(
+                store,
+                resolved,
+                decision_id,
+                include_history=True,
+            )
+            decision = _decision_payload(
+                item,
+                resolved.policy,
+                include_content=True,
+            )
+            decision["links"] = store.list_links(item_id=decision_id)
+        return {"status": "ok", "decision": decision}
+
+    return _response("decision_show", run)
+
+
+def add_decision_work_experience(
+    *,
+    title: str,
+    summary: str,
+    statement: str,
+    rationale: str,
+    effective_at: float,
+    expires_at: Optional[float] = None,
+    task_types: Optional[List[str]] = None,
+    technologies: Optional[List[str]] = None,
+    entities: Optional[List[str]] = None,
+    failure_fingerprints: Optional[List[str]] = None,
+    sensitivity: str = "normal",
+    egress_policy: str = "local_only",
+) -> str:
+    def run() -> dict[str, Any]:
+        from agent.experience.models import DecisionBody
+
+        with _open_current_scope() as (store, resolved):
+            scope = resolved.as_ref()
+            body = DecisionBody(
+                statement=statement,
+                rationale=rationale,
+                source_type="agent_proposal",
+                authority="unapproved",
+                effective_at=effective_at,
+                expires_at=expires_at,
+            ).to_dict()
+            item = store.create_decision(
+                principal_id=scope.principal_id,
+                scope_type=scope.scope_type,
+                scope_id=scope.scope_id,
+                repository_id=scope.repository_id,
+                project_id=scope.project_id,
+                title=title,
+                summary=summary,
+                body=body,
+                tags=_tags(
+                    task_types=task_types,
+                    technologies=technologies,
+                    entities=entities,
+                    failure_fingerprints=failure_fingerprints,
+                ),
+                sensitivity=sensitivity,
+                egress_policy=egress_policy,
+                created_by="agent",
+            )
+            decision = _decision_payload(
+                item,
+                resolved.policy,
+                include_content=True,
+            )
+        return {"status": "ok", "created": True, "decision": decision}
+
+    return _response("decision_add", run)
+
+
+def approve_decision_work_experience(decision_id: str, *, reason: str) -> str:
+    def run() -> dict[str, Any]:
+        if not reason or not reason.strip():
+            raise ValueError("approval reason is required")
+        with _open_current_scope() as (store, resolved):
+            _require_scoped_decision(store, resolved, decision_id)
+            item = store.activate_decision(
+                decision_id,
+                authority=_mcp_decision_authority(reason=reason, approve=decision_id),
+                repository_root=str(_get_project_root()),
+                repository_id=resolved.repository_id,
+                actor="mcp-client",
+                reason=reason,
+            )
+            decision = _decision_payload(
+                item,
+                resolved.policy,
+                include_content=False,
+            )
+        return {"status": "ok", "approved": True, "decision": decision}
+
+    return _response("decision_approve", run)
+
+
+def supersede_decision_work_experience(
+    decision_id: str,
+    *,
+    title: str,
+    summary: str,
+    statement: str,
+    rationale: str,
+    effective_at: float,
+    reason: str,
+    expires_at: Optional[float] = None,
+    task_types: Optional[List[str]] = None,
+    technologies: Optional[List[str]] = None,
+    entities: Optional[List[str]] = None,
+    failure_fingerprints: Optional[List[str]] = None,
+    sensitivity: str = "normal",
+    egress_policy: str = "local_only",
+) -> str:
+    def run() -> dict[str, Any]:
+        from agent.experience.models import DecisionBody
+
+        if not reason or not reason.strip():
+            raise ValueError("supersession reason is required")
+        with _open_current_scope() as (store, resolved):
+            _require_scoped_decision(store, resolved, decision_id)
+            scope = resolved.as_ref()
+            body = DecisionBody(
+                statement=statement,
+                rationale=rationale,
+                source_type="user_turn",
+                authority="user",
+                effective_at=effective_at,
+                expires_at=expires_at,
+            ).to_dict()
+            item = store.supersede_decision(
+                decision_id,
+                authority=_mcp_decision_authority(reason=reason, supersede=decision_id),
+                principal_id=scope.principal_id,
+                scope_type=scope.scope_type,
+                scope_id=scope.scope_id,
+                repository_id=scope.repository_id,
+                project_id=scope.project_id,
+                title=title,
+                summary=summary,
+                body=body,
+                tags=_tags(
+                    task_types=task_types,
+                    technologies=technologies,
+                    entities=entities,
+                    failure_fingerprints=failure_fingerprints,
+                ),
+                sensitivity=sensitivity,
+                egress_policy=egress_policy,
+                created_by="agent",
+                repository_root=str(_get_project_root()),
+                reason=reason,
+            )
+            decision = _decision_payload(
+                item,
+                resolved.policy,
+                include_content=True,
+            )
+        return {"status": "ok", "superseded": True, "decision": decision}
+
+    return _response("decision_supersede", run)
+
+
+def revoke_decision_work_experience(decision_id: str, *, reason: str) -> str:
+    def run() -> dict[str, Any]:
+        if not reason or not reason.strip():
+            raise ValueError("revocation reason is required")
+        with _open_current_scope() as (store, resolved):
+            _require_scoped_decision(store, resolved, decision_id)
+            item = store.revoke_decision(
+                decision_id,
+                authority=_mcp_decision_authority(reason=reason, revoke=decision_id),
+                actor="mcp-client",
+                reason=reason,
+            )
+            decision = _decision_payload(
+                item,
+                resolved.policy,
+                include_content=False,
+            )
+        return {"status": "ok", "revoked": True, "decision": decision}
+
+    return _response("decision_revoke", run)
+
+
+def related_decision_work_experience(decision_id: str) -> str:
+    def run() -> dict[str, Any]:
+        with _open_current_scope() as (store, resolved):
+            item = _require_scoped_decision(
+                store,
+                resolved,
+                decision_id,
+                include_history=True,
+            )
+            decision = _decision_payload(
+                item,
+                resolved.policy,
+                include_content=True,
+            )
+            links = store.list_links(item_id=decision_id) if hasattr(store, "list_links") else []
+            related = store.related_decisions(item_id=decision_id) if hasattr(store, "related_decisions") else []
+        return {
+            "status": "ok",
+            "decision": decision,
+            "links": links,
+            "related": related,
+        }
+
+    return _response("decision_related", run)
+
+
 def register_work_experience_tools(mcp: Any) -> None:
     """Register the seven Work Experience MCP tools on ``mcp``."""
 
@@ -669,14 +1023,149 @@ def register_work_experience_tools(mcp: Any) -> None:
 
         return retract_work_experience(lesson_id, reason=reason)
 
+    @mcp.tool(annotations=read_only)
+    def experience_decision_list(
+        statuses: Optional[List[str]] = None,
+        limit: int = 100,
+    ) -> str:
+        """List Decision Memory records in this MCP server's project."""
+
+        return list_decision_work_experience(statuses=statuses, limit=limit)
+
+    @mcp.tool(annotations=read_only)
+    def experience_decision_show(decision_id: str) -> str:
+        """Show one project Decision and its current revision when authorized."""
+
+        return show_decision_work_experience(decision_id)
+
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=False,
+            openWorldHint=False,
+        )
+    )
+    def experience_decision_add(
+        title: str,
+        summary: str,
+        statement: str,
+        rationale: str,
+        effective_at: float,
+        expires_at: Optional[float] = None,
+        task_types: Optional[List[str]] = None,
+        technologies: Optional[List[str]] = None,
+        entities: Optional[List[str]] = None,
+        failure_fingerprints: Optional[List[str]] = None,
+        sensitivity: str = "normal",
+        egress_policy: str = "local_only",
+    ) -> str:
+        """Create an agent-authored candidate Decision proposal."""
+
+        return add_decision_work_experience(
+            title=title,
+            summary=summary,
+            statement=statement,
+            rationale=rationale,
+            effective_at=effective_at,
+            expires_at=expires_at,
+            task_types=task_types,
+            technologies=technologies,
+            entities=entities,
+            failure_fingerprints=failure_fingerprints,
+            sensitivity=sensitivity,
+            egress_policy=egress_policy,
+        )
+
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=False,
+        )
+    )
+    def experience_decision_approve(decision_id: str, reason: str) -> str:
+        """Activate a candidate Decision through this MCP management boundary."""
+
+        return approve_decision_work_experience(decision_id, reason=reason)
+
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=False,
+            openWorldHint=False,
+        )
+    )
+    def experience_decision_supersede(
+        decision_id: str,
+        title: str,
+        summary: str,
+        statement: str,
+        rationale: str,
+        effective_at: float,
+        reason: str,
+        expires_at: Optional[float] = None,
+        task_types: Optional[List[str]] = None,
+        technologies: Optional[List[str]] = None,
+        entities: Optional[List[str]] = None,
+        failure_fingerprints: Optional[List[str]] = None,
+        sensitivity: str = "normal",
+        egress_policy: str = "local_only",
+    ) -> str:
+        """Supersede a project Decision with a replacement proposal."""
+
+        return supersede_decision_work_experience(
+            decision_id,
+            title=title,
+            summary=summary,
+            statement=statement,
+            rationale=rationale,
+            effective_at=effective_at,
+            reason=reason,
+            expires_at=expires_at,
+            task_types=task_types,
+            technologies=technologies,
+            entities=entities,
+            failure_fingerprints=failure_fingerprints,
+            sensitivity=sensitivity,
+            egress_policy=egress_policy,
+        )
+
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=True,
+            idempotentHint=True,
+            openWorldHint=False,
+        )
+    )
+    def experience_decision_revoke(decision_id: str, reason: str) -> str:
+        """Revoke a project Decision so it is no longer eligible for recall."""
+
+        return revoke_decision_work_experience(decision_id, reason=reason)
+
+    @mcp.tool(annotations=read_only)
+    def experience_decision_related(decision_id: str) -> str:
+        """Show project Decision relationship links and nearby decisions."""
+
+        return related_decision_work_experience(decision_id)
+
 
 __all__ = [
+    "add_decision_work_experience",
     "add_work_experience",
+    "approve_decision_work_experience",
     "approve_work_experience",
     "edit_work_experience",
+    "list_decision_work_experience",
     "list_work_experience",
     "recall_work_experience",
     "register_work_experience_tools",
+    "related_decision_work_experience",
     "retract_work_experience",
-    "show_work_experience",
+    "revoke_decision_work_experience",
+    "show_decision_work_experience",
+    "supersede_decision_work_experience",
 ]

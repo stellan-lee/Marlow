@@ -169,3 +169,54 @@ def test_relevant_memory_includes_original_supporting_evidence(tmp_path: Path) -
         match = store.find_relevant_memories(scope_id="person_a", claim="preferred editor")[0]
         assert match["evidence"][0]["event_id"] == event["event_id"]
         assert match["evidence"][0]["content"] == "I use vim every day"
+
+
+def test_store_hash_and_current_memories_support_migration_review(tmp_path: Path) -> None:
+    with MemoryConsolidationStore((tmp_path / "state.db").resolve()) as store:
+        active = store.append_evidence(scope_id="person_a", source_key="turn:1", content="Use Decision Memory.")
+        conflicted = store.append_evidence(scope_id="person_a", source_key="turn:2", content="Conflict.")
+        archived = store.append_evidence(scope_id="person_a", source_key="turn:3", content="Archived.")
+        store.commit(
+            scope_id="person_a",
+            operations=[
+                _candidate(active["event_id"]),
+                {
+                    "type": "conflict",
+                    "candidate": {
+                        "kind": "decision",
+                        "claim": "Conflict",
+                        "evidence_event_ids": [conflicted["event_id"]],
+                    },
+                },
+                {
+                    "type": "create",
+                    "candidate": {
+                        "kind": "decision",
+                        "claim": "Archived",
+                        "evidence_event_ids": [archived["event_id"]],
+                    },
+                },
+            ],
+            end_seq=3,
+        )
+        archived_item_id = store.find_relevant_memories(scope_id="person_a", claim="Archived")[0]["id"]
+        store.commit(
+            scope_id="person_a",
+            operations=[
+                {
+                    "type": "archive",
+                    "target_item_id": archived_item_id,
+                    "candidate": {
+                        "kind": "decision",
+                        "claim": "Archived",
+                        "evidence_event_ids": [archived["event_id"]],
+                    },
+                }
+            ],
+            end_seq=3,
+        )
+        active_rows = store.list_current_memories(scope_id="person_a")
+        archived_rows = store.list_current_memories(scope_id="person_a", include_archived=True)
+        assert [row["status"] for row in active_rows] == ["conflicted", "active"]
+        assert {row["status"] for row in archived_rows} == {"active", "conflicted", "archived"}
+        assert len(store.store_hash(scope_id="person_a")) == 64

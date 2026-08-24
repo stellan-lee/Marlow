@@ -5,6 +5,13 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from agent.experience.models import (
+    CreatedBy,
+    Decision,
+    DecisionAuthority,
+    DecisionBody,
+    DecisionRevision,
+    DecisionSourceType,
+    DecisionStatus,
     EgressPolicy,
     LessonBody,
     LessonRevision,
@@ -14,8 +21,10 @@ from agent.experience.models import (
     ScopeRef,
     ScopeType,
     TagNamespace,
+    can_transition_decision,
     can_transition_lesson,
     lesson_content_hash,
+    require_decision_transition,
     require_lesson_transition,
 )
 
@@ -145,4 +154,128 @@ def test_lesson_body_mapping_rejects_untyped_extra_fields() -> None:
                 **LessonBody("when", "guidance", "rationale").to_dict(),
                 "raw_tool_output": "must never become model-visible",
             }
+        )
+
+
+def test_decision_body_rejects_unknown_fields_and_authority_mismatches() -> None:
+    with pytest.raises(ValueError, match="unknown decision body fields"):
+        DecisionBody.from_mapping(
+            {
+                **DecisionBody(
+                    statement="Use SQLite links",
+                    rationale="Relationships remain inspectable.",
+                    source_type=DecisionSourceType.MANUAL_IMPORT,
+                    authority=DecisionAuthority.UNAPPROVED,
+                    effective_at=1.0,
+                ).to_dict(),
+                "raw_tool_output": "must never become a Decision",
+            }
+        )
+
+    with pytest.raises(ValueError, match="repository_policy authority"):
+        DecisionBody(
+            statement="Use the local policy",
+            rationale="Policy is explicit.",
+            source_type=DecisionSourceType.MANUAL_IMPORT,
+            authority=DecisionAuthority.REPOSITORY_POLICY,
+            effective_at=1.0,
+            policy_anchor_path="AGENTS.md",
+            policy_anchor_hash="a" * 64,
+        )
+
+    with pytest.raises(ValueError, match="policy_anchor_path"):
+        DecisionBody(
+            statement="Use the local policy",
+            rationale="Policy is explicit.",
+            source_type=DecisionSourceType.REPOSITORY_POLICY,
+            authority=DecisionAuthority.REPOSITORY_POLICY,
+            effective_at=1.0,
+            policy_anchor_path="../AGENTS.md",
+            policy_anchor_hash="a" * 64,
+        )
+
+    with pytest.raises(ValueError, match="repository_policy source_type"):
+        DecisionBody(
+            statement="Policy source",
+            rationale="Source is policy.",
+            source_type=DecisionSourceType.REPOSITORY_POLICY,
+            authority=DecisionAuthority.UNAPPROVED,
+            effective_at=1.0,
+        )
+
+
+def test_decision_lifecycle_is_forward_only_and_replay_safe() -> None:
+    assert can_transition_decision("candidate", "active")
+    assert can_transition_decision("candidate", "review_required")
+    assert can_transition_decision("active", "review_required")
+    assert can_transition_decision("review_required", "active")
+    assert can_transition_decision("candidate", "candidate")
+
+    for terminal in ("superseded", "revoked"):
+        assert can_transition_decision(terminal, terminal)
+        assert not can_transition_decision(terminal, "active")
+
+    assert require_decision_transition("candidate", "REVIEW_REQUIRED") is (
+        DecisionStatus.REVIEW_REQUIRED
+    )
+    with pytest.raises(ValueError, match="invalid decision transition"):
+        require_decision_transition("revoked", "active")
+
+
+def test_decision_models_require_consistent_authority() -> None:
+    body = DecisionBody(
+        statement="Use Decision Memory only when the design is approved.",
+        rationale="Authority must be explicit.",
+        source_type=DecisionSourceType.MANUAL_IMPORT,
+        authority=DecisionAuthority.UNAPPROVED,
+        effective_at=1.0,
+    )
+    revision = DecisionRevision(
+        item_id="decision_test",
+        revision=1,
+        title="Candidate decision",
+        summary="Not injectable.",
+        body=body,
+        source_session_id="session-1",
+        source_turn_id="turn-1",
+        source_work_id="work-1",
+        source_hash="a" * 64,
+        tags=(LessonTag(TagNamespace.COMPONENT, "agent/experience"),),
+        producer_metadata=(("provider", "test-provider"),),
+        created_at=1.0,
+    )
+    decision = Decision(
+        id="decision_test",
+        family_id="decision_test",
+        status=DecisionStatus.CANDIDATE,
+        scope=ScopeRef(
+            "local-owner",
+            ScopeType.PROJECT,
+            "project:abc",
+            repository_id="repo:abc",
+            project_id="project:abc",
+        ),
+        sensitivity="normal",
+        egress_policy="local_only",
+        producer_trust_domain="provider:a",
+        created_by="agent",
+        created_at=1.0,
+        updated_at=2.0,
+        revision=revision,
+    )
+    assert decision.status is DecisionStatus.CANDIDATE
+
+    with pytest.raises(ValueError, match="active decisions require"):
+        Decision(
+            id=decision.id,
+            family_id=decision.family_id,
+            status=DecisionStatus.ACTIVE,
+            scope=decision.scope,
+            sensitivity=decision.sensitivity,
+            egress_policy=decision.egress_policy,
+            producer_trust_domain=decision.producer_trust_domain,
+            created_by=decision.created_by,
+            created_at=decision.created_at,
+            updated_at=decision.updated_at,
+            revision=decision.revision,
         )
