@@ -95,6 +95,27 @@ def agent_with_memory_tool():
         return a
 
 
+def test_decision_memory_disables_structured_cards_when_canonical_enabled():
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+        patch("marlow_cli.config.load_config", return_value={
+            "memory": {"structured_cards_enabled": True},
+            "experience": {"decisions": {"enabled": True}},
+        }),
+    ):
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=False,
+        )
+
+    assert agent._memory_structured_cards_enabled is False
+
+
 def test_aiagent_reuses_existing_errors_log_handler():
     """Repeated AIAgent init should not accumulate duplicate errors.log handlers."""
     root_logger = logging.getLogger()

@@ -234,6 +234,64 @@ class MemoryConsolidationStore:
         cursor = int(row[0]) if row else 0
         return [dict(row) for row in self._conn.execute("SELECT * FROM memory_events WHERE scope_id=? AND ingestion_seq>? ORDER BY ingestion_seq,event_id", (scope, cursor))]
 
+    def store_hash(self, *, scope_id: str | None = None, scope_type: str = "profile") -> str:
+        """Return a stable, text-free fingerprint for migration idempotency."""
+        scope = None if scope_id is None else self._scope_key(scope_type, scope_id)
+        if scope is None:
+            rows = self._conn.execute(
+                "SELECT status, COUNT(*) FROM memory_items GROUP BY status ORDER BY status"
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT status, COUNT(*) FROM memory_items WHERE scope_id=? GROUP BY status ORDER BY status",
+                (scope,),
+            ).fetchall()
+        import hashlib
+
+        material = json.dumps([dict(row) for row in rows], sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    def list_current_memories(self, *, scope_id: str, scope_type: str = "profile",
+                              include_archived: bool = False, limit: int = 100) -> list[dict[str, Any]]:
+        """Return bounded current revision summaries for migration review."""
+        scope = self._scope_key(scope_type, scope_id)
+        statuses = ("active", "conflicted", "archived", "superseded") if include_archived else ("active", "conflicted")
+        placeholders = ",".join("?" for _ in statuses)
+        rows = self._conn.execute(
+            f"""SELECT i.item_id, i.kind, i.status, i.retention_class,
+                       i.pinned, i.origin, i.confidence, i.current_revision,
+                       i.updated_at, r.claim, r.candidate_key
+                  FROM memory_items i
+                  JOIN memory_revisions r
+                    ON r.item_id=i.item_id AND r.revision=i.current_revision
+                 WHERE i.scope_id=? AND i.status IN ({placeholders})
+                 ORDER BY CASE i.status
+                            WHEN 'conflicted' THEN 0
+                            WHEN 'active' THEN 1
+                            WHEN 'superseded' THEN 2
+                            WHEN 'archived' THEN 3
+                            ELSE 4
+                          END,
+                          i.updated_at DESC, i.item_id
+                 LIMIT ?""",
+            (scope, *statuses, max(1, min(int(limit), 1_000))),
+        ).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            evidence = [
+                dict(item)
+                for item in self._conn.execute(
+                    "SELECT e.event_id, e.content, e.source_key, e.observed_at, e.created_at "
+                    "FROM memory_sources s JOIN memory_events e ON e.event_id=s.event_id "
+                    "WHERE s.item_id=? AND s.revision=? ORDER BY e.ingestion_seq, e.event_id",
+                    (row["item_id"], int(row["current_revision"])),
+                ).fetchall()
+            ]
+            result = dict(row)
+            result["evidence"] = evidence
+            results.append(result)
+        return results
+
     def cursor(self, scope_id: str, scope_type: str = "profile") -> int:
         row = self._conn.execute("SELECT ingestion_seq FROM memory_scope_cursors WHERE scope_id=?", (self._scope_key(scope_type, scope_id),)).fetchone()
         return int(row[0]) if row else 0

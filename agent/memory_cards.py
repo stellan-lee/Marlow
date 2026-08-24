@@ -95,6 +95,7 @@ class MemoryCard:
     confidence: str = "medium"
     source_session_id: str = ""
     source_turn_hash: str = ""
+    source_role: str = "user"
     # PR5 — append-only supersession metadata.
     supersedes: list[str] = field(default_factory=list)
     superseded_by: str | None = None
@@ -340,23 +341,18 @@ def _has_logistics_anchor(sentence: str) -> bool:
         or _LOGISTICS_ANCHOR_ZH_RE.search(sentence)
     )
 
-# Which card types each source is allowed to produce. The assistant's final
-# response is the source of truth for decisions/todos/implementation; user
-# text is used mainly for topic/entities and for user-stated
-# preferences/constraints/todos/questions.
+# Which card types each source is allowed to produce. User-stated durable
+# judgments are allowed; assistant-only text is limited to non-authoritative
+# implementation/logistics context so the agent cannot self-authorize.
 _ASSISTANT_TYPES = frozenset(
     {
-        MemoryCardType.DECISION,
-        MemoryCardType.CONSTRAINT,
-        MemoryCardType.OPEN_QUESTION,
         MemoryCardType.LOGISTICS_PLAN,
-        MemoryCardType.PREFERENCE,
-        MemoryCardType.TODO,
         MemoryCardType.IMPLEMENTATION_DETAIL,
     }
 )
 _USER_TYPES = frozenset(
     {
+        MemoryCardType.DECISION,
         MemoryCardType.PREFERENCE,
         MemoryCardType.CONSTRAINT,
         MemoryCardType.TODO,
@@ -542,6 +538,7 @@ def _build_card(
     user_entities: list[str],
     session_id: str,
     turn_hash: str,
+    source_role: str = "user",
 ) -> MemoryCard:
     summary = _WHITESPACE_RE.sub(" ", sentence).strip()
     if len(summary) > _MAX_SUMMARY_CHARS:
@@ -588,6 +585,7 @@ def _build_card(
         confidence=confidence,
         source_session_id=session_id or "",
         source_turn_hash=turn_hash,
+        source_role=source_role,
     )
 
 
@@ -603,9 +601,9 @@ def extract_memory_cards(
 
     Pure, deterministic, best-effort. ``None``/non-string inputs are handled
     gracefully (return ``[]`` rather than crash). Cards are deduplicated by
-    ``card_id`` within the turn and capped at ``max_cards``. Assistant
-    sentences are processed first (source of truth), so under the cap
-    assistant-derived cards take priority.
+    ``card_id`` within the turn and capped at ``max_cards``. User-origin
+    durable signals take priority; assistant-only text is limited to
+    non-authoritative implementation/logistics context.
     """
     max_cards = max(0, int(max_cards or 0))
     max_chars = max(1, int(max_chars or 1))
@@ -623,10 +621,12 @@ def extract_memory_cards(
     cards: list[MemoryCard] = []
     seen_ids: set[str] = set()
 
-    # Assistant first (source of truth), then user.
-    for text, allowed in (
-        (assistant_text, _ASSISTANT_TYPES),
-        (user_text, _USER_TYPES),
+    # User-origin durable signals win. Assistant text is limited to
+    # non-authoritative implementation/logistics context so the agent cannot
+    # turn its own proposal into a durable user preference/decision.
+    for text, allowed, source_role in (
+        (user_text, _USER_TYPES, "user"),
+        (assistant_text, _ASSISTANT_TYPES, "assistant"),
     ):
         if not text:
             continue
@@ -638,7 +638,7 @@ def extract_memory_cards(
             if card_type is None:
                 continue
             card = _build_card(
-                card_type, sentence, user_entities, session_id, turn_hash
+                card_type, sentence, user_entities, session_id, turn_hash, source_role
             )
             if card.card_id in seen_ids:
                 continue
@@ -677,6 +677,7 @@ def format_memory_cards_for_sync(
         parts = [
             f"- type: {card.type}",
             f"  card_id: {card.card_id}",
+            f"  source_role: {card.source_role}",
             f"  status: {card.status}",
             f"  title: {card.title}",
             f"  summary: {card.summary}",
@@ -787,6 +788,8 @@ def parse_memory_cards_from_text(text: object) -> list[ParsedMemoryCard]:
                     current.type = value
                 elif key == "card_id":
                     current.card_id = value
+                elif key == "source_role":
+                    current.source_role = value
                 elif key == "status":
                     current.status = value
                 elif key == "title":

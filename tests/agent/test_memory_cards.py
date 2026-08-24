@@ -47,9 +47,9 @@ def _types(cards):
 
 def test_decision_extraction_english():
     cards = extract_memory_cards(
-        "which approval UX should we use?",
         "We decided to use compact inline approval cards with Approve/Reject "
         "buttons. This is final.",
+        "Got it.",
     )
     assert MemoryCardType.DECISION in _types(cards)
     decision = next(c for c in cards if c.type == MemoryCardType.DECISION)
@@ -58,8 +58,8 @@ def test_decision_extraction_english():
 
 def test_decision_extraction_chinese():
     cards = extract_memory_cards(
-        "审批用什么方案？",
         "我们最终决定就用紧凑型内联审批卡片。",
+        "好的。",
     )
     assert MemoryCardType.DECISION in _types(cards)
 
@@ -82,25 +82,24 @@ def test_preference_extraction_chinese():
 
 def test_todo_extraction():
     cards = extract_memory_cards(
-        "anything left?",
-        "Next step is to wire the cache invalidation; we still need to add "
-        "tests for the queue path.",
+        "Next step is to wire the cache invalidation and add tests.",
+        "ok",
     )
     assert MemoryCardType.TODO in _types(cards)
 
 
 def test_constraint_extraction():
     cards = extract_memory_cards(
-        "any rules I should know?",
         "The worker must not log raw user text and cannot block the turn.",
+        "ok",
     )
     assert MemoryCardType.CONSTRAINT in _types(cards)
 
 
 def test_constraint_extraction_chinese():
     cards = extract_memory_cards(
-        "有什么限制？",
         "必须保证不能阻塞用户回合。",
+        "好的。",
     )
     assert MemoryCardType.CONSTRAINT in _types(cards)
 
@@ -118,9 +117,9 @@ def test_dotted_identifiers_and_paths_are_not_split_into_fragments():
     # Regression: a `.` inside a file path / dotted name / URL must not be
     # treated as a sentence boundary (it would spawn garbled fragment cards).
     cards = extract_memory_cards(
-        "ok",
         "We decided to use queue_prefetch_all in agent/memory_manager.py and "
         "the MemoryManager class.",
+        "ok",
     )
     decisions = [c for c in cards if c.type == MemoryCardType.DECISION]
     assert len(decisions) == 1
@@ -132,8 +131,8 @@ def test_dotted_identifiers_and_paths_are_not_split_into_fragments():
 
 def test_url_with_dots_not_fragmented():
     cards = extract_memory_cards(
-        "ok",
         "We decided to call api.example.com for the cache lookup. This is final.",
+        "ok",
     )
     decisions = [c for c in cards if c.type == MemoryCardType.DECISION]
     assert decisions
@@ -153,8 +152,8 @@ def test_implementation_detail_natural_phrasing():
 
 def test_open_question_extraction():
     cards = extract_memory_cards(
-        "anything unresolved?",
         "One open question remains: the mobile layout is still TBD.",
+        "ok",
     )
     assert MemoryCardType.OPEN_QUESTION in _types(cards)
     oq = next(c for c in cards if c.type == MemoryCardType.OPEN_QUESTION)
@@ -282,9 +281,9 @@ def test_logistics_plan_strips_memory_context_and_does_not_leak():
 
 def test_memory_context_blocks_are_stripped():
     cards = extract_memory_cards(
-        "ok",
         "We decided to use Foo. "
         "<memory-context>secret recalled text decided to use Bar</memory-context>",
+        "ok",
     )
     blob = " ".join(c.summary for c in cards) + " ".join(
         " ".join(c.entities) for c in cards
@@ -326,7 +325,7 @@ def test_max_cards_respected():
 
 
 def test_max_cards_zero_returns_empty():
-    cards = extract_memory_cards("we decided to use Foo", "final decision", max_cards=0)
+    cards = extract_memory_cards("We decided to use Foo", "final decision", max_cards=0)
     assert cards == []
 
 
@@ -340,13 +339,13 @@ def test_max_chars_respected_truncates_processed_text():
 
 def test_summaries_are_bounded():
     long_decision = "We decided to use " + ("a very long phrase " * 60) + "."
-    cards = extract_memory_cards("ok", long_decision)
+    cards = extract_memory_cards(long_decision, "ok")
     assert cards
     assert all(len(c.summary) <= 240 for c in cards)
 
 
 def test_card_id_is_deterministic():
-    args = ("which UX?", "We decided to use compact cards. This is final.")
+    args = ("We decided to use compact cards. This is final.", "Got it.")
     first = extract_memory_cards(*args, session_id="s1")
     second = extract_memory_cards(*args, session_id="s1")
     assert [c.card_id for c in first] == [c.card_id for c in second]
@@ -354,7 +353,7 @@ def test_card_id_is_deterministic():
 
 
 def test_card_id_changes_with_session():
-    args = ("which UX?", "We decided to use compact cards. This is final.")
+    args = ("We decided to use compact cards. This is final.", "Got it.")
     a = extract_memory_cards(*args, session_id="s1")
     b = extract_memory_cards(*args, session_id="s2")
     assert a and b
@@ -367,14 +366,14 @@ def test_duplicate_sentences_within_turn_are_deduped():
         "We decided to use the compact cards. "
         "We decided to use the compact cards."
     )
-    cards = extract_memory_cards("ok", repeated)
+    cards = extract_memory_cards(repeated, "ok")
     decisions = [c for c in cards if c.type == MemoryCardType.DECISION]
     assert len(decisions) == 1
 
 
 def test_source_turn_hash_does_not_expose_raw_text():
     cards = extract_memory_cards(
-        "secretuserphrase", "We decided to use secretassistantphrase finally."
+        "secretuserphrase decided to use compact cards finally.", "secretassistantphrase"
     )
     assert cards
     for c in cards:
@@ -383,14 +382,57 @@ def test_source_turn_hash_does_not_expose_raw_text():
         assert len(c.source_turn_hash) <= 32
 
 
+
+def test_user_origin_priority_and_source_role():
+    cards = extract_memory_cards(
+        "I prefer dark mode. We implement the cache in Redis.",
+        "We decided to use dark mode. We implement the queue in Redis.",
+        max_cards=4,
+    )
+    by_type = {card.type: card for card in cards}
+    assert by_type[MemoryCardType.PREFERENCE].source_role == "user"
+    assert by_type[MemoryCardType.IMPLEMENTATION_DETAIL].source_role == "assistant"
+    assert MemoryCardType.DECISION not in {card.type for card in cards}
+
+
+def test_assistant_only_durable_card_types_are_limited():
+    cards = extract_memory_cards(
+        "ok",
+        "We decided to use compact cards. Next step is to add tests. "
+        "The worker must not block. We implement the cache in Redis. "
+        "One open question: rollout timing.",
+        max_cards=10,
+    )
+    assert {card.type for card in cards} == {MemoryCardType.IMPLEMENTATION_DETAIL}
+    assert cards[0].source_role == "assistant"
+
+
+def test_format_includes_source_role():
+    cards = extract_memory_cards("I prefer dark mode.", "ok")
+    formatted = format_memory_cards_for_sync(cards)
+    assert "source_role: user" in formatted
+
+
+def test_parse_includes_source_role():
+    parsed = parse_memory_cards_from_text(
+        "<structured-memory-cards>\n"
+        "- type: preference\n"
+        "  card_id: ID1\n"
+        "  source_role: user\n"
+        "</structured-memory-cards>"
+    )
+    assert len(parsed) == 1
+    assert parsed[0].source_role == "user"
+
+
 def test_unicode_preserved_safely():
     cards = extract_memory_cards(
         "我喜欢简洁的设计。",
-        "我们最终决定就用紧凑型卡片，按钮顺序是 Approve、Reject。",
+        "好的。",
     )
     assert cards
     summaries = " ".join(c.summary for c in cards)
-    assert "紧凑型卡片" in summaries or "决定" in summaries
+    assert "简洁" in summaries
 
 
 # ---------------------------------------------------------------------------
@@ -511,7 +553,7 @@ def test_memorycard_supports_supersession_fields():
 
 def test_pr4_card_defaults_keep_supersession_empty():
     # Backward compat: a card built the PR4 way has empty supersession fields.
-    cards = extract_memory_cards("ok", "We decided to use Foo. This is final.")
+    cards = extract_memory_cards("We decided to use Foo. This is final.", "ok")
     assert cards
     for c in cards:
         assert c.supersedes == []

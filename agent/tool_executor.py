@@ -630,6 +630,18 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             # callbacks, checkpointing, activity mutation, and real execution.
             pass
         # Reset nudge counters when the relevant tool is actually used
+        elif function_name == "experience_decision":
+            from tools.experience_decision_tool import experience_decision_tool
+
+            function_result = experience_decision_tool(
+                function_args,
+                runtime=getattr(agent, "_decision_turn", None),
+            )
+            tool_duration = time.time() - tool_start_time
+            if agent._should_emit_quiet_tool_messages():
+                agent._vprint(
+                    f"  {_get_cute_tool_message_impl('experience_decision', function_args, tool_duration, result=function_result)}"
+                )
         elif function_name == "memory":
             agent._turns_since_memory = 0
         elif function_name == "skill_manage":

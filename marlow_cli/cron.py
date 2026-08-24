@@ -22,7 +22,7 @@ from marlow_cli.colors import Colors, color
 # the API gateway logs and report restart events").
 _GATEWAY_LIFECYCLE_PATTERNS = re.compile(
     r"(?i)"
-    r"(marlow\s+gateway\s+(restart|stop|start))"
+    r"(?:marlow|hermes)\s+gateway\s+(restart|stop|start)"
     r"|(launchctl\s+(kickstart|unload|load|stop|restart)\s+.*marlow)"
     r"|(systemctl\s+(restart|stop|start)\s+.*marlow)"
     r"|(p?kill\s+.*marlow.*gateway)"

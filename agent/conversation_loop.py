@@ -301,7 +301,13 @@ def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[List
         )
 
 
-def _recall_one_subquery(manager, subquery: str, sid: str) -> str:
+def _recall_one_subquery(
+    manager,
+    subquery: str,
+    sid: str,
+    provider: str | None = None,
+    base_url: str | None = None,
+) -> str:
     """Queue-then-prefetch a single subquery synchronously.
 
     Queue and prefetch use the *identical* subquery and the same session id,
@@ -309,10 +315,15 @@ def _recall_one_subquery(manager, subquery: str, sid: str) -> str:
     for this exact subquery/scope.
     """
     manager.queue_prefetch_all(subquery, session_id=sid)
-    return manager.prefetch_all(subquery, session_id=sid) or ""
+    kwargs = {"session_id": sid}
+    if provider:
+        kwargs["provider"] = provider
+        if base_url:
+            kwargs["base_url"] = base_url
+    return manager.prefetch_all(subquery, **kwargs) or ""
 
 
-def _recall_multi_query(agent, raw_query: str, sid: str, recent_messages) -> str:
+def _recall_multi_query(agent, raw_query: str, sid: str, recent_messages, provider: str | None = None, base_url: str | None = None) -> str:
     """Deterministic multi-query recall: plan → per-subquery retrieve → merge.
 
     Builds the subquery plan via the recall query builder (always, regardless
@@ -346,7 +357,13 @@ def _recall_multi_query(agent, raw_query: str, sid: str, recent_messages) -> str
     for idx, subquery in enumerate(subqueries):
         started = time.monotonic()
         try:
-            result = _recall_one_subquery(manager, subquery, sid)
+            result = _recall_one_subquery(
+                manager,
+                subquery,
+                sid,
+                provider=provider,
+                base_url=base_url,
+            )
         except Exception:
             result = ""
         latency_ms = int((time.monotonic() - started) * 1000)
@@ -479,6 +496,7 @@ def run_conversation(
     # Never carry a prior turn's retrieval into this invocation. Unsupported
     # origins and disabled modes leave this as None without opening the store.
     agent._experience_turn = None
+    agent._decision_turn = None
 
     # Store stream callback for _interruptible_api_call to pick up
     agent._stream_callback = stream_callback
@@ -854,10 +872,14 @@ def run_conversation(
                 _memory_settings.get("consolidation", {})
                 if isinstance(_memory_settings, dict) else {}
             )
-            if isinstance(_consolidation_settings, dict) and _consolidation_settings.get("enabled"):
+            if (
+                isinstance(_consolidation_settings, dict)
+                and _consolidation_settings.get("enabled")
+                and _consolidation_settings.get("legacy_recall_enabled") is True
+            ):
                 from agent.memory_consolidation_runner import retrieve_consolidated_memory
                 _scope_type = "user" if getattr(agent, "_user_id", "") else "profile"
-                _scope_id = getattr(agent, "_user_id", "") or getattr(agent, "session_id", "") or "default"
+                _scope_id = getattr(agent, "_user_id", "") or "local-owner"
                 _consolidated_prefetch_cache = retrieve_consolidated_memory(
                     scope_id=str(_scope_id), scope_type=_scope_type,
                     query=_raw_query_global,
@@ -881,8 +903,15 @@ def run_conversation(
                 # Multi-query recall: expand into a deterministic subquery plan
                 # and retrieve each subquery safely (queue-then-prefetch per
                 # subquery), then merge/dedupe into one memory-context block.
+                _main_provider = getattr(agent, "provider", "") or None
+                _main_base_url = getattr(agent, "base_url", "") or None if _main_provider else None
                 _ext_prefetch_cache = _recall_multi_query(
-                    agent, _raw_query, _sid, messages
+                    agent,
+                    _raw_query,
+                    _sid,
+                    messages,
+                    provider=_main_provider,
+                    base_url=_main_base_url,
                 )
             else:
                 # Single-query recall (PR1 raw query / PR2 enriched query).
@@ -921,9 +950,16 @@ def run_conversation(
                     )
                 if _recall_query:
                     agent._memory_manager.queue_prefetch_all(_recall_query, session_id=_sid)
+                    _prefetch_kwargs = {"session_id": _sid}
+                    _main_provider = getattr(agent, "provider", "") or None
+                    if _main_provider:
+                        _main_base_url = getattr(agent, "base_url", "") or None
+                        _prefetch_kwargs["provider"] = _main_provider
+                        if _main_base_url:
+                            _prefetch_kwargs["base_url"] = _main_base_url
                     _ext_prefetch_cache = agent._memory_manager.prefetch_all(
                         _recall_query,
-                        session_id=_sid,
+                        **_prefetch_kwargs,
                     ) or ""
                     # Apply superseded-card suppression in the single-query path
                     # too. The PR5 filter previously ran ONLY inside
@@ -1046,7 +1082,16 @@ def run_conversation(
     # origin, raw-input availability, global mode, project policy, and scope in
     # that order; any failure leaves the user's normal task path untouched.
     try:
-        from agent.experience.runtime import prepare_experience_turn
+        from agent.experience.runtime import (
+            prepare_decision_capture_turn,
+            prepare_experience_turn,
+        )
+
+        agent._decision_turn = prepare_decision_capture_turn(
+            agent,
+            raw_user_message=raw_user_message,
+            turn_origin=turn_origin,
+        )
 
         agent._experience_turn = prepare_experience_turn(
             agent,
@@ -1059,6 +1104,7 @@ def run_conversation(
             type(_experience_error).__name__,
         )
         agent._experience_turn = None
+        agent._decision_turn = None
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         # Reset per-turn checkpoint dedup so each iteration can take one snapshot

@@ -202,9 +202,9 @@ _TOOL_STUBS = {
     ),
     "terminal": (
         "terminal",
-        "command: str, timeout: int = None, workdir: str = None",
+        "command: str, timeout: int = None, workdir: str = None, purpose: str = '', approval_plan: object = None, intent_grant_id: str = ''",
         '"""Run a shell command (foreground only). Returns dict with "output" and "exit_code"."""',
-        '{"command": command, "timeout": timeout, "workdir": workdir}',
+        '{"command": command, "timeout": timeout, "workdir": workdir, "purpose": purpose, "approval_plan": approval_plan, "intent_grant_id": intent_grant_id}',
     ),
 }
 
@@ -1597,7 +1597,7 @@ _TOOL_DOC_LINES = [
      "  patch(path: str, old_string: str, new_string: str, replace_all: bool = False) -> dict\n"
      "    Replaces old_string with new_string in the file."),
     ("terminal",
-     "  terminal(command: str, timeout=None, workdir=None) -> dict\n"
+     "  terminal(command: str, timeout=None, workdir=None, purpose='', approval_plan: object = None, intent_grant_id: str = '') -> dict\n"
      "    Foreground only (no background/pty). Returns {\"output\": \"...\", \"exit_code\": N}"),
 ]
 

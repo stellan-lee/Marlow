@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent.experience.models import EgressPolicy, LessonBody
+from agent.experience.models import DecisionBody, DecisionSourceType, EgressPolicy, LessonBody
 from agent.experience.runtime import (
     ExperienceMode,
     TurnOrigin,
@@ -61,6 +61,17 @@ def _seed_active_local_lesson(home: Path, repository: Path) -> str:
         return lesson["id"]
 
 
+def _active_decision_authority(source_hash: str) -> object:
+    from agent.experience.authority import DecisionTurnAuthority
+
+    return DecisionTurnAuthority(
+        source_turn_id="turn-runtime-decision",
+        source_session_id="session-runtime",
+        raw_user_text_hash=source_hash,
+        explicit_remember_grant=True,
+    )
+
+
 @pytest.mark.parametrize(
     ("turn_origin", "agent_identity"),
     [
@@ -113,7 +124,7 @@ def test_prepare_retrieves_once_and_builds_local_assist_context(
                 "mode": "assist",
                 "max_retrieved_items": 3,
                 "max_injected_chars": 1_500,
-                "min_retrieval_confidence": 0.55,
+                "min_retrieval_confidence": 0.0,
                 "telegram_recall": {
                     "enabled": True,
                     "owner_user_id": "12345",
@@ -171,7 +182,8 @@ def test_prepare_retrieves_once_and_builds_local_assist_context(
         turn_origin=turn_origin,
     )
     assert unrelated is not None
-    assert unrelated.result.items == ()
+    assert unrelated.result.decisions == ()
+    assert unrelated.result.lessons == ()
     assert unrelated.context_for_request(
         provider=agent.provider,
         base_url=agent.base_url,
@@ -232,7 +244,6 @@ def test_global_recall_mode_cannot_retrieve_from_capture_only_peer_project(
                 guidance="Never return this text without recall consent.",
                 rationale="Global rollout gates cannot grant another project access.",
             ),
-            confidence=0.95,
             sensitivity="local_only",
             egress_policy="local_only",
         )
@@ -246,7 +257,7 @@ def test_global_recall_mode_cannot_retrieve_from_capture_only_peer_project(
                 "mode": global_mode,
                 "max_retrieved_items": 3,
                 "max_injected_chars": 1_500,
-                "min_retrieval_confidence": 0.55,
+                "min_retrieval_confidence": 0.0,
             }
         },
     )
@@ -274,3 +285,98 @@ def test_global_recall_mode_cannot_retrieve_from_capture_only_peer_project(
             repository_id=assist_policy.repository_id,
             project_id=assist_policy.project_id,
         )["recall_allowed"] is True
+
+
+def test_prepare_retrieves_active_decision_context(tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "marlow-home"
+    repository = tmp_path / "repository"
+    home.mkdir()
+    repository.mkdir()
+    subprocess.run(
+        ["git", "init", "--quiet"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    resolver = ScopeResolver(str(home))
+    policy = resolver.make_git_policy(
+        repository,
+        repository,
+        capture_allowed=True,
+        recall_allowed=True,
+        injection_allowed=True,
+        max_egress_policy=EgressPolicy.LOCAL_ONLY,
+    )
+    with ExperienceStore(home / "state.db") as store:
+        store.upsert_scope_policy(
+            principal_id=policy.principal_id,
+            repository_id=policy.repository_id,
+            project_id=policy.project_id,
+            project_root_rel=policy.project_root_rel,
+            capture_allowed=policy.capture_allowed,
+            recall_allowed=policy.recall_allowed,
+            injection_allowed=policy.injection_allowed,
+            reflection_allowed=policy.reflection_allowed,
+            max_egress_policy=policy.max_egress_policy,
+        )
+        decision = store.create_decision(
+            principal_id=policy.principal_id,
+            scope_type="project",
+            scope_id=policy.project_id,
+            repository_id=policy.repository_id,
+            project_id=policy.project_id,
+            title="Compute reporting state at response time",
+            summary="Do not persist reporting_state.",
+            body=DecisionBody(
+                statement="reporting_state is computed at response time and is not persisted.",
+                rationale="The current repository policy treats it as derived state.",
+                source_type=DecisionSourceType.AGENT_PROPOSAL,
+                authority="unapproved",
+                effective_at=1.0,
+            ),
+            sensitivity="local_only",
+            egress_policy="local_only",
+            tags={"entity": ["reporting_state"]},
+            created_by="agent",
+            source_hash="b" * 64,
+        )
+        store.activate_decision(
+            decision["id"],
+            authority=_active_decision_authority("b" * 64),
+            transitioned_at=3.0,
+        )
+
+    monkeypatch.setenv("MARLOW_HOME", str(home))
+    monkeypatch.setattr(
+        "marlow_cli.config.load_config",
+        lambda: {
+            "experience": {
+                "mode": "assist",
+                "max_retrieved_items": 3,
+                "max_injected_chars": 1_500,
+                "min_retrieval_confidence": 0.0,
+            }
+        },
+    )
+    monkeypatch.setattr("agent.runtime_cwd.resolve_agent_cwd", lambda: repository)
+    agent = SimpleNamespace(
+        api_mode="chat_completions",
+        provider="ollama",
+        base_url="http://127.0.0.1:11434/v1",
+    )
+
+    turn = prepare_experience_turn(
+        agent,
+        raw_user_message="Should reporting_state be persisted?",
+        turn_origin=TurnOrigin.CLASSIC_CLI,
+    )
+
+    assert turn is not None
+    context = turn.context_for_request(
+        provider=agent.provider,
+        base_url=agent.base_url,
+    )
+    assert "<active-decision-context>" in context
+    assert "reporting_state is computed" in context
+    assert "<work-experience-context>" not in context

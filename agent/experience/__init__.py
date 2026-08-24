@@ -7,6 +7,13 @@ conversation, invokes a model, or mutates the agent loop.
 
 from agent.experience.models import (
     CreatedBy,
+    Decision,
+    DecisionAuthority,
+    DecisionBody,
+    DecisionMatch,
+    DecisionRevision,
+    DecisionSourceType,
+    DecisionStatus,
     EgressPolicy,
     Lesson,
     LessonBody,
@@ -23,6 +30,13 @@ from agent.experience.models import (
     ScopeType,
     Sensitivity,
     TagNamespace,
+)
+from agent.experience.anchors import AnchorValidationResult, validate_repository_anchor
+from agent.experience.authority import (
+    DecisionTurnAuthority,
+    decision_authority_from_text,
+    require_scope_not_broadened,
+    scope_is_equal_or_narrower,
 )
 from agent.experience.safety import (
     ExperienceEgressError,
@@ -44,7 +58,16 @@ from agent.experience.store import ExperienceStore
 
 __all__ = [
     "AmbiguousScopeError",
+    "AnchorValidationResult",
     "CreatedBy",
+    "Decision",
+    "DecisionAuthority",
+    "DecisionBody",
+    "DecisionMatch",
+    "DecisionRevision",
+    "DecisionSourceType",
+    "DecisionTurnAuthority",
+    "DecisionStatus",
     "EgressPolicy",
     "ExperienceEgressError",
     "ExperienceSafety",
@@ -74,4 +97,8 @@ __all__ = [
     "ScopeType",
     "Sensitivity",
     "TagNamespace",
+    "decision_authority_from_text",
+    "require_scope_not_broadened",
+    "scope_is_equal_or_narrower",
+    "validate_repository_anchor",
 ]

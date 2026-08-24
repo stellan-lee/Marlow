@@ -15652,7 +15652,7 @@ class GatewayRunner:
         telegram_digital_twin = _telegram_digital_twin_context(
             source,
             user_config,
-            getattr(self.config, "admin_approval", AdminApprovalConfig()),
+            getattr(getattr(self, "config", None), "admin_approval", AdminApprovalConfig()),
             is_super_admin_source=self._is_super_admin_source(source),
         )
 

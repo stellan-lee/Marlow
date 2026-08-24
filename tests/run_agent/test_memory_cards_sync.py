@@ -11,8 +11,8 @@ import pytest
 
 
 DECISION_TURN = (
-    "which approval UX should we use?",
     "We decided to use compact inline approval cards. This is final.",
+    "Got it.",
 )
 
 
@@ -24,6 +24,14 @@ def _bare_agent(*, structured_enabled=False):
     agent.session_id = "sess-card-1"
     agent._memory_post_turn_prefetch_enabled = False
     agent._memory_structured_cards_enabled = structured_enabled
+    agent._memory_structured_cards_max_per_turn = 5
+    agent._memory_structured_cards_max_chars = 2500
+    agent._memory_structured_cards_fallback_sync_turn_enabled = True
+    agent._memory_structured_conflict_resolution_enabled = False
+    agent._memory_structured_conflict_require_explicit_override = True
+    agent._memory_structured_conflict_min_entity_overlap = 1
+    agent._memory_structured_conflict_max_candidates = 8
+    agent._decision_turn = None
     return agent
 
 
@@ -141,7 +149,7 @@ def test_user_message_not_modified_by_cards():
     )
     # sync_all received the verbatim original user message.
     assert agent._memory_manager.sync_all.call_args.args[0] == user
-    assert user == "which approval UX should we use?"
+    assert user == DECISION_TURN[0]
 
 
 # ---------------------------------------------------------------------------
@@ -154,8 +162,8 @@ from agent.memory_cards import MemoryCard, format_memory_cards_for_sync  # noqa:
 # a decision keyword and explicit override language, with a quoted entity that
 # cleanly matches the prior card below.
 OVERRIDE_TURN = (
-    "what layout for the approval buttons?",
     'Final decision: use one row instead of two rows for "ApprovalButtons".',
+    "Got it.",
 )
 
 

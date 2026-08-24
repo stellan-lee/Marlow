@@ -87,6 +87,7 @@ class ExperienceRuntimeTurn:
     service: Any
     result: Any
     max_primary_lessons: int = 2
+    repository_root: str | None = None
 
     def context_for_request(
         self,
@@ -135,30 +136,155 @@ class ExperienceRuntimeTurn:
             ):
                 allowed.add((disclosure.item_id, disclosure.item_revision))
 
+        if hasattr(self.result, "decisions") and hasattr(self.result, "lessons"):
+            ranked = tuple(self.result.decisions) + tuple(self.result.lessons)
+        else:
+            ranked = tuple(getattr(self.result, "items", ()) or ())
         selected = tuple(
             item
-            for item in self.result.items
+            for item in ranked
             if (item.item_id, item.item_revision) in allowed
         )[: self.max_primary_lessons]
         if not selected:
             return "", 0
-        selected_result = replace(self.result, items=selected)
+        if hasattr(self.result, "decisions") and hasattr(self.result, "lessons"):
+            selected_decisions = tuple(
+                item for item in selected if hasattr(item, "body") and hasattr(item.body, "statement")
+            )
+            selected_lessons = tuple(item for item in selected if item not in selected_decisions)
+            selected_result = replace(
+                self.result,
+                decisions=selected_decisions,
+                lessons=selected_lessons,
+            )
+        else:
+            selected_result = replace(self.result, items=selected)
         # The concrete service performs a fresh DB-backed authorization check
         # using the identity of this exact request. Lightweight test/dry-run
         # formatters retain the small one-argument protocol.
         from agent.experience.service import ExperienceService
 
         if isinstance(self.service, ExperienceService):
-            context = self.service.format_context(
-                selected_result,
-                provider_trust_domain=identity.trust_domain,
-                provider_is_local=identity.is_local,
-            )
+            if hasattr(selected_result, "decisions") and hasattr(selected_result, "lessons"):
+                context = self.service.format_combined_context(
+                    selected_result,
+                    provider_trust_domain=identity.trust_domain,
+                    provider_is_local=identity.is_local,
+                    repository_root=self.repository_root,
+                )
+            else:
+                context = self.service.format_context(
+                    selected_result,
+                    provider_trust_domain=identity.trust_domain,
+                    provider_is_local=identity.is_local,
+                )
         else:
             context = self.service.format_context(selected_result)
         if not context:
             return "", 0
+        try:
+            service = self.service
+            if hasattr(service, "record_disclosure_events"):
+                service.record_disclosure_events(
+                    selected_result,
+                    retrieval_id=getattr(getattr(self.result, "diagnostic", None), "id", None),
+                    work_id=getattr(getattr(self.result, "diagnostic", None), "work_id", None),
+                    provider_trust_domain=identity.trust_domain,
+                    provider_is_local=identity.is_local,
+                )
+        except Exception:
+            pass
         return context, len(selected)
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionRuntimeTurn:
+    """Host-owned capture context kept outside model-visible tool arguments."""
+
+    authority: Any
+    scope: Any
+    policy: Any
+    repository_root: str | None
+    provider_trust_domain: str
+    provider_is_local: bool
+    source_session_id: str
+    source_turn_id: str
+
+
+def prepare_decision_capture_turn(
+    agent: Any,
+    *,
+    raw_user_message: str | None,
+    turn_origin: TurnOrigin | str | None,
+) -> DecisionRuntimeTurn | None:
+    """Build exact current-turn Decision authority without model input."""
+
+    origin = normalize_turn_origin(turn_origin)
+    if origin not in {TurnOrigin.CLASSIC_CLI, TurnOrigin.TELEGRAM}:
+        return None
+    if getattr(agent, "api_mode", None) == "codex_app_server":
+        return None
+    if not isinstance(raw_user_message, str) or not raw_user_message.strip():
+        return None
+    try:
+        from marlow_cli.config import load_config
+
+        loaded = load_config()
+        experience = loaded.get("experience", {}) if isinstance(loaded, Mapping) else {}
+        decisions = experience.get("decisions", {}) if isinstance(experience, Mapping) else {}
+        if not isinstance(decisions, Mapping):
+            return None
+        if decisions.get("enabled") is not True or decisions.get("explicit_capture_enabled") is not True:
+            return None
+        if normalize_experience_mode(experience.get("mode", "off")) is ExperienceMode.OFF:
+            return None
+        if origin is TurnOrigin.TELEGRAM and not _telegram_recall_authorized(agent, experience):
+            return None
+
+        from agent.experience.authority import decision_authority_from_text
+        from agent.experience.scope import ScopeResolver
+        from agent.experience.service import ExperienceService
+        from agent.experience.store import ExperienceStore
+        from agent.runtime_cwd import resolve_agent_cwd
+        from marlow_constants import get_marlow_home
+
+        identity = provider_identity(
+            provider=getattr(agent, "provider", None),
+            base_url=getattr(agent, "base_url", None),
+        )
+        if identity is None:
+            return None
+        home = Path(get_marlow_home()).expanduser().resolve()
+        with ExperienceStore(home / "state.db") as store:
+            resolved = ExperienceService(
+                store,
+                scope_resolver=ScopeResolver(str(home)),
+            ).resolve_scope(str(resolve_agent_cwd()))
+        if not bool(resolved.policy.capture_allowed):
+            return None
+        turn_id = f"turn_{uuid.uuid4().hex}"
+        session_id = str(getattr(agent, "session_id", None) or f"session_{uuid.uuid4().hex}")
+        authority = decision_authority_from_text(
+            turn_id,
+            session_id,
+            raw_user_message,
+        )
+        return DecisionRuntimeTurn(
+            authority=authority,
+            scope=resolved.as_ref(),
+            policy=resolved.policy,
+            repository_root=resolved.repository_root,
+            provider_trust_domain=identity.trust_domain,
+            provider_is_local=identity.is_local,
+            source_session_id=authority.source_session_id,
+            source_turn_id=authority.source_turn_id,
+        )
+    except Exception as exc:
+        logger.info(
+            "Decision capture preparation skipped safely: error_type=%s",
+            type(exc).__name__,
+        )
+        return None
 
 
 def normalize_turn_origin(value: TurnOrigin | str | None) -> TurnOrigin:
@@ -348,11 +474,14 @@ def prepare_experience_turn(
             )
             turn_id = f"turn_{uuid.uuid4().hex}"
             work_id = f"attempt_{uuid.uuid4().hex}"
-            result = service.retrieve(
+            result = service.retrieve_decisions_and_lessons(
                 query,
                 turn_id=turn_id,
                 work_id=work_id,
                 require_injection_allowed=effective_mode is ExperienceMode.ASSIST,
+                max_decisions=max_items,
+                max_lessons=max(0, max_items - max_items // 2),
+                repository_root=resolved.repository_root,
             )
 
         # Keep source attribution in the shared usage stream while retaining
@@ -363,7 +492,9 @@ def prepare_experience_turn(
 
             diagnostic = getattr(result, "diagnostic", None)
             retrieval_id = str(getattr(diagnostic, "id", "") or turn_id)
-            result_count = len(tuple(getattr(result, "items", ()) or ()))
+            result_count = len(tuple(getattr(result, "decisions", ()) or ())) + len(
+                tuple(getattr(result, "lessons", ()) or ())
+            )
             event_prefix = (
                 f"experience:{getattr(agent, 'session_id', None) or 'session'}:"
                 f"{retrieval_id}"
@@ -399,6 +530,8 @@ def prepare_experience_turn(
             policy=resolved.policy,
             service=service,
             result=result,
+            max_primary_lessons=max_items,
+            repository_root=resolved.repository_root,
         )
     except Exception as exc:
         # Metadata only: never log raw input, paths, provider URLs, or stored

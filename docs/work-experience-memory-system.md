@@ -1,8 +1,8 @@
 # Work Experience Memory for Marlow
 
-Status: Retrieval-first validation MVP implemented on 2026-07-18, with the
-Telegram guest digital-twin extension added on 2026-07-24. Automatic
-retrospective capture and closed-loop learning remain deferred.
+Status: Decision-aware Work Experience implemented on 2026-08-21.
+Automatic retrospective capture, work-record UI, gateway/TUI capture, shared/team
+experience, embeddings, and remote synchronization remain deferred.
 
 ## Implementation boundary (authoritative)
 
@@ -13,17 +13,17 @@ Implemented now:
 
 - profile-local experience tables in the existing `state.db`, behind
   `agent.experience.ExperienceStore`;
-- manually authored lesson candidates, explicit approval, immutable edits,
+- manually authored lesson and Decision candidates, explicit approval, immutable edits,
   lifecycle transitions, retraction, and best-effort purge;
 - Git-common-dir/project and non-Git workspace scope policies;
 - hard status, scope, confidence, sensitivity, provider-egress, and project
-  consent filters before lesson text is returned;
+  consent filters before lesson and Decision text is returned;
 - explainable structured/FTS5 recall with realistic term-overlap matching,
   shadow diagnostics, and bounded assist-mode injection;
 - classic foreground CLI, explicitly owner-bound Telegram DM integration, and
   opt-in guest recall for authorized non-super-admin Telegram sources, using a
   wire-only copy of the current user turn;
-- project-scoped MCP recall and lesson management through `marlow mcp serve`,
+- project-scoped MCP recall and lesson/Decision management through `marlow mcp serve`,
   with explicit tool annotations and external-boundary content filtering;
   unbound, unconfigured, and unsupported automatic-injection frontends fail
   closed;
@@ -38,12 +38,12 @@ Not implemented yet:
 - automatic lesson generation, novelty checks, contradiction resolution, or
   confidence updates;
 - model-based contextual applicability judgments and event-triggered recall;
-- proof that a recalled lesson changed behavior or caused an outcome;
-- first-class decisions, work-record UI, gateway/TUI capture, shared/team
-  experience, embeddings, or remote synchronization.
+- proof that a recalled lesson or Decision changed behavior or caused an outcome;
+- work-record UI, gateway/TUI capture, shared/team experience, embeddings, or
+  remote synchronization.
 
-`experience.mode: capture` exists only as a forward-compatible project-consent
-foundation in this MVP. It does not automatically record completed work.
+`experience.mode: capture` remains a forward-compatible project-consent
+foundation. It does not automatically record completed work.
 `why --last` reports candidate recall diagnostics; it does not claim that a
 lesson was injected, followed, or causally helpful.
 
@@ -71,24 +71,25 @@ that provider boundary.
 
 The MCP server cannot attest which model provider receives a tool result, so
 `experience_recall` treats its caller as an unknown remote provider. It returns
-only active lessons created with `--egress explicit_any_provider` under a
-project policy whose maximum egress is also `explicit_any_provider`.
+only active lessons and Decisions created with `--egress explicit_any_provider`
+under a project policy whose maximum egress is also `explicit_any_provider`.
 
 The same server exposes `experience_list`, `experience_show`,
-`experience_add`, `experience_approve`, `experience_edit`, and
-`experience_retract`. Every operation is fixed to the server process's current
-project. MCP-created candidates record `created_by=agent`, and lifecycle/edit
-events record `mcp-client` as their audit actor. List/show/mutation responses
-include lesson text only when assist mode plus project and item egress policy
+`experience_add`, `experience_approve`, `experience_edit`,
+`experience_supersede`, `experience_revoke`, and `experience_retract`. Every
+operation is fixed to the server process's current project. MCP-created
+candidates record `created_by=agent`, and lifecycle/edit events record
+`mcp-client` as their audit actor. List/show/mutation responses include lesson
+and Decision text only when assist mode plus project and item egress policy
 authorize disclosure to the unknown remote boundary; otherwise they return
 opaque management metadata. Physical purge and project-policy mutation remain
 CLI-only.
 
 `experience_recall` is annotated as a non-destructive mutation because it
 records a new text-free retrieval diagnostic. `experience_list` and
-`experience_show` are read-only; add/approve/edit are non-destructive
-mutations; retract is a destructive logical lifecycle change that retains
-inspectable history.
+`experience_show` are read-only; add/approve/edit/supersede/revoke are
+non-destructive mutations; retract is a destructive logical lifecycle change
+that retains inspectable history.
 
 ## Executive decision
 
@@ -96,30 +97,27 @@ Marlow should add a first-class, local **work experience** subsystem rather
 than stretching conversation memory, session search, or skills into a role
 they were not designed to fill.
 
-The recommended validation implementation is:
+The implemented validation boundary is:
 
 - a narrow `ExperienceStore` abstraction backed by first-class,
   non-cascading tables in the existing profile-scoped `state.db`;
-- a target information model with two durable experience types: **work
-  records** and **lessons**; continuing decisions remain a later, separate
-  authority model;
-- a much smaller MVP0 containing only manually seeded, user-approved lessons,
-  hard local scope, retrieval, bounded injection, retrieval diagnostics, and
-  governance;
-- automatic retrieval once per supported user turn, scoped by profile-local
-  owner, repository, and project/workspace;
+- durable lessons and canonical Decisions with authority, scope, lifecycle,
+  egress, repository-policy anchors, and retrieval diagnostics;
+- manually authored experience plus explicit Decision governance; automatic
+  work-record capture and reflection remain deferred;
+- retrieval once per supported user turn, scoped by profile-local owner,
+  repository, and project/workspace;
 - ephemeral injection into the current API user-message copy, preserving
   Marlow's prompt-cache invariant;
 - explicit `retrieved` diagnostics, while paired, externally verified outcomes
   remain the evidence needed to determine whether retrieval helped; and
-- a CLI-first inspection and governance surface.
+- CLI-first and MCP governance surfaces.
 
-Automatic work-record capture, tool-outcome ledgers, reflection, first-class
-decisions, and contradiction automation are the next milestone only if MVP0
-shows behavioral value. Embeddings, remote storage, raw transcript backfill,
-automatic skill generation, and gateway/group-chat capture remain out of
-scope. A separate `experience.db` is a future split option, not a prerequisite
-for testing the idea.
+Automatic work-record capture, tool-outcome ledgers, reflection, shared/team
+experience, embeddings, remote storage, raw transcript backfill, automatic
+skill generation, and gateway/group-chat capture remain out of scope. A
+separate `experience.db` is a future split option, not a prerequisite for this
+implementation.
 
 ## 1. Design intent
 
@@ -1216,79 +1214,80 @@ correctness.
 ### 10.1 MVP0: validate retrieval before capture
 
 MVP0 answers one question: **does a small set of approved, correctly scoped
-lessons improve later work?** Automatic once-per-turn retrieval supports the
-classic local CLI primary agent in normal Marlow runtime. Explicit MCP tools
-provide bounded retrieval and project-scoped lesson management to stdio clients
-under stricter external-boundary disclosure rules. One `run_conversation()`
-invocation is one work attempt for telemetry; follow-ups are separate attempts.
+lessons and Decisions improve later work without stale, unsafe, or overbroad
+injection?** Automatic once-per-turn retrieval supports the classic local CLI
+primary agent in normal Marlow runtime. Explicit MCP tools provide bounded
+retrieval and project-scoped lesson/Decision management to stdio clients under
+stricter external-boundary disclosure rules. One `run_conversation()` invocation
+is one work attempt for telemetry; follow-ups are separate attempts.
 
 Modes:
 
 - `off` (default): no capture or retrieval;
-- `capture`: consent foundation/manual governance only in MVP0; no automatic
-  retrospective runs;
-- `shadow`: rank approved lessons and record safe match metadata, but inject
-  nothing; and
-- `assist`: inject approved lessons after per-request authorization.
+- `capture`: consent foundation/manual governance and explicit Decision
+  capture; no automatic retrospective runs;
+- `shadow`: rank approved lessons and active Decisions and record safe match
+  metadata, but inject nothing; and
+- `assist`: inject approved lessons and active Decisions after per-request
+  authorization.
 
-Lessons are manually added or loaded from controlled evaluation fixtures and
-explicitly approved. MVP0 does **not** automatically capture work records,
-reflect on conversations, extract decisions, observe raw tool results, resolve
-contradictions, or promote skills. It also excludes TUI governance, gateway,
-groups, subagent learning, `codex_app_server`, embeddings, remote sync,
+Lessons and Decisions are manually added, explicitly approved, or imported from
+controlled evaluation fixtures. MVP0 does **not** automatically capture work
+records, reflect on conversations, extract decisions, observe raw tool results,
+resolve contradictions, or promote skills. It also excludes TUI governance,
+gateway, groups, subagent learning, `codex_app_server`, embeddings, remote sync,
 dashboard UI, historical backfill, portable export/import, and profile-wide
 automatic sharing.
 
-MVP0 includes only:
+MVP0 includes:
 
 1. lesson CRUD and approval;
-2. local-owner + repository + project scope resolution;
-3. per-project recall/injection/provider-egress consent;
-4. deterministic FTS5/metadata retrieval with match reasons;
-5. bounded ephemeral injection;
-6. `retrieved` diagnostics with explicit non-causality wording; and
-7. MCP recall plus list/show/add/approve/edit/retract management fixed to the
-   server process's current project, with purge and policy changes excluded.
+2. Decision add/propose/approve/edit/supersede/revoke/reapprove/relate/import-policy;
+3. local-owner + repository + project scope resolution;
+4. per-project recall/injection/provider-egress consent;
+5. repository-policy anchor validation and invalidation;
+6. deterministic FTS5/trigram metadata retrieval with match reasons;
+7. bounded ephemeral injection;
+8. `retrieved` diagnostics with explicit non-causality wording; and
+9. MCP recall plus list/show/add/approve/edit/supersede/revoke/related management
+   fixed to the server process's current project, with purge and policy changes
+   excluded.
 
-The implementation is ready for a paired behavioral evaluation, but the
-evaluation corpus/harness is not part of this code slice.
-
-This deliberately tests retrieval without first building automatic learning.
+The paired behavioral evaluation harness is included as
+`scripts/evaluate_experience_memory.py`.
 
 ### 10.2 Post-MVP roadmap
 
-Proceed only if MVP0 passes its behavioral gate:
+Proceed with automatic learning only after the behavioral gate passes:
 
 1. Add the typed raw/synthetic turn-input envelope and common all-exit
    `_finish_turn` contract.
 2. Add a transient sanitized action/outcome ledger and deterministic work gate.
 3. With separate consent, add bounded synchronous reflection that writes
    proposed work records/lessons only; measure review burden and precision.
-4. Add first-class continuing decisions and live policy-anchor invalidation.
-5. Add observed action conformance and conservative contradiction handling.
-6. Consider TUI governance, delegation correlation, a dedicated database, or
+4. Add observed action conformance and conservative contradiction handling.
+5. Consider TUI governance, delegation correlation, a dedicated database, or
    remote synchronization only when individually justified.
 
 ### 10.3 Exact MVP0 code surface
 
 New components:
 
-- `agent/experience/models.py` — approved lesson, scope, retrieval, and event
-  validation;
-- `agent/experience/store.py` — a facade for experience tables/search in the
-  active `state.db`;
+- `agent/experience/models.py` — approved lesson, Decision, scope, retrieval, authority, and event validation;
+- `agent/experience/store.py` — a facade for experience tables, Decision lifecycle, repository anchors, and search in the active `state.db`;
 - `agent/experience/scope.py` — `local-owner`, logical runtime cwd, Git common
   directory, and explicit project-policy resolution;
 - `agent/experience/safety.py` — forced redaction, URL/path normalization,
   threat scanning, sensitivity, and provider-egress policy;
-- `agent/experience/service.py` — retrieve, rank, format, and maintain the
-  current turn's retrieval set;
+- `agent/experience/service.py` — retrieve, rank, format, and maintain the current turn's retrieval set for lessons and Decisions;
 - `agent/experience/runtime.py` — origin gating, provider identity, once-per-
   turn recall, fallback reauthorization, and wire-only injection;
 - `marlow_cli/experience.py` — `policy set`, `add`, `list`, `show`, `approve`,
-  `edit`, `retract`, `delete --purge`, and `why`;
+  `edit`, `supersede`, `revoke`, `reapprove`, `related`, `import-policy`,
+  `migrate consolidation`, `delete --purge`, `why`, `status`, `doctor`,
+  `rebuild-index`, and `prune`;
 - `agent/transports/work_experience_mcp.py` — fail-closed MCP recall and
-  project-scoped lesson management;
+  project-scoped lesson/Decision management;
 - `mcp_serve.py` — public server registration for the Work Experience tools;
   and
 - focused tests under `tests/agent/experience/`, `tests/marlow_cli/`, and
@@ -1307,8 +1306,9 @@ Existing modules changed:
 - `marlow_cli/main.py` — register the governance command.
 
 Experience is never double-written into `MemoryStore`, structured cards,
-skills, session search, Curator, or Journey. `MemoryManager` supplies only the
-shared internal-fence scrubber; it is not an experience persistence backend.
+skills, session search, Curator, Journey, or consolidation. `MemoryManager`
+supplies only the shared internal-fence scrubber; it is not an experience
+persistence backend.
 
 ### 10.4 Configuration sketch
 
@@ -1462,10 +1462,10 @@ latency, consent, and egress checks.
 
 ### Persistence and operations
 
-The validation release adds tables and FTS rows to `state.db`; manually curated
-lessons are small, and diagnostic TTL/caps bound growth. Existing local SQLite
-backups include them. Session exports/pruning remain unchanged, and portable
-experience export is absent. Best-effort physical purge can require an
+The release adds tables and FTS rows to `state.db`; manually curated lessons
+and Decisions are small, and diagnostic TTL/caps bound growth. Existing local
+SQLite backups include them. Session exports/pruning remain unchanged, and
+portable experience export is absent. Best-effort physical purge can require an
 exclusive checkpoint/vacuum maintenance window.
 
 ### Migration and rollback

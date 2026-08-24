@@ -86,6 +86,73 @@ def _search(store: ExperienceStore, *, query: str = "", tags=None):  # type: ign
     )
 
 
+
+
+def _seed_cjk_lessons(store: ExperienceStore) -> None:
+    store.upsert_scope_policy(
+        principal_id="local-owner",
+        repository_id="repo",
+        project_id="project",
+        project_root_rel=".",
+        recall_allowed=True,
+        injection_allowed=True,
+        max_egress_policy="explicit_any_provider",
+    )
+    lessons = [
+        ("lesson_cjk_phrase", "审批卡片", "审批卡片需要紧凑的内联流程。"),
+        ("lesson_cjk_substring", "队列重试", "SQLite 队列重试需要抖动。"),
+        ("lesson_cjk_two", "工单", "工单处理要保留来源。"),
+        ("lesson_mixed", "Redis缓存", "Redis缓存用于 API 限流。"),
+        ("lesson_irrelevant", "账单导出", "账单导出走异步任务。"),
+    ]
+    for item_id, title, summary in lessons:
+        store.create_lesson(
+            item_id=item_id,
+            principal_id="local-owner",
+            scope_type="project",
+            scope_id="project",
+            repository_id="repo",
+            project_id="project",
+            title=title,
+            summary=summary,
+            body={
+                "applies_when": "Chinese retrieval test",
+                "does_not_apply_when": None,
+                "guidance": summary,
+                "rationale": "Deterministic CJK test data.",
+            },
+            tags={"technology": ["sqlite"]},
+            sensitivity="normal",
+            egress_policy="explicit_any_provider",
+            producer_trust_domain="provider:a",
+        )
+        store.approve_lesson(item_id)
+
+
+def test_cjk_phrase_substring_two_char_and_mixed_retrieval(tmp_path: Path) -> None:
+    with ExperienceStore((tmp_path / "state.db").resolve()) as store:
+        _seed_cjk_lessons(store)
+        phrase = [item["id"] for item in _search(store, query="审批卡片")]
+        substring = [item["id"] for item in _search(store, query="队列重试")]
+        two_char = [item["id"] for item in _search(store, query="工单")]
+        mixed = [item["id"] for item in _search(store, query="Redis API")]
+        irrelevant = [item["id"] for item in _search(store, query="账单")]
+        assert phrase == ["lesson_cjk_phrase"]
+        assert substring == ["lesson_cjk_substring"]
+        assert two_char == ["lesson_cjk_two"]
+        assert mixed == ["lesson_mixed"]
+        assert irrelevant == []
+
+
+def test_retrieval_is_deterministic_and_bounded(tmp_path: Path) -> None:
+    with ExperienceStore((tmp_path / "state.db").resolve()) as store:
+        _seed_cjk_lessons(store)
+        first = [item["id"] for item in _search(store, query="审批 队列 Redis API 账单")]
+        second = [item["id"] for item in _search(store, query="审批 队列 Redis API 账单")]
+        assert first == second
+        assert len(first) <= 5
+
+
 def test_no_fts_runtime_uses_only_authorized_metadata(monkeypatch, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
     _disable_fts(monkeypatch)
     with ExperienceStore((tmp_path / "state.db").resolve()) as store:

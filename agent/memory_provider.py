@@ -34,7 +34,10 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
+
+if TYPE_CHECKING:
+    from agent.memory_types import MemoryCandidate, MemoryRecallRequest
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +106,19 @@ class MemoryProvider(ABC):
         per-session scoping can ignore it.
         """
         return ""
+
+    def recall_candidates(
+        self,
+        request: "MemoryRecallRequest",
+    ) -> Optional[Sequence["MemoryCandidate"]]:
+        """Return typed recall candidates, or ``None`` for legacy fallback.
+
+        Providers may override this optional PR 7 contract. Returning ``None``
+        tells ``MemoryManager`` to keep using ``prefetch()``; returning an empty
+        sequence is a typed recall miss and does not call the legacy method.
+        """
+
+        return None
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Queue a background recall for the NEXT turn.

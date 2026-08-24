@@ -3097,12 +3097,13 @@ class MarlowCLI:
         self._prompt_start_time: Optional[float] = None  # time.time() when turn started
         self._prompt_duration: float = 0.0  # frozen duration of last completed turn
         # Initialize SQLite session store early so /title works before first message
-        self._session_db = None
-        try:
-            from marlow_state import SessionDB
-            self._session_db = SessionDB()
-        except Exception as e:
-            logger.warning("Failed to initialize SessionDB — session will NOT be indexed for search: %s", e)
+        if not hasattr(self, "_session_db"):
+            self._session_db = None
+            try:
+                from marlow_state import SessionDB
+                self._session_db = SessionDB()
+            except Exception as e:
+                logger.warning("Failed to initialize SessionDB — session will NOT be indexed for search: %s", e)
 
         # Opportunistic state.db maintenance — runs at most once per
         # min_interval_hours, tracked via state_meta in state.db itself so
@@ -8520,7 +8521,7 @@ class MarlowCLI:
                     base_cmd,
                     user_instruction,
                     task_id=self.session_id,
-                    usage_db=self._session_db,
+                    usage_db=getattr(self, "_session_db", None),
                 )
                 if msg:
                     skill_name = skill_commands[base_cmd]["name"]

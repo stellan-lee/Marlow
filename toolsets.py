@@ -48,6 +48,8 @@ _MARLOW_CORE_TOOLS = [
     "text_to_speech",
     # Planning & memory
     "todo", "memory",
+    # Work Experience governance
+    "experience_decision",
     # Session history search
     "session_search",
     # Clarifying questions
