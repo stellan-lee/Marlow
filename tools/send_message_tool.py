@@ -118,11 +118,13 @@ SEND_MESSAGE_SCHEMA = {
     "name": "send_message",
     "description": (
         "Send a message to a connected messaging platform, or list available targets.\n\n"
-        "IMPORTANT: When the user asks to send to a specific channel or person "
-        "(not just a bare platform name), call send_message(action='list') FIRST to see "
-        "available targets, then send to the correct one.\n"
-        "If the user just says a platform name like 'send to telegram', send directly "
-        "to the home channel without listing first."
+        "This tool sends to a different conversation. Never use it to reply to the "
+        "current conversation; put current-conversation content in the assistant "
+        "response. When the user asks to send to a specific channel or person, call "
+        "send_message(action='list') FIRST to discover a concrete target. During an "
+        "interactive turn, a bare platform name is ambiguous and will be rejected. "
+        "Marlow will ask the initiating user to confirm the exact destination and "
+        "payload before sending."
     ),
     "parameters": {
         "type": "object",
@@ -134,7 +136,7 @@ SEND_MESSAGE_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'feishu:oc_xxx', or 'email:user@example.com'."
+                "description": "Delivery target. During an interactive turn, use a concrete target returned by action='list'; such as 'telegram:chat_id:thread_id', 'discord:channel_id:thread_id', 'slack:conversation_id:thread_ts', 'feishu:chat_id:thread_id', or 'email:user@example.com'. A bare platform name is ambiguous and will be rejected before sending."
             },
             "message": {
                 "type": "string",
@@ -156,6 +158,36 @@ def send_message_tool(args, **kw):
     return _handle_send(args)
 
 
+def _get_turn_context_for_send_message():
+    """Return the typed gateway turn context when available."""
+    try:
+        from gateway.turn_context import get_current_turn, ExecutionMode
+        turn = get_current_turn()
+        if turn is not None and turn.mode == ExecutionMode.INTERACTIVE:
+            return turn
+    except Exception:
+        pass
+    return None
+
+
+def _parse_target_identity(target: str):
+    """Parse a target into platform/chat/thread without home fallback."""
+    parts = target.split(":", 2)
+    platform_name = parts[0].strip().lower() if parts else ""
+    if not platform_name or len(parts) < 2:
+        return platform_name, None, None, False
+    target_ref = parts[1].strip()
+    thread_id = parts[2].strip() if len(parts) > 2 else None
+    if not target_ref:
+        return platform_name, None, None, False
+    if target_ref.lower() == "home":
+        return platform_name, None, thread_id, False
+    chat_id, parsed_thread_id, is_explicit = _parse_target_ref(platform_name, target_ref)
+    if is_explicit:
+        return platform_name, chat_id, parsed_thread_id or thread_id, True
+    return platform_name, None, thread_id, False
+
+
 def _handle_list():
     """Return formatted list of available messaging targets."""
     try:
@@ -172,30 +204,64 @@ def _handle_send(args):
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
 
-    parts = target.split(":", 1)
-    platform_name = parts[0].strip().lower()
-    target_ref = parts[1].strip() if len(parts) > 1 else None
-    chat_id = None
-    thread_id = None
+    turn = _get_turn_context_for_send_message()
+    interactive = turn is not None
+    target_ref = target.split(":", 1)[1].strip() if ":" in target else ""
+    platform_name, chat_id, thread_id, is_explicit = _parse_target_identity(target)
 
-    if target_ref:
-        chat_id, thread_id, is_explicit = _parse_target_ref(platform_name, target_ref)
-    else:
-        is_explicit = False
+    if not platform_name:
+        return json.dumps({"success": False, "policy_denied": True, "reason": "ambiguous_destination"})
 
-    # Resolve human-friendly channel names to numeric IDs
-    if target_ref and not is_explicit:
+    if interactive and not target_ref:
+        return json.dumps({"success": False, "policy_denied": True, "reason": "ambiguous_destination"})
+
+    # Resolve human-friendly channel names to numeric IDs when the model
+    # supplied a concrete non-home target. Bare platform names are rejected
+    # for interactive turns instead of falling back to home channels.
+    if target_ref.lower() == "home":
+        try:
+            from gateway.config import load_gateway_config, Platform
+            config = load_gateway_config()
+        except Exception as e:
+            return json.dumps(_error(f"Failed to load gateway config: {e}"))
+        home = config.get_home_channel(Platform(platform_name))
+        if home:
+            chat_id = home.chat_id
+            thread_id = thread_id or home.thread_id
+            is_explicit = True
+        elif interactive:
+            return json.dumps({
+                "success": False,
+                "policy_denied": True,
+                "reason": "ambiguous_destination",
+            })
+        else:
+            return tool_error(f"No home channel set for {platform_name} to determine where to send the message.")
+
+    if chat_id is None and thread_id is None and not is_explicit and target_ref:
         try:
             from gateway.channel_directory import resolve_channel_name
             resolved = resolve_channel_name(platform_name, target_ref)
             if resolved:
-                chat_id, thread_id, _ = _parse_target_ref(platform_name, resolved)
+                platform_name, chat_id, thread_id, is_explicit = _parse_target_identity(f"{platform_name}:{resolved}")
+            elif interactive:
+                return json.dumps({
+                    "success": False,
+                    "policy_denied": True,
+                    "reason": "ambiguous_destination",
+                })
             else:
                 return json.dumps({
                     "error": f"Could not resolve '{target_ref}' on {platform_name}. "
                     f"Use send_message(action='list') to see available targets."
                 })
         except Exception:
+            if interactive:
+                return json.dumps({
+                    "success": False,
+                    "policy_denied": True,
+                    "reason": "ambiguous_destination",
+                })
             return json.dumps({
                 "error": f"Could not resolve '{target_ref}' on {platform_name}. "
                 f"Try using a numeric channel ID instead."
@@ -210,6 +276,22 @@ def _handle_send(args):
         config = load_gateway_config()
     except Exception as e:
         return json.dumps(_error(f"Failed to load gateway config: {e}"))
+
+    if not interactive and not chat_id and not target_ref:
+        home = config.get_home_channel(Platform(platform_name))
+        if home:
+            chat_id = home.chat_id
+            thread_id = thread_id or home.thread_id
+            is_explicit = True
+        else:
+            home_env = _HOME_CHANNEL_ENV_OVERRIDES.get(
+                platform_name, f"{platform_name.upper()}_HOME_CHANNEL"
+            )
+            return json.dumps({
+                "error": f"No home channel set for {platform_name} to determine where to send the message. "
+                f"Either specify a channel directly with '{platform_name}:CHANNEL_NAME', "
+                f"or set a home channel via: marlow config set {home_env} <channel_id>"
+            })
 
     # Accept any platform name — built-in names resolve to their enum
     # member, plugin platform names create dynamic members via _missing_().
@@ -232,29 +314,10 @@ def _handle_send(args):
 
     media_files, cleaned_message = BasePlatformAdapter.extract_media(message)
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
-    mirror_text = cleaned_message.strip() or _describe_media_for_mirror(media_files)
 
-    used_home_channel = False
-    if not chat_id:
-        home = config.get_home_channel(platform)
-        if home:
-            chat_id = home.chat_id
-            used_home_channel = True
-        else:
-            home_env = _HOME_CHANNEL_ENV_OVERRIDES.get(
-                platform_name, f"{platform_name.upper()}_HOME_CHANNEL"
-            )
-            return json.dumps({
-                "error": f"No home channel set for {platform_name} to determine where to send the message. "
-                f"Either specify a channel directly with '{platform_name}:CHANNEL_NAME', "
-                f"or set a home channel via: marlow config set {home_env} <channel_id>"
-            })
-
-    duplicate_skip = _maybe_skip_cron_duplicate_send(platform_name, chat_id, thread_id)
-    if duplicate_skip:
-        return json.dumps(duplicate_skip)
-
-    # Slack: resolve user IDs (U...) to DM channel IDs via conversations.open
+    # Slack: resolve user IDs (U...) to DM channel IDs before route policy
+    # locks the destination. This keeps interactive confirmation bound to the
+    # actual conversation ID, not a model-facing user ID.
     if platform_name == "slack" and chat_id and chat_id.startswith("U"):
         try:
             import aiohttp
@@ -276,6 +339,32 @@ def _handle_send(args):
         except Exception as e:
             return json.dumps({"error": f"Failed to open Slack DM: {e}"})
 
+    if turn is not None:
+        from gateway.turn_context import ConversationRoute
+        from gateway.outbound import OutboundPolicy, OutboundKind
+        destination = ConversationRoute.from_parts(platform, chat_id, thread_id)
+        decision = OutboundPolicy.evaluate(turn, OutboundKind.CROSS_CONVERSATION, destination)
+        if not decision.allowed:
+            if decision.reason == "same_origin_reply":
+                return json.dumps({
+                    "error": "same_origin_reply",
+                    "message": "Do not use send_message to reply to the current conversation; place the content in the final response.",
+                })
+            return json.dumps({"success": False, "policy_denied": True, "reason": decision.reason})
+        if decision.requires_confirmation:
+            return _handle_interactive_cross_conversation_send(
+                turn=turn,
+                platform=platform,
+                destination=destination,
+                cleaned_message=cleaned_message,
+                media_files=media_files,
+                force_document=force_document_attachments,
+            )
+
+    duplicate_skip = _maybe_skip_cron_duplicate_send(platform_name, chat_id, thread_id)
+    if duplicate_skip:
+        return json.dumps(duplicate_skip)
+
     try:
         from model_tools import _run_async
         result = _run_async(
@@ -289,28 +378,6 @@ def _handle_send(args):
                 force_document=force_document_attachments,
             )
         )
-        if used_home_channel and isinstance(result, dict) and result.get("success"):
-            result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
-
-        # Mirror the sent message into the target's gateway session
-        if isinstance(result, dict) and result.get("success") and mirror_text:
-            try:
-                from gateway.mirror import mirror_to_session
-                from gateway.session_context import get_session_env
-                source_label = get_session_env("MARLOW_SESSION_PLATFORM", "cli")
-                user_id = get_session_env("MARLOW_SESSION_USER_ID", "") or None
-                if mirror_to_session(
-                    platform_name,
-                    chat_id,
-                    mirror_text,
-                    source_label=source_label,
-                    thread_id=thread_id,
-                    user_id=user_id,
-                ):
-                    result["mirrored"] = True
-            except Exception:
-                pass
-
         if isinstance(result, dict) and "error" in result:
             result["error"] = _sanitize_error_text(result["error"])
         return json.dumps(result)
@@ -390,6 +457,132 @@ def _get_cron_auto_delivery_target():
         "chat_id": chat_id,
         "thread_id": thread_id,
     }
+
+
+def _handle_interactive_cross_conversation_send(
+    *,
+    turn,
+    platform,
+    destination,
+    cleaned_message: str,
+    media_files,
+    force_document: bool = False,
+) -> str:
+    """Confirm and send an interactive cross-conversation payload once."""
+    from gateway import outbound as outbound_mod, pending_delivery as pending_delivery_mod
+    from gateway.outbound import OutboundEnvelope, OutboundKind
+    from gateway.pending_delivery import PendingDelivery
+
+    if turn.actor is None or not turn.session_key:
+        return json.dumps({
+            "success": False,
+            "policy_denied": True,
+            "reason": "missing_actor_or_session",
+        })
+
+    request_id = pending_delivery_mod.make_request_id()
+    try:
+        attachments = tuple(
+            pending_delivery_mod.stage_attachment(path, request_id)
+            for path, _is_voice in media_files or []
+        )
+    except Exception as exc:
+        pending_delivery_mod.cleanup_delivery_files(request_id)
+        return json.dumps(_error(f"Failed to stage delivery attachment: {exc}"))
+
+    envelope = OutboundEnvelope(
+        delivery_id=request_id,
+        kind=OutboundKind.CROSS_CONVERSATION,
+        destination=destination,
+        text=cleaned_message,
+        attachments=attachments,
+        hints=turn.hints,
+        turn_id=turn.turn_id,
+        grant_id=request_id,
+    )
+    digest = pending_delivery_mod.payload_digest(cleaned_message, attachments)
+    entry = PendingDelivery(
+        request_id=request_id,
+        turn_id=turn.turn_id,
+        session_key=turn.session_key,
+        origin=turn.origin,
+        actor=turn.actor,
+        destination=destination,
+        payload_digest=digest,
+        envelope=envelope,
+        created_at=time.time(),
+        expires_at=time.time() + pending_delivery_mod._DEFAULT_TIMEOUT_SECONDS,
+    )
+
+    confirmation_result = pending_delivery_mod.request_confirmation(entry)
+    if not confirmation_result or not confirmation_result.get("success") or not confirmation_result.get("approved"):
+        return json.dumps(confirmation_result or {
+            "success": False,
+            "cancelled": True,
+            "delivery_id": request_id,
+            "message": "Delivery confirmation was not approved.",
+        })
+
+    authorized_envelope = pending_delivery_mod.claim(request_id)
+    if authorized_envelope is None:
+        pending_delivery_mod.finish(
+            request_id,
+            state=pending_delivery_mod.PendingDeliveryState.FAILED,
+            result={"success": False, "error": "delivery_grant_claim_failed"},
+        )
+        return json.dumps({"success": False, "error": "delivery_grant_claim_failed"})
+
+    try:
+        from model_tools import _run_async
+        send_result = _run_async(
+            outbound_mod.OutboundDeliveryService(force_document=force_document).send(
+                turn,
+                authorized_envelope,
+            )
+        )
+    except Exception as exc:
+        pending_delivery_mod.finish(
+            request_id,
+            state=pending_delivery_mod.PendingDeliveryState.FAILED,
+            result={"success": False, "error": _sanitize_error_text(str(exc))},
+        )
+        return json.dumps(_error(f"Interactive delivery failed: {exc}"))
+
+    if isinstance(send_result, dict) and send_result.get("success"):
+        pending_delivery_mod.finish(
+            request_id,
+            state=pending_delivery_mod.PendingDeliveryState.SENT,
+            result=send_result,
+        )
+        message_ids = tuple(
+            str(mid)
+            for mid in send_result.get("message_ids") or ([] if send_result.get("message_id") is None else [send_result["message_id"]])
+        )
+        delivery = outbound_mod.SuccessfulDelivery(
+            delivery_id=request_id,
+            destination=destination,
+            text=cleaned_message,
+            message_ids=message_ids,
+        )
+        record_result = outbound_mod.DeliveryRecorder().record_success(delivery)
+        response = dict(send_result)
+        response.update({
+            "delivery_id": request_id,
+            "target": destination.public_label(),
+            "confirmed": True,
+        })
+        if record_result.mirrored:
+            response["mirrored"] = True
+        return json.dumps(response)
+
+    pending_delivery_mod.finish(
+        request_id,
+        state=pending_delivery_mod.PendingDeliveryState.FAILED,
+        result=send_result if isinstance(send_result, dict) else None,
+    )
+    if isinstance(send_result, dict) and "error" in send_result:
+        send_result["error"] = _sanitize_error_text(send_result["error"])
+    return json.dumps(send_result)
 
 
 def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id: str | None):

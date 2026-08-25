@@ -311,7 +311,7 @@ def build_session_context_prompt(
     # Home channels
     if context.home_channels:
         lines.append("")
-        lines.append("**Home Channels (default destinations):**")
+        lines.append("**Home Channels (scheduled/system delivery destinations):**")
         for platform, home in context.home_channels.items():
             hc_id = _hash_chat_id(home.chat_id) if redact_pii else home.chat_id
             lines.append(f"  - {platform.value}: {home.name} (ID: {hc_id})")
