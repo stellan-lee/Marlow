@@ -235,7 +235,10 @@ class AdminApprovalConfig:
     user_id: str = ""
     chat_id: str = ""
     thread_id: Optional[str] = None
+    chat_type: Optional[str] = None
     conversation_mode: str = "approval_only"
+    prefer_authorized_private_origin: bool = True
+    allow_shared_fallback: bool = False
 
     @property
     def is_complete(self) -> bool:
@@ -261,6 +264,12 @@ class AdminApprovalConfig:
             result["platform"] = self.platform.value
         if self.thread_id:
             result["thread_id"] = self.thread_id
+        if self.chat_type:
+            result["chat_type"] = self.chat_type
+        if not self.prefer_authorized_private_origin:
+            result["prefer_authorized_private_origin"] = False
+        if self.allow_shared_fallback:
+            result["allow_shared_fallback"] = True
         return result
 
     @classmethod
@@ -295,6 +304,19 @@ class AdminApprovalConfig:
                 str(data.get("thread_id")).strip()
                 if data.get("thread_id") not in (None, "")
                 else None
+            ),
+            chat_type=(
+                str(data.get("chat_type") or "").strip().lower()
+                if data.get("chat_type") not in (None, "")
+                else None
+            ),
+            prefer_authorized_private_origin=_coerce_bool(
+                data.get("prefer_authorized_private_origin", True),
+                True,
+            ),
+            allow_shared_fallback=_coerce_bool(
+                data.get("allow_shared_fallback"),
+                False,
             ),
             conversation_mode=conversation_mode,
         )

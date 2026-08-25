@@ -45,6 +45,7 @@ def _event(
     user_id: str = "admin-user",
     chat_id: str = "admin-chat",
     thread_id: str | None = "admin-thread",
+    chat_type: str = "dm",
 ) -> MessageEvent:
     return MessageEvent(
         text=text,
@@ -53,6 +54,7 @@ def _event(
             user_id=user_id,
             chat_id=chat_id,
             thread_id=thread_id,
+            chat_type=chat_type,
         ),
         message_id="message-1",
     )
@@ -727,6 +729,7 @@ class TestAdminApprovalRouting:
             "title": "Admin Approval Required",
             "admin_routed": True,
             "admin_platform": Platform.SLACK,
+            "presentation": "fallback",
         }
 
     def test_general_admin_request_never_falls_back_to_requester(self):
@@ -804,6 +807,102 @@ class TestAdminApprovalRouting:
                 origin_metadata=None,
                 kind="command",
             )
+
+
+    def test_admin_principal_private_origin_receives_request_scoped_approval(self):
+        admin = AdminApprovalConfig(
+            enabled=True,
+            platform=Platform.TELEGRAM,
+            user_id="admin-user",
+            chat_id="admin-chat",
+            thread_id="admin-thread",
+            chat_type="dm",
+        )
+        runner = _runner(admin)
+        admin_adapter = _Adapter()
+        runner.adapters = {Platform.TELEGRAM: admin_adapter}
+
+        route = runner._resolve_approval_delivery_route(
+            origin_adapter=admin_adapter,
+            origin_chat_id="admin-chat",
+            origin_metadata={"thread_id": "admin-thread"},
+            kind="command",
+            source=_event("hello", user_id="admin-user", chat_id="admin-chat", thread_id="admin-thread", chat_type="dm").source,
+        )
+
+        assert route["adapter"] is admin_adapter
+        assert route["chat_id"] == "admin-chat"
+        assert route["metadata"] == {"thread_id": "admin-thread"}
+        assert route["authorized_user_id"] == "admin-user"
+        assert route["admin_routed"] is True
+        assert route["presentation"] == "origin"
+
+    def test_non_admin_request_uses_configured_fallback(self):
+        admin = AdminApprovalConfig(
+            enabled=True,
+            platform=Platform.SLACK,
+            user_id="U_ADMIN",
+            chat_id="C_ADMIN",
+        )
+        runner = _runner(admin)
+        admin_adapter = _Adapter()
+        runner.adapters = {Platform.SLACK: admin_adapter}
+
+        route = runner._resolve_approval_delivery_route(
+            origin_adapter=_Adapter(),
+            origin_chat_id="requester-chat",
+            origin_metadata=None,
+            kind="command",
+            source=_event("hello", user_id="requester", chat_id="requester-chat").source,
+        )
+
+        assert route["adapter"] is admin_adapter
+        assert route["chat_id"] == "C_ADMIN"
+        assert route["presentation"] == "fallback"
+
+    def test_shared_fallback_is_disabled_by_default(self):
+        runner = _runner(
+            AdminApprovalConfig(
+                enabled=True,
+                platform=Platform.SLACK,
+                user_id="U_ADMIN",
+                chat_id="C_ADMIN",
+                chat_type="group",
+            )
+        )
+        runner.adapters = {Platform.SLACK: _Adapter()}
+
+        with pytest.raises(RuntimeError, match="shared fallback is disabled"):
+            runner._resolve_approval_delivery_route(
+                origin_adapter=_Adapter(),
+                origin_chat_id="requester-chat",
+                origin_metadata=None,
+                kind="command",
+                source=_event("hello", user_id="requester", chat_id="requester-chat").source,
+            )
+
+    def test_shared_fallback_requires_explicit_enablement(self):
+        runner = _runner(
+            AdminApprovalConfig(
+                enabled=True,
+                platform=Platform.SLACK,
+                user_id="U_ADMIN",
+                chat_id="C_ADMIN",
+                chat_type="group",
+                allow_shared_fallback=True,
+            )
+        )
+        runner.adapters = {Platform.SLACK: _Adapter()}
+
+        route = runner._resolve_approval_delivery_route(
+            origin_adapter=_Adapter(),
+            origin_chat_id="requester-chat",
+            origin_metadata=None,
+            kind="command",
+            source=_event("hello", user_id="requester", chat_id="requester-chat").source,
+        )
+
+        assert route["presentation"] == "fallback"
 
 
 class TestSuperAdminConversation:

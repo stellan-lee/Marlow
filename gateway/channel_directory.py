@@ -351,7 +351,7 @@ def format_directory_for_display() -> str:
                 lines.append(f"  {plat_name}:{_channel_target_name(plat_name, ch)}")
             lines.append("")
 
-    lines.append('Use these as the "target" parameter when sending.')
-    lines.append('Bare platform name (e.g. "telegram") sends to home channel.')
+    lines.append('Use these exact targets as the "target" parameter when sending.')
+    lines.append('A bare platform name (e.g. "telegram") is ambiguous in an interactive turn and will not resolve to a home channel.')
 
     return "\n".join(lines)

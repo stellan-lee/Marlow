@@ -2489,6 +2489,8 @@ class GatewayRunner:
         }
         if admin.user_id not in caller_ids:
             return False
+        if admin.chat_type and str(source.chat_type or "").lower() != admin.chat_type:
+            return False
         if admin.thread_id is not None:
             return str(source.thread_id or "") == admin.thread_id
         return True
@@ -2512,6 +2514,32 @@ class GatewayRunner:
             "invariants still apply."
         )
 
+    def _admin_principal_matches_source(self, source: Optional[SessionSource]) -> bool:
+        """Return whether source is the configured administrator principal."""
+        if source is None:
+            return False
+        admin = getattr(
+            getattr(self, "config", None),
+            "admin_approval",
+            AdminApprovalConfig(),
+        )
+        if not admin.enabled or admin.platform is None or source.platform != admin.platform:
+            return False
+        caller_ids = {
+            str(value).strip()
+            for value in (source.user_id, source.user_id_alt)
+            if value is not None and str(value).strip()
+        }
+        return admin.user_id in caller_ids
+
+    @staticmethod
+    def _is_private_origin_source(source: Optional[SessionSource]) -> bool:
+        return bool(source and str(source.chat_type or "").lower() in {"dm", "private"})
+
+    @staticmethod
+    def _is_shared_fallback_route(chat_type: Optional[str]) -> bool:
+        return bool(chat_type and str(chat_type).lower() not in {"dm", "private"})
+
     def _resolve_approval_delivery_route(
         self,
         *,
@@ -2519,6 +2547,7 @@ class GatewayRunner:
         origin_chat_id: str,
         origin_metadata: Optional[Dict[str, Any]],
         kind: str,
+        source: Optional[SessionSource] = None,
     ) -> Dict[str, Any]:
         """Resolve where an approval is delivered and who may answer it.
 
@@ -2554,28 +2583,55 @@ class GatewayRunner:
                 "approvals.admin is enabled but platform, user_id, or chat_id is missing"
             )
 
+        title = "Action Approval Required" if kind in {"admin_action", "action_intent"} else "Admin Approval Required"
+        metadata: Dict[str, Any] = {"notify": True}
+        if admin.thread_id:
+            metadata["thread_id"] = admin.thread_id
+
+        if (
+            admin.prefer_authorized_private_origin
+            and self._admin_principal_matches_source(source)
+            and self._is_private_origin_source(source)
+        ):
+            target_adapter = self.adapters.get(source.platform)
+            if target_adapter is None:
+                raise RuntimeError(
+                    f"admin approval platform {source.platform.value} is not connected"
+                )
+            return {
+                "adapter": target_adapter,
+                "chat_id": str(source.chat_id or ""),
+                "metadata": origin_metadata or metadata,
+                "authorized_user_id": admin.user_id,
+                "binary": True,
+                "title": title,
+                "admin_routed": True,
+                "admin_platform": admin.platform,
+                "presentation": "origin",
+            }
+
+        if self._is_shared_fallback_route(admin.chat_type) and not admin.allow_shared_fallback:
+            raise RuntimeError(
+                "admin approval shared fallback is disabled; set "
+                "approvals.admin.allow_shared_fallback=true to use it explicitly"
+            )
+
         target_adapter = self.adapters.get(admin.platform)
         if target_adapter is None:
             raise RuntimeError(
                 f"admin approval platform {admin.platform.value} is not connected"
             )
 
-        metadata: Dict[str, Any] = {"notify": True}
-        if admin.thread_id:
-            metadata["thread_id"] = admin.thread_id
         return {
             "adapter": target_adapter,
             "chat_id": admin.chat_id,
             "metadata": metadata,
             "authorized_user_id": admin.user_id,
             "binary": True,
-            "title": (
-                "Action Approval Required"
-                if kind in {"admin_action", "action_intent"}
-                else "Admin Approval Required"
-            ),
+            "title": title,
             "admin_routed": True,
             "admin_platform": admin.platform,
+            "presentation": "fallback",
         }
 
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
@@ -6576,6 +6632,18 @@ class GatewayRunner:
             # clearly moved on.
             _slash_confirm_mod.clear_if_stale(_quick_key)
 
+        # Delivery confirmation replies may arrive while the agent is idle or
+        # before the running-agent fast path is reached. Resolve them before
+        # slash-command access checks and before treating the text as a new
+        # user turn.
+        try:
+            from gateway.pending_delivery import resolve_from_event
+            _delivery_reply = resolve_from_event(_quick_key, event)
+            if _delivery_reply is not None:
+                return _delivery_reply
+        except Exception:
+            logger.debug("Delivery confirmation resolution failed", exc_info=True)
+
         # PRIORITY handling when an agent is already running for this session.
         # Default behavior is to interrupt immediately so user text/stop messages
         # are handled with minimal latency.
@@ -6659,6 +6727,17 @@ class GatewayRunner:
         if _quick_key in self._running_agents:
             if event.get_command() == "status":
                 return await self._handle_status_command(event)
+
+            # Delivery confirmation replies are request-scoped callbacks into a
+            # blocked send_message tool call. They must bypass the running-agent
+            # interrupt path so the agent thread can resume exactly once.
+            try:
+                from gateway.pending_delivery import resolve_from_event
+                _delivery_reply = resolve_from_event(_quick_key, event)
+                if _delivery_reply is not None:
+                    return _delivery_reply
+            except Exception:
+                logger.debug("Delivery confirmation resolution failed", exc_info=True)
 
             # Resolve the command once for all early-intercept checks below.
             from marlow_cli.commands import (
@@ -9414,6 +9493,17 @@ class GatewayRunner:
             "",
             t("gateway.status.platforms", platforms=', '.join(connected_platforms)),
         ])
+
+        admin_approval = getattr(getattr(self, "config", None), "admin_approval", None)
+        if admin_approval and admin_approval.enabled:
+            presentation = "configured fallback"
+            if admin_approval.prefer_authorized_private_origin:
+                presentation = "private origin for admin principal, fallback otherwise"
+            fallback_warning = ""
+            if self._is_shared_fallback_route(admin_approval.chat_type) and admin_approval.allow_shared_fallback:
+                fallback_warning = " (shared fallback explicitly enabled)"
+            lines.append(f"Admin approvals: enabled; presentation={presentation}; shared fallback={admin_approval.allow_shared_fallback}{fallback_warning}")
+            lines.append("Route isolation: interactive origin-bound delivery active")
 
         return "\n".join(lines)
 
@@ -16761,6 +16851,7 @@ class GatewayRunner:
                     origin_chat_id=_status_chat_id,
                     origin_metadata=_status_thread_metadata,
                     kind=kind,
+                    source=source,
                 )
                 target_adapter = route["adapter"]
                 target_chat_id = route["chat_id"]
@@ -16887,6 +16978,36 @@ class GatewayRunner:
                 except Exception as _e:
                     logger.error("Failed to send approval request: %s", _e)
 
+            def _delivery_notify_sync(payload: dict) -> None:
+                """Send a cross-conversation delivery confirmation to origin."""
+                try:
+                    _status_adapter.pause_typing_for_chat(_status_chat_id)
+                except Exception:
+                    pass
+                try:
+                    from gateway.pending_delivery import format_confirmation_text
+                    msg = format_confirmation_text(payload)
+                    _delivery_send_fut = safe_schedule_threadsafe(
+                        _status_adapter.send(
+                            _status_chat_id,
+                            msg,
+                            metadata=_status_thread_metadata,
+                        ),
+                        _loop_for_step,
+                        logger=logger,
+                        log_message="Delivery confirmation text-send scheduling error",
+                    )
+                    if _delivery_send_fut is None:
+                        raise RuntimeError("delivery confirmation: loop unavailable")
+                    _delivery_send_fut.result(timeout=15)
+                except Exception as _e:
+                    logger.error("Failed to send delivery confirmation request: %s", _e)
+                finally:
+                    try:
+                        _status_adapter.resume_typing_for_chat(_status_chat_id)
+                    except Exception:
+                        pass
+
             def _resume_origin_after_approval() -> None:
                 try:
                     _status_adapter.resume_typing_for_chat(_status_chat_id)
@@ -16896,6 +17017,7 @@ class GatewayRunner:
             # tools.approval invokes this after every resolution path,
             # including timeout and cross-platform delivery failure.
             _approval_notify_sync.on_resolved = _resume_origin_after_approval
+            _delivery_notify_sync.on_resolved = _resume_origin_after_approval
 
             # Prepend pending model switch note so the model knows about the switch
             _pending_notes = getattr(self, '_pending_model_notes', {})
@@ -16991,9 +17113,37 @@ class GatewayRunner:
             _super_admin_token = set_super_admin_context(
                 self._is_super_admin_source(source)
             )
+            _turn_context_token = None
+            try:
+                from gateway.turn_context import (
+                    ExecutionMode,
+                    TurnContext,
+                    set_current_turn,
+                )
+                _turn_context_token = set_current_turn(
+                    TurnContext.from_source(
+                        source,
+                        turn_id=_quick_key,
+                        session_key=_approval_session_key,
+                        session_id=session_id or "",
+                        mode=ExecutionMode.INTERACTIVE,
+                    )
+                )
+            except Exception:
+                logger.debug("Failed to set typed turn context", exc_info=True)
             _approval_notify_registered = False
+            _delivery_notify_registered = False
             try:
                 register_gateway_notify(_approval_session_key, _approval_notify_sync)
+                try:
+                    from gateway.pending_delivery import (
+                        register_gateway_notify as register_delivery_notify,
+                        unregister_gateway_notify as unregister_delivery_notify,
+                    )
+                    register_delivery_notify(_approval_session_key, _delivery_notify_sync)
+                    _delivery_notify_registered = True
+                except Exception:
+                    logger.debug("Failed to register delivery confirmation notifier", exc_info=True)
                 _approval_notify_registered = True
                 # If _prepare_inbound_message_text buffered image paths for native
                 # attachment, wrap the user turn as an OpenAI-style multimodal
@@ -17047,12 +17197,28 @@ class GatewayRunner:
             finally:
                 if _approval_notify_registered:
                     unregister_gateway_notify(_approval_session_key)
+                if _delivery_notify_registered:
+                    try:
+                        unregister_delivery_notify(_approval_session_key)
+                    except Exception:
+                        pass
+                if _turn_context_token is not None:
+                    try:
+                        from gateway.turn_context import reset_current_turn
+                        reset_current_turn(_turn_context_token)
+                    except Exception:
+                        pass
                 # Cancel any pending clarify entries so blocked agent
                 # threads don't hang past the end of the run (interrupt,
                 # completion, gateway shutdown).  Idempotent.
                 try:
                     from tools.clarify_gateway import clear_session as _clear_clarify_session
                     _clear_clarify_session(_approval_session_key)
+                except Exception:
+                    pass
+                try:
+                    from gateway.pending_delivery import clear_session as _clear_delivery_session
+                    _clear_delivery_session(_approval_session_key)
                 except Exception:
                     pass
                 reset_super_admin_context(_super_admin_token)
