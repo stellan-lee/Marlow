@@ -87,6 +87,7 @@ class SessionSource:
     guild_id: Optional[str] = None  # Discord guild or Slack workspace scope
     parent_chat_id: Optional[str] = None  # Parent channel when chat_id refers to a thread
     message_id: Optional[str] = None  # ID of the triggering message (for pin/reply/react)
+    metadata: Optional[Dict[str, Any]] = None  # Process-local platform routing metadata
     
     @property
     def description(self) -> str:

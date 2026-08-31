@@ -536,6 +536,12 @@ def validate_toolset(name: str) -> bool:
         return True
     if name in _get_plugin_toolset_names():
         return True
+    if name.startswith("marlow-"):
+        try:
+            from gateway.platform_registry import platform_registry
+            return platform_registry.is_registered(name[len("marlow-"):])
+        except Exception:
+            return False
     return name in _get_registry_toolset_aliases()
 
 

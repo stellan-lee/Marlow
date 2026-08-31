@@ -1,5 +1,7 @@
 """Tests for toolsets.py — toolset resolution, validation, and composition."""
 
+from types import SimpleNamespace
+
 from tools.registry import ToolRegistry
 from toolsets import (
     TOOLSETS,
@@ -145,6 +147,19 @@ class TestValidateToolset:
         assert validate_toolset("dynserver") is True
         assert validate_toolset("mcp-dynserver") is True
         assert "mcp_dynserver_ping" in resolve_toolset("dynserver")
+
+    def test_registered_platform_generated_toolset_valid(self, monkeypatch):
+        registry = SimpleNamespace(is_registered=lambda name: name == "teams")
+        monkeypatch.setattr("gateway.platform_registry.platform_registry", registry)
+
+        assert validate_toolset("marlow-teams") is True
+        assert validate_toolset("marlow-unknown") is False
+
+    def test_unknown_generated_platform_toolset_invalid(self, monkeypatch):
+        registry = SimpleNamespace(is_registered=lambda name: False)
+        monkeypatch.setattr("gateway.platform_registry.platform_registry", registry)
+
+        assert validate_toolset("marlow-unknown") is False
 
 
 class TestGetToolsetInfo:

@@ -62,6 +62,12 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     ``direct_messages_topic_id`` when the Bot API supports it.
     """
     thread_id = getattr(source, "thread_id", None)
+    source_metadata = getattr(source, "metadata", None)
+    if isinstance(source_metadata, dict) and source_metadata:
+        metadata = dict(source_metadata)
+        if thread_id is not None:
+            metadata.setdefault("thread_id", thread_id)
+        return metadata
     if thread_id is None:
         return None
     metadata = {"thread_id": thread_id}
