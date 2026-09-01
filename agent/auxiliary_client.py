@@ -125,6 +125,31 @@ def _convert_responses_content(content: Any) -> Any:
     return converted or ""
 
 
+def _responses_output_text(response: Any) -> str:
+    """Read plain text from a completed Responses object without deltas."""
+    output_text = getattr(response, "output_text", "")
+    if isinstance(output_text, str) and output_text:
+        return output_text
+    parts: list[str] = []
+    for item in getattr(response, "output", ()) or ():
+        item_type = getattr(item, "type", None)
+        content = getattr(item, "content", None)
+        if isinstance(item, dict):
+            item_type = item.get("type", item_type)
+            content = item.get("content")
+        if item_type != "message":
+            continue
+        for part in content or ():
+            part_type = getattr(part, "type", None)
+            text = getattr(part, "text", None)
+            if isinstance(part, dict):
+                part_type = part.get("type", part_type)
+                text = part.get("text", text)
+            if part_type in {"output_text", "text"} and isinstance(text, str):
+                parts.append(text)
+    return "".join(parts)
+
+
 class _CodexCompletions:
     def __init__(self, client: Any, model: str):
         self.client = client
@@ -156,8 +181,36 @@ class _CodexCompletions:
                 for tool in kwargs["tools"]
                 if isinstance(tool, dict) and isinstance(tool.get("function"), dict)
             ]
+        # The ChatGPT Codex Responses endpoint only accepts streamed calls.
+        # Reuse the runtime's event assembler so the auxiliary path sees the
+        # same response shape as the primary Codex transport.
+        request["stream"] = True
         response = self.client.responses.create(**request)
-        content = getattr(response, "output_text", "") or ""
+        if not (hasattr(response, "output") and not hasattr(response, "__iter__")):
+            from agent.codex_runtime import _consume_codex_event_stream
+
+            try:
+                final_response = _consume_codex_event_stream(
+                    response, model=request["model"]
+                )
+            finally:
+                close_fn = getattr(response, "close", None)
+                if callable(close_fn):
+                    try:
+                        close_fn()
+                    except Exception:
+                        pass
+            response = final_response
+        status = getattr(response, "status", None)
+        if status in {"cancelled", "incomplete", "failed"}:
+            detail = getattr(response, "error", None) or getattr(
+                response, "incomplete_details", None
+            )
+            raise RuntimeError(
+                f"Codex Responses stream ended with status={status}"
+                + (f": {detail}" if detail else "")
+            )
+        content = _responses_output_text(response)
         message = SimpleNamespace(content=content, tool_calls=None, reasoning=None)
         usage = getattr(response, "usage", None)
         return SimpleNamespace(

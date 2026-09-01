@@ -2,10 +2,11 @@
 import base64
 import json
 import time
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from agent.auxiliary_client import (
-    _build_call_kwargs, _is_model_not_found_error, _is_payment_error,
+    _CodexCompletions, _build_call_kwargs, _is_model_not_found_error, _is_payment_error,
     _is_rate_limit_error, _normalize_aux_provider, _read_codex_access_token,
 )
 
@@ -63,3 +64,118 @@ def test_error_classifiers():
     assert _is_rate_limit_error(ApiError(429,"too many requests"))
     assert _is_model_not_found_error(ApiError(404,"model does not exist"))
     assert not _is_rate_limit_error(ApiError(500,"server error"))
+
+
+class _EventStream:
+    def __init__(self, events):
+        self.events = events
+        self.closed = False
+
+    def __iter__(self):
+        return iter(self.events)
+
+    def close(self):
+        self.closed = True
+
+
+def test_codex_auxiliary_completions_streams_and_reconstructs_response():
+    stream = _EventStream([
+        {"type": "response.output_text.delta", "delta": "hello"},
+        {"type": "response.output_text.delta", "delta": " world"},
+        {"type": "response.completed", "response": {"status": "completed", "usage": {"total_tokens": 7}}},
+    ])
+
+    class Responses:
+        def create(self, **kwargs):
+            self.kwargs = kwargs
+            return stream
+
+    responses = Responses()
+    result = _CodexCompletions(type("Client", (), {"responses": responses})(), "gpt-5").create(
+        messages=[{"role": "user", "content": "hi"}]
+    )
+
+    assert responses.kwargs["stream"] is True
+    assert result.choices[0].message.content == "hello world"
+    assert result.usage == {"total_tokens": 7}
+    assert stream.closed
+
+
+def test_codex_auxiliary_completions_raises_for_terminal_failure_and_closes_stream():
+    stream = _EventStream([
+        {"type": "response.failed", "response": {"status": "failed", "error": "quota exceeded"}},
+    ])
+
+    class Responses:
+        def create(self, **kwargs):
+            return stream
+
+    import pytest
+
+    with pytest.raises(RuntimeError, match="status=failed"):
+        _CodexCompletions(type("Client", (), {"responses": Responses()})(), "gpt-5").create(
+            messages=[{"role": "user", "content": "hi"}]
+        )
+    assert stream.closed
+
+
+def test_codex_auxiliary_completions_accepts_concrete_response_compatibly():
+    concrete = SimpleNamespace(
+        output=[], output_text="already assembled", usage={"total_tokens": 3}, status="completed"
+    )
+
+    class Responses:
+        def create(self, **kwargs):
+            self.kwargs = kwargs
+            return concrete
+
+    responses = Responses()
+    result = _CodexCompletions(type("Client", (), {"responses": responses})(), "gpt-5").create(
+        messages=[{"role": "user", "content": "hi"}]
+    )
+
+    assert responses.kwargs["stream"] is True
+    assert result.choices[0].message.content == "already assembled"
+    assert result.usage == {"total_tokens": 3}
+
+
+def test_codex_auxiliary_completions_uses_done_message_text_without_deltas():
+    stream = _EventStream([
+        {"type": "response.output_item.done", "item": {
+            "type": "message", "content": [{"type": "output_text", "text": "done-only text"}],
+        }},
+        {"type": "response.completed", "response": {"status": "completed"}},
+    ])
+
+    class Responses:
+        def create(self, **kwargs):
+            return stream
+
+    result = _CodexCompletions(type("Client", (), {"responses": Responses()})(), "gpt-5").create(
+        messages=[{"role": "user", "content": "hi"}]
+    )
+
+    assert result.choices[0].message.content == "done-only text"
+    assert stream.closed
+
+
+def test_codex_auxiliary_completions_does_not_expose_non_message_output_text():
+    stream = _EventStream([
+        {"type": "response.output_item.done", "item": {
+            "type": "reasoning", "content": [{"type": "output_text", "text": "private"}],
+        }},
+        {"type": "response.output_item.done", "item": {
+            "type": "message", "content": [{"type": "text", "text": "public"}],
+        }},
+        {"type": "response.completed", "response": {"status": "completed"}},
+    ])
+
+    class Responses:
+        def create(self, **kwargs):
+            return stream
+
+    result = _CodexCompletions(type("Client", (), {"responses": Responses()})(), "gpt-5").create(
+        messages=[{"role": "user", "content": "hi"}]
+    )
+
+    assert result.choices[0].message.content == "public"

@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 from agent.memory_consolidation_runner import (
     CandidateExtractor,
@@ -13,6 +14,7 @@ from agent.memory_consolidation_runner import (
     MemoryConsolidationStoreRepository,
     WeeklyVerificationRunner,
     append_conversation_evidence,
+    run_configured_consolidation,
 )
 from agent.memory_consolidation import MemoryConsolidationStore
 
@@ -76,16 +78,117 @@ def test_llm_extractor_enforces_provenance_and_scope_with_mocked_structured_call
     assert calls and calls[0]["json_schema"]["required"] == ["candidates"]
 
 
-def test_llm_extractor_bounded_failure_degrades_to_empty_noop():
+def test_llm_extractor_exhaustion_raises_after_bounded_retries():
     calls = []
 
     def broken(**kwargs):
         calls.append(kwargs)
         raise RuntimeError("provider unavailable")
 
-    result = LlmCandidateExtractor(llm_call=broken, max_retries=2).extract([EvidenceEvent("evt-1", "fact")])
-    assert result == []
+    import pytest
+
+    with pytest.raises(RuntimeError, match="exhausted retries"):
+        LlmCandidateExtractor(llm_call=broken, max_retries=2).extract([EvidenceEvent("evt-1", "fact")])
     assert len(calls) == 3
+
+
+def test_llm_extractor_valid_empty_result_remains_successful_empty_result():
+    result = LlmCandidateExtractor(
+        llm_call=lambda **_: {"parsed": {"candidates": []}}
+    ).extract([EvidenceEvent("evt-1", "fact")])
+    assert result == []
+
+
+def test_runner_fails_and_does_not_record_empty_plan_on_extraction_exhaustion():
+    repo = FakeRepository([{"id": "evt-1", "content": "fact"}])
+    extractor = LlmCandidateExtractor(
+        llm_call=lambda **_: (_ for _ in ()).throw(RuntimeError("provider unavailable")),
+        max_retries=0,
+    )
+
+    result = ConsolidationRunner(
+        repo, extractor=extractor, enabled=True, dry_run=False, phase="safe"
+    ).run(cutoff_watermark=10)
+
+    assert result.status == "failed"
+    assert not repo.committed
+    assert not repo.succeeded
+    assert repo.failed and "exhausted retries" in repo.failed[0][1]
+
+
+def test_configured_failed_extraction_is_throttled_without_advancing_cursor(tmp_path):
+    path = (tmp_path / "state.db").resolve()
+    with MemoryConsolidationStore(path) as store:
+        store.append_evidence(scope_id="person_a", source_key="turn:1", content="fact")
+
+    class UnavailableLlm:
+        def complete_structured(self, **kwargs):
+            raise RuntimeError("provider unavailable")
+
+    config = {"memory": {"consolidation": {
+        "enabled": True, "dry_run": True, "phase": "observe", "max_retries": 0,
+    }}}
+    with patch("agent.memory_consolidation_runner._default_structured_llm", return_value=UnavailableLlm()):
+        first = run_configured_consolidation(
+            config=config, scope_id="person_a", state_db_path=str(path)
+        )
+        second = run_configured_consolidation(
+            config=config, scope_id="person_a", state_db_path=str(path)
+        )
+
+    assert first.status == "failed"
+    assert second.status == "not_due"
+    with MemoryConsolidationStore(path) as store:
+        assert store.cursor("person_a") == 0
+        failed = store._conn.execute(
+            "SELECT run_id, start_seq, end_seq, status FROM memory_runs WHERE status='failed'"
+        ).fetchone()
+        assert failed is not None
+        assert failed["run_id"] != first.run_id
+        assert (failed["start_seq"], failed["end_seq"]) == (0, 1)
+
+
+def test_failed_extraction_throttling_keeps_typed_scopes_distinct(tmp_path):
+    path = (tmp_path / "state.db").resolve()
+    with MemoryConsolidationStore(path) as store:
+        store.append_evidence(
+            scope_type="user", scope_id="same", source_key="turn:user", content="user fact"
+        )
+        store.append_evidence(
+            scope_type="profile", scope_id="same", source_key="turn:profile", content="profile fact"
+        )
+
+    class UnavailableLlm:
+        def complete_structured(self, **kwargs):
+            raise RuntimeError("provider unavailable")
+
+    config = {"memory": {"consolidation": {
+        "enabled": True, "dry_run": True, "phase": "observe", "max_retries": 0,
+    }}}
+    with patch("agent.memory_consolidation_runner._default_structured_llm", return_value=UnavailableLlm()):
+        first_user = run_configured_consolidation(
+            config=config, scope_type="user", scope_id="same", state_db_path=str(path)
+        )
+        first_profile = run_configured_consolidation(
+            config=config, scope_type="profile", scope_id="same", state_db_path=str(path)
+        )
+        second_user = run_configured_consolidation(
+            config=config, scope_type="user", scope_id="same", state_db_path=str(path)
+        )
+        second_profile = run_configured_consolidation(
+            config=config, scope_type="profile", scope_id="same", state_db_path=str(path)
+        )
+
+    assert first_user.status == first_profile.status == "failed"
+    assert first_user.run_id != first_profile.run_id
+    assert second_user.status == second_profile.status == "not_due"
+    with MemoryConsolidationStore(path) as store:
+        assert store.cursor("same", "user") == 0
+        assert store.cursor("same", "profile") == 0
+        failed_count = store._conn.execute(
+            "SELECT COUNT(*) FROM memory_runs WHERE status='failed'"
+        ).fetchone()[0]
+        assert failed_count == 2
 
 
 def test_llm_planner_only_targets_known_matches_and_preserves_candidate_id():
