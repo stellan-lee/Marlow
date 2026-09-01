@@ -225,6 +225,325 @@ class TestAdapterSessionCancellation:
         assert call_order.index("original:cancelled") < call_order.index("followup:processed")
         assert sk not in adapter._pending_messages
 
+    @pytest.mark.asyncio
+    async def test_guard_swap_during_in_band_typing_requeues_follow_up_for_command_drain(self):
+        adapter = _make_adapter()
+        sk = _session_key()
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        typing_stop_entered = asyncio.Event()
+        release_typing_stop = asyncio.Event()
+        follow_up_processed = asyncio.Event()
+
+        async def _keep_typing(*args, **kwargs):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                typing_stop_entered.set()
+                await release_typing_stop.wait()
+
+        async def _handler(event):
+            if event.text == "first":
+                first_started.set()
+                await release_first.wait()
+            elif event.text == "follow-up":
+                follow_up_processed.set()
+            return None
+
+        adapter._keep_typing = _keep_typing
+        adapter._message_handler = _handler
+        root_task = await adapter.handle_message(_make_event("first"))
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        await adapter.handle_message(_make_event("follow-up"))
+
+        release_first.set()
+        await asyncio.wait_for(typing_stop_entered.wait(), timeout=1)
+        command_guard = asyncio.Event()
+        adapter._active_sessions[sk] = command_guard
+        release_typing_stop.set()
+        await asyncio.wait_for(root_task, timeout=1)
+
+        assert adapter._pending_messages[sk].text == "follow-up"
+        follow_up_task = await adapter._drain_pending_after_session_command(sk, command_guard)
+        await asyncio.wait_for(follow_up_task, timeout=1)
+        assert follow_up_processed.is_set()
+
+    @pytest.mark.asyncio
+    async def test_overlapping_session_commands_leave_pending_for_current_guard_owner(self):
+        adapter = _make_adapter()
+        sk = _session_key()
+        initial_started = asyncio.Event()
+        new_started = asyncio.Event()
+        reset_started = asyncio.Event()
+        release_new = asyncio.Event()
+        release_reset = asyncio.Event()
+        follow_up_processed = asyncio.Event()
+
+        async def _handler(event):
+            command = event.get_command()
+            if command == "new":
+                new_started.set()
+                await release_new.wait()
+                return None
+            if command == "reset":
+                reset_started.set()
+                await release_reset.wait()
+                return None
+            if event.text == "initial":
+                initial_started.set()
+                await asyncio.Event().wait()
+            if event.text == "follow-up":
+                follow_up_processed.set()
+            return None
+
+        adapter._message_handler = _handler
+        await adapter.handle_message(_make_event("initial"))
+        await asyncio.wait_for(initial_started.wait(), timeout=1)
+        new_task = asyncio.create_task(adapter.handle_message(_make_event("/new")))
+        await asyncio.wait_for(new_started.wait(), timeout=1)
+        reset_task = asyncio.create_task(adapter.handle_message(_make_event("/reset")))
+        await asyncio.wait_for(reset_started.wait(), timeout=1)
+        current_guard = adapter._active_sessions[sk]
+
+        await adapter.handle_message(_make_event("follow-up"))
+        release_new.set()
+        assert await asyncio.wait_for(new_task, timeout=1) is None
+        assert adapter._active_sessions.get(sk) is current_guard
+        assert adapter._pending_messages[sk].text == "follow-up"
+
+        release_reset.set()
+        follow_up_task = await asyncio.wait_for(reset_task, timeout=1)
+        await asyncio.wait_for(follow_up_task, timeout=1)
+        assert follow_up_processed.is_set()
+        assert sk not in adapter._pending_messages
+
+    @pytest.mark.asyncio
+    async def test_stale_command_completion_does_not_cancel_newer_follow_up_lifecycle(self):
+        adapter = _make_adapter()
+        sk = _session_key()
+        initial_started = asyncio.Event()
+        new_started = asyncio.Event()
+        reset_started = asyncio.Event()
+        follow_up_started = asyncio.Event()
+        release_new = asyncio.Event()
+        release_reset = asyncio.Event()
+        release_follow_up = asyncio.Event()
+
+        async def _handler(event):
+            command = event.get_command()
+            if command == "new":
+                new_started.set()
+                await release_new.wait()
+                return None
+            if command == "reset":
+                reset_started.set()
+                await release_reset.wait()
+                return None
+            if event.text == "initial":
+                initial_started.set()
+                await asyncio.Event().wait()
+            if event.text == "follow-up":
+                follow_up_started.set()
+                await release_follow_up.wait()
+            return None
+
+        adapter._message_handler = _handler
+        await adapter.handle_message(_make_event("initial"))
+        await asyncio.wait_for(initial_started.wait(), timeout=1)
+        new_task = asyncio.create_task(adapter.handle_message(_make_event("/new")))
+        await asyncio.wait_for(new_started.wait(), timeout=1)
+        reset_task = asyncio.create_task(adapter.handle_message(_make_event("/reset")))
+        await asyncio.wait_for(reset_started.wait(), timeout=1)
+        await adapter.handle_message(_make_event("follow-up"))
+
+        release_reset.set()
+        follow_up_task = await asyncio.wait_for(reset_task, timeout=1)
+        await asyncio.wait_for(follow_up_started.wait(), timeout=1)
+        newer_guard = adapter._active_sessions[sk]
+        release_new.set()
+        assert await asyncio.wait_for(new_task, timeout=1) is None
+        assert adapter._active_sessions.get(sk) is newer_guard
+        assert not follow_up_task.done()
+
+        release_follow_up.set()
+        await asyncio.wait_for(follow_up_task, timeout=1)
+        assert sk not in adapter._active_sessions
+        assert sk not in adapter._pending_messages
+
+    @pytest.mark.asyncio
+    async def test_failed_command_drains_pending_after_original_task_finishes_naturally(self):
+        adapter = _make_adapter()
+        sk = _session_key()
+        initial_started = asyncio.Event()
+        initial_finished = asyncio.Event()
+        command_started = asyncio.Event()
+        release_initial = asyncio.Event()
+        fail_command = asyncio.Event()
+        follow_up_processed = asyncio.Event()
+
+        async def _handler(event):
+            if event.get_command() == "new":
+                command_started.set()
+                await fail_command.wait()
+                raise RuntimeError("command failed")
+            if event.text == "initial":
+                initial_started.set()
+                await release_initial.wait()
+                initial_finished.set()
+            elif event.text == "follow-up":
+                follow_up_processed.set()
+            return None
+
+        adapter._message_handler = _handler
+        await adapter.handle_message(_make_event("initial"))
+        await asyncio.wait_for(initial_started.wait(), timeout=1)
+        command_task = asyncio.create_task(adapter.handle_message(_make_event("/new")))
+        await asyncio.wait_for(command_started.wait(), timeout=1)
+        await adapter.handle_message(_make_event("follow-up"))
+        release_initial.set()
+        await asyncio.wait_for(initial_finished.wait(), timeout=1)
+        await asyncio.sleep(0)
+
+        fail_command.set()
+        follow_up_task = await asyncio.wait_for(command_task, timeout=1)
+        await asyncio.wait_for(follow_up_task, timeout=1)
+        await asyncio.sleep(0)
+        assert follow_up_processed.is_set()
+        assert sk not in adapter._pending_messages
+        assert sk not in adapter._active_sessions
+        assert sk not in adapter._session_tasks
+
+    @pytest.mark.asyncio
+    async def test_nested_failed_command_restores_live_processors_captured_guard(self):
+        adapter = _make_adapter()
+        sk = _session_key()
+        initial_started = asyncio.Event()
+        new_started = asyncio.Event()
+        reset_started = asyncio.Event()
+        release_initial = asyncio.Event()
+        release_new = asyncio.Event()
+        fail_reset = asyncio.Event()
+        follow_up_processed = asyncio.Event()
+
+        async def _handler(event):
+            command = event.get_command()
+            if command == "new":
+                new_started.set()
+                await release_new.wait()
+                return None
+            if command == "reset":
+                reset_started.set()
+                await fail_reset.wait()
+                raise RuntimeError("reset failed")
+            if event.text == "initial":
+                initial_started.set()
+                await release_initial.wait()
+            elif event.text == "follow-up":
+                follow_up_processed.set()
+            return None
+
+        adapter._message_handler = _handler
+        root_task = await adapter.handle_message(_make_event("initial"))
+        await asyncio.wait_for(initial_started.wait(), timeout=1)
+        original_guard = adapter._active_sessions[sk]
+        new_task = asyncio.create_task(adapter.handle_message(_make_event("/new")))
+        await asyncio.wait_for(new_started.wait(), timeout=1)
+        reset_task = asyncio.create_task(adapter.handle_message(_make_event("/reset")))
+        await asyncio.wait_for(reset_started.wait(), timeout=1)
+        await adapter.handle_message(_make_event("follow-up"))
+
+        release_new.set()
+        assert await asyncio.wait_for(new_task, timeout=1) is None
+        fail_reset.set()
+        assert await asyncio.wait_for(reset_task, timeout=1) is None
+        assert adapter._active_sessions.get(sk) is original_guard
+
+        release_initial.set()
+        await asyncio.wait_for(root_task, timeout=1)
+        assert follow_up_processed.is_set()
+        assert sk not in adapter._active_sessions
+        assert sk not in adapter._pending_messages
+
+    @pytest.mark.asyncio
+    async def test_cancelled_command_restores_live_processors_captured_guard(self):
+        adapter = _make_adapter()
+        sk = _session_key()
+        initial_started = asyncio.Event()
+        command_started = asyncio.Event()
+        release_initial = asyncio.Event()
+        follow_up_processed = asyncio.Event()
+
+        async def _handler(event):
+            if event.get_command() == "new":
+                command_started.set()
+                await asyncio.Event().wait()
+            if event.text == "initial":
+                initial_started.set()
+                await release_initial.wait()
+            elif event.text == "follow-up":
+                follow_up_processed.set()
+            return None
+
+        adapter._message_handler = _handler
+        root_task = await adapter.handle_message(_make_event("initial"))
+        await asyncio.wait_for(initial_started.wait(), timeout=1)
+        original_guard = adapter._active_sessions[sk]
+        command_task = asyncio.create_task(adapter.handle_message(_make_event("/new")))
+        await asyncio.wait_for(command_started.wait(), timeout=1)
+        await adapter.handle_message(_make_event("follow-up"))
+
+        command_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await command_task
+        assert adapter._active_sessions.get(sk) is original_guard
+
+        release_initial.set()
+        await asyncio.wait_for(root_task, timeout=1)
+        assert follow_up_processed.is_set()
+        assert sk not in adapter._active_sessions
+        assert sk not in adapter._pending_messages
+
+    @pytest.mark.asyncio
+    async def test_cancelling_command_during_old_processor_cleanup_reraises_and_drops_follow_up(self):
+        adapter = _make_adapter()
+        sk = _session_key()
+        initial_started = asyncio.Event()
+        old_cleanup_entered = asyncio.Event()
+        release_old_cleanup = asyncio.Event()
+
+        async def _handler(event):
+            if event.get_command() == "new":
+                return None
+            if event.text == "initial":
+                initial_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    old_cleanup_entered.set()
+                    await release_old_cleanup.wait()
+                    raise
+            return None
+
+        adapter._message_handler = _handler
+        root_task = await adapter.handle_message(_make_event("initial"))
+        await asyncio.wait_for(initial_started.wait(), timeout=1)
+        command_task = asyncio.create_task(adapter.handle_message(_make_event("/new")))
+        await asyncio.wait_for(old_cleanup_entered.wait(), timeout=1)
+        await adapter.handle_message(_make_event("follow-up"))
+
+        command_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await command_task
+        release_old_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(root_task, timeout=1)
+        await asyncio.sleep(0)
+
+        assert sk not in adapter._pending_messages
+        assert sk not in adapter._active_sessions
+        assert sk not in adapter._session_tasks
+        assert not adapter._processing_guard_map()
+
 
 # ===========================================================================
 # Layer 2: Adapter-side on-entry self-heal for stale session locks

@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import gateway.platforms.base as platform_base
 from gateway.config import PlatformConfig
 
 from tests.gateway._plugin_adapter_loader import load_plugin_adapter
@@ -415,6 +416,145 @@ async def test_supervisor_saturates_without_unbounded_tasks():
 
 
 @pytest.mark.asyncio
+async def test_supervisor_stop_returns_after_handler_swallows_cancellation():
+    supervisor = teams.TeamsDispatchSupervisor(max_active=1, max_pending=1)
+    delivered = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    async def handler(task):
+        delivered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(0)
+            cleanup_finished.set()
+
+    supervisor.start_worker(handler)
+    first = teams.TeamsDispatchTask(None, MagicMock(), None, "first", "hash")
+    second = teams.TeamsDispatchTask(None, MagicMock(), None, "second", "hash")
+    assert await supervisor.submit(first) is True
+    await asyncio.wait_for(delivered.wait(), timeout=1)
+    assert await supervisor.submit(second) is True
+
+    await asyncio.wait_for(supervisor.stop(), timeout=1)
+
+    assert cleanup_finished.is_set()
+    assert supervisor.capacity.active == 0
+    assert supervisor.capacity.pending == 0
+
+
+@pytest.mark.asyncio
+async def test_supervisor_uses_all_active_slots_and_drains_on_stop():
+    supervisor = teams.TeamsDispatchSupervisor(max_active=2, max_pending=1)
+    started = set()
+    both_started = asyncio.Event()
+    cancelled = set()
+
+    async def handler(task):
+        started.add(task.receipt_key)
+        if len(started) == 2:
+            both_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.add(task.receipt_key)
+            raise
+
+    supervisor.start_worker(handler)
+    tasks = [
+        teams.TeamsDispatchTask(None, MagicMock(), None, f"task-{index}", "hash")
+        for index in range(4)
+    ]
+    assert await supervisor.submit(tasks[0]) is True
+    assert await supervisor.submit(tasks[1]) is True
+    assert await supervisor.submit(tasks[2]) is True
+    assert await supervisor.submit(tasks[3]) is False
+    await asyncio.wait_for(both_started.wait(), timeout=1)
+    assert started == {"task-0", "task-1"}
+    assert supervisor.capacity.pending == 1
+
+    await asyncio.wait_for(supervisor.stop(), timeout=1)
+
+    assert cancelled == {"task-0", "task-1"}
+    assert supervisor.capacity.active == 0
+    assert supervisor.capacity.pending == 0
+
+
+@pytest.mark.asyncio
+async def test_supervisor_continues_after_task_local_cancellation():
+    supervisor = teams.TeamsDispatchSupervisor(max_active=1, max_pending=1)
+    processed = []
+
+    async def handler(task):
+        if task.receipt_key == "cancelled":
+            raise asyncio.CancelledError()
+        processed.append(task.receipt_key)
+
+    supervisor.start_worker(handler)
+    assert await supervisor.submit(teams.TeamsDispatchTask(None, MagicMock(), None, "cancelled", "hash")) is True
+    assert await supervisor.submit(teams.TeamsDispatchTask(None, MagicMock(), None, "next", "hash")) is True
+
+    for _ in range(10):
+        if processed == ["next"]:
+            break
+        await asyncio.sleep(0.01)
+
+    assert processed == ["next"]
+    await supervisor.stop()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_stop_before_same_session_drain_leaves_no_successor_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("MARLOW_HOME", str(tmp_path))
+    adapter = _start_supervisor(_make_adapter(), max_active=2, max_pending=1)
+    adapter._receipt_store = teams.TeamsReceiptStore(teams.get_marlow_home() / "teams" / "receipts")
+    first_started = asyncio.Event()
+    handler_calls = 0
+
+    async def handler(event):
+        nonlocal handler_calls
+        handler_calls += 1
+        if handler_calls == 1:
+            first_started.set()
+        await asyncio.Event().wait()
+
+    adapter.set_message_handler(handler)
+    assert (await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-1", conversation_id="shared")))).status == 200
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+    assert (await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-2", conversation_id="shared")))).status == 200
+    await asyncio.sleep(0)
+
+    await asyncio.wait_for(adapter._supervisor.stop(), timeout=1)
+    await asyncio.sleep(0)
+
+    assert handler_calls == 1
+    assert not any(not task.done() for task in adapter._background_tasks)
+    assert not adapter._processing_successor_map()
+    assert not adapter._processing_chain_task_set()
+    assert not adapter._session_tasks
+    assert not adapter._active_sessions
+
+
+@pytest.mark.asyncio
+async def test_immediately_cancelled_processing_root_leaves_no_base_task_state():
+    adapter = _make_adapter()
+    session_key = "immediate-cancel"
+    event = teams.MessageEvent(text="hello", source=MagicMock())
+    task = adapter._start_session_processing(event, session_key)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0)
+
+    assert session_key not in adapter._active_sessions
+    assert session_key not in adapter._session_tasks
+    assert task not in adapter._background_tasks
+    assert task not in adapter._processing_chain_task_set()
+    assert task not in adapter._processing_successor_map()
+
+
+@pytest.mark.asyncio
 async def test_handle_teams_activity_dispatches_once_and_returns_200(tmp_path, monkeypatch):
     monkeypatch.setenv("MARLOW_HOME", str(tmp_path))
     adapter = _start_supervisor(_make_adapter(), max_active=2, max_pending=2)
@@ -432,6 +572,35 @@ async def test_handle_teams_activity_dispatches_once_and_returns_200(tmp_path, m
     assert response.status == 200
     await asyncio.sleep(0.05)
     assert len(events) == 1
+    await adapter._supervisor.stop()
+
+
+@pytest.mark.asyncio
+async def test_accepted_activity_delivers_handler_response_with_teams_reference(tmp_path, monkeypatch):
+    monkeypatch.setenv("MARLOW_HOME", str(tmp_path))
+    adapter = _start_supervisor(_make_adapter(), max_active=1, max_pending=1)
+    adapter._receipt_store = teams.TeamsReceiptStore(teams.get_marlow_home() / "teams" / "receipts")
+    adapter.set_message_handler(AsyncMock(return_value="Hello from Marlow"))
+    delivered = asyncio.Event()
+
+    async def capture_send(**kwargs):
+        delivered.set()
+        return teams.SendResult(success=True, message_id="reply-1")
+
+    adapter.send = AsyncMock(side_effect=capture_send)
+    adapter.send_typing = AsyncMock(return_value=teams.SendResult(success=True))
+
+    response = await adapter._handle_teams_activity(MagicMock(body=_activity()))
+    assert response.status == 200
+    await asyncio.wait_for(delivered.wait(), timeout=1)
+
+    adapter.send.assert_awaited_once()
+    sent = adapter.send.await_args.kwargs
+    assert sent["content"] == "Hello from Marlow"
+    assert sent["metadata"]["teams_reference"] == teams._conversation_reference_dict(
+        teams._sdk_conversation_reference(SERVICE_URL, _bot(), _conversation())
+    )
+    await asyncio.wait_for(adapter._supervisor.stop(), timeout=1)
 
 
 @pytest.mark.asyncio
@@ -442,6 +611,408 @@ async def test_supervisor_saturation_returns_503_without_receipt(tmp_path, monke
     response = await adapter._handle_teams_activity(MagicMock(body=_activity()))
     assert response.status == 503
     assert (tmp_path / "teams" / "receipts" / "teams_receipts.json").exists() is False
+
+
+@pytest.mark.asyncio
+async def test_supervisor_capacity_is_held_while_base_processing_is_blocked(tmp_path, monkeypatch):
+    monkeypatch.setenv("MARLOW_HOME", str(tmp_path))
+    adapter = _start_supervisor(_make_adapter(), max_active=1, max_pending=1)
+    adapter._receipt_store = teams.TeamsReceiptStore(teams.get_marlow_home() / "teams" / "receipts")
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_handler(event):
+        started.set()
+        await release.wait()
+        return None
+
+    adapter.set_message_handler(blocked_handler)
+    assert (await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-1", conversation_id="conv-1")))).status == 200
+    await asyncio.wait_for(started.wait(), timeout=1)
+    assert (await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-2", conversation_id="conv-2")))).status == 200
+    assert (await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-3", conversation_id="conv-3")))).status == 503
+
+    release.set()
+    await adapter._supervisor.stop()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_stop_cancels_owned_base_processing(tmp_path, monkeypatch):
+    monkeypatch.setenv("MARLOW_HOME", str(tmp_path))
+    adapter = _start_supervisor(_make_adapter(), max_active=1, max_pending=1)
+    adapter._receipt_store = teams.TeamsReceiptStore(teams.get_marlow_home() / "teams" / "receipts")
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def blocked_handler(event):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    adapter.set_message_handler(blocked_handler)
+    assert (await adapter._handle_teams_activity(MagicMock(body=_activity()))).status == 200
+    await asyncio.wait_for(started.wait(), timeout=1)
+    processing_task = next(iter(adapter._background_tasks))
+
+    await adapter._supervisor.stop()
+
+    assert cancelled.is_set()
+    assert processing_task.done()
+    assert processing_task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_same_session_drain_remains_supervisor_owned_until_stop(tmp_path, monkeypatch):
+    monkeypatch.setenv("MARLOW_HOME", str(tmp_path))
+    adapter = _start_supervisor(_make_adapter(), max_active=2, max_pending=1)
+    adapter._receipt_store = teams.TeamsReceiptStore(teams.get_marlow_home() / "teams" / "receipts")
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    release_first = asyncio.Event()
+    calls = 0
+
+    async def handler(event):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            first_started.set()
+            await release_first.wait()
+            return None
+        second_started.set()
+        await asyncio.Event().wait()
+
+    adapter.set_message_handler(handler)
+    assert (await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-1", conversation_id="shared")))).status == 200
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+    assert (await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-2", conversation_id="shared")))).status == 200
+    await asyncio.sleep(0)
+
+    release_first.set()
+    await asyncio.wait_for(second_started.wait(), timeout=1)
+    assert adapter._supervisor.capacity.active == 1
+
+    await asyncio.wait_for(adapter._supervisor.stop(), timeout=1)
+    await asyncio.sleep(0)
+    assert not any(not task.done() for task in adapter._background_tasks)
+
+
+@pytest.mark.asyncio
+async def test_command_drained_follow_up_remains_supervisor_owned_until_stop(tmp_path, monkeypatch):
+    monkeypatch.setenv("MARLOW_HOME", str(tmp_path))
+    adapter = _start_supervisor(_make_adapter(), max_active=2, max_pending=1)
+    adapter._receipt_store = teams.TeamsReceiptStore(teams.get_marlow_home() / "teams" / "receipts")
+    first_started = asyncio.Event()
+    command_started = asyncio.Event()
+    follow_up_started = asyncio.Event()
+    release_command = asyncio.Event()
+
+    async def handler(event):
+        if event.text == "first":
+            first_started.set()
+            await asyncio.Event().wait()
+        elif event.get_command() == "new":
+            command_started.set()
+            await release_command.wait()
+        elif event.text == "follow-up":
+            follow_up_started.set()
+            await asyncio.Event().wait()
+        return None
+
+    adapter.set_message_handler(handler)
+    assert (await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-1", conversation_id="shared", text="first")))).status == 200
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+    assert (await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-2", conversation_id="shared", text="/new")))).status == 200
+    await asyncio.wait_for(command_started.wait(), timeout=1)
+    assert (await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-3", conversation_id="shared", text="follow-up")))).status == 200
+
+    release_command.set()
+    await asyncio.wait_for(follow_up_started.wait(), timeout=1)
+    assert adapter._supervisor.capacity.active == 1
+
+    await asyncio.wait_for(adapter._supervisor.stop(), timeout=1)
+    await asyncio.sleep(0)
+    assert not any(not task.done() for task in adapter._background_tasks)
+    assert not adapter._processing_chain_task_set()
+    assert not adapter._processing_successor_map()
+    assert not adapter._session_tasks
+    assert not adapter._active_sessions
+
+
+@pytest.mark.asyncio
+async def test_failed_command_drained_follow_up_remains_supervisor_owned_until_stop(tmp_path, monkeypatch):
+    monkeypatch.setenv("MARLOW_HOME", str(tmp_path))
+    adapter = _start_supervisor(_make_adapter(), max_active=2, max_pending=1)
+    adapter._receipt_store = teams.TeamsReceiptStore(teams.get_marlow_home() / "teams" / "receipts")
+    first_started = asyncio.Event()
+    first_finished = asyncio.Event()
+    command_started = asyncio.Event()
+    follow_up_started = asyncio.Event()
+    release_first = asyncio.Event()
+    fail_command = asyncio.Event()
+
+    async def handler(event):
+        if event.text == "first":
+            first_started.set()
+            await release_first.wait()
+            first_finished.set()
+        elif event.get_command() == "new":
+            command_started.set()
+            await fail_command.wait()
+            raise RuntimeError("command failed")
+        elif event.text == "follow-up":
+            follow_up_started.set()
+            await asyncio.Event().wait()
+        return None
+
+    adapter.set_message_handler(handler)
+    assert (await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-1", conversation_id="shared", text="first")))).status == 200
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+    assert (await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-2", conversation_id="shared", text="/new")))).status == 200
+    await asyncio.wait_for(command_started.wait(), timeout=1)
+    assert (await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-3", conversation_id="shared", text="follow-up")))).status == 200
+
+    release_first.set()
+    await asyncio.wait_for(first_finished.wait(), timeout=1)
+    fail_command.set()
+    await asyncio.wait_for(follow_up_started.wait(), timeout=1)
+    assert adapter._supervisor.capacity.active == 1
+
+    await asyncio.wait_for(adapter._supervisor.stop(), timeout=1)
+    await asyncio.sleep(0)
+    assert not any(not task.done() for task in adapter._background_tasks)
+    assert not adapter._processing_chain_task_set()
+    assert not adapter._processing_successor_map()
+    assert not adapter._session_tasks
+    assert not adapter._active_sessions
+
+
+@pytest.mark.asyncio
+async def test_supervisor_stop_cancels_nested_command_without_escaping_processing_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("MARLOW_HOME", str(tmp_path))
+    adapter = _start_supervisor(_make_adapter(), max_active=2, max_pending=1)
+    adapter._receipt_store = teams.TeamsReceiptStore(teams.get_marlow_home() / "teams" / "receipts")
+    first_started = asyncio.Event()
+    command_started = asyncio.Event()
+
+    async def handler(event):
+        if event.text == "first":
+            first_started.set()
+            await asyncio.Event().wait()
+        elif event.get_command() == "new":
+            command_started.set()
+            await asyncio.Event().wait()
+        return None
+
+    adapter.set_message_handler(handler)
+    assert (await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-1", conversation_id="shared", text="first")))).status == 200
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+    assert (await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-2", conversation_id="shared", text="/new")))).status == 200
+    await asyncio.wait_for(command_started.wait(), timeout=1)
+    assert (await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-3", conversation_id="shared", text="follow-up")))).status == 200
+
+    await asyncio.wait_for(adapter._supervisor.stop(), timeout=1)
+    await asyncio.sleep(0)
+    assert not any(not task.done() for task in adapter._background_tasks)
+    assert not adapter._processing_chain_task_set()
+    assert not adapter._processing_successor_map()
+    assert not adapter._processing_guard_map()
+    assert not adapter._session_tasks
+    assert not adapter._active_sessions
+
+
+@pytest.mark.asyncio
+async def test_supervisor_stop_cancels_command_waiting_for_old_processor_cleanup(tmp_path, monkeypatch):
+    monkeypatch.setenv("MARLOW_HOME", str(tmp_path))
+    adapter = _start_supervisor(_make_adapter(), max_active=2, max_pending=1)
+    adapter._receipt_store = teams.TeamsReceiptStore(teams.get_marlow_home() / "teams" / "receipts")
+    first_started = asyncio.Event()
+    old_cleanup_entered = asyncio.Event()
+    release_old_cleanup = asyncio.Event()
+
+    async def handler(event):
+        if event.text == "first":
+            first_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                old_cleanup_entered.set()
+                await release_old_cleanup.wait()
+                raise
+        elif event.get_command() == "new":
+            return None
+        return None
+
+    adapter.set_message_handler(handler)
+    assert (await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-1", conversation_id="shared", text="first")))).status == 200
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+    assert (await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-2", conversation_id="shared", text="/new")))).status == 200
+    await asyncio.wait_for(old_cleanup_entered.wait(), timeout=1)
+    assert (await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-3", conversation_id="shared", text="follow-up")))).status == 200
+
+    stop_task = asyncio.create_task(adapter._supervisor.stop())
+    await asyncio.sleep(0)
+    release_old_cleanup.set()
+    await asyncio.wait_for(stop_task, timeout=1)
+    await asyncio.sleep(0)
+    assert not any(not task.done() for task in adapter._background_tasks)
+    assert not adapter._processing_chain_task_set()
+    assert not adapter._processing_successor_map()
+    assert not adapter._processing_guard_map()
+    assert not adapter._session_tasks
+    assert not adapter._active_sessions
+
+
+@pytest.mark.asyncio
+async def test_three_message_same_session_drain_chain_stays_owned_until_stop(tmp_path, monkeypatch):
+    monkeypatch.setenv("MARLOW_HOME", str(tmp_path))
+    adapter = _start_supervisor(_make_adapter(), max_active=2, max_pending=1)
+    adapter._receipt_store = teams.TeamsReceiptStore(teams.get_marlow_home() / "teams" / "receipts")
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    third_started = asyncio.Event()
+    release_first = asyncio.Event()
+    release_second = asyncio.Event()
+    calls = 0
+
+    async def handler(event):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            first_started.set()
+            await release_first.wait()
+        elif calls == 2:
+            second_started.set()
+            await release_second.wait()
+        else:
+            third_started.set()
+            await asyncio.Event().wait()
+
+    adapter.set_message_handler(handler)
+    assert (await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-1", conversation_id="shared")))).status == 200
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+    assert (await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-2", conversation_id="shared")))).status == 200
+    await asyncio.sleep(0)
+
+    release_first.set()
+    await asyncio.wait_for(second_started.wait(), timeout=1)
+    assert (await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-3", conversation_id="shared")))).status == 200
+    await asyncio.sleep(0)
+
+    release_second.set()
+    await asyncio.wait_for(third_started.wait(), timeout=1)
+    assert adapter._supervisor.capacity.active == 1
+
+    await asyncio.wait_for(adapter._supervisor.stop(), timeout=1)
+    await asyncio.sleep(0)
+    assert not any(not task.done() for task in adapter._background_tasks)
+    assert not adapter._processing_chain_task_set()
+    assert not adapter._processing_successor_map()
+    assert not adapter._session_tasks
+    assert not adapter._active_sessions
+
+
+@pytest.mark.asyncio
+async def test_predecessor_cleanup_barrier_preserves_three_message_chain_until_stop(tmp_path, monkeypatch):
+    monkeypatch.setenv("MARLOW_HOME", str(tmp_path))
+    adapter = _start_supervisor(_make_adapter(), max_active=2, max_pending=1)
+    adapter._receipt_store = teams.TeamsReceiptStore(teams.get_marlow_home() / "teams" / "receipts")
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    third_started = asyncio.Event()
+    root_before_chain_consume = asyncio.Event()
+    release_first = asyncio.Event()
+    release_second = asyncio.Event()
+    release_root_before_chain_consume = asyncio.Event()
+    calls = 0
+
+    async def handler(event):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            first_started.set()
+            await release_first.wait()
+        elif calls == 2:
+            second_started.set()
+            await release_second.wait()
+        else:
+            third_started.set()
+            await asyncio.Event().wait()
+
+    original_process_message = adapter._process_message_background
+
+    async def delay_root_before_chain_consume(event, session_key):
+        result = await original_process_message(event, session_key)
+        if event.message_id == "msg-1":
+            root_before_chain_consume.set()
+            await release_root_before_chain_consume.wait()
+        return result
+
+    adapter._process_message_background = delay_root_before_chain_consume
+    adapter.set_message_handler(handler)
+    assert (await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-1", conversation_id="shared")))).status == 200
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+    assert (await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-2", conversation_id="shared")))).status == 200
+
+    release_first.set()
+    await asyncio.wait_for(second_started.wait(), timeout=1)
+    await asyncio.wait_for(root_before_chain_consume.wait(), timeout=1)
+    assert (await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-3", conversation_id="shared")))).status == 200
+
+    release_second.set()
+    await asyncio.wait_for(third_started.wait(), timeout=1)
+    assert len(adapter._processing_successor_map()) == 2
+    assert adapter._supervisor.capacity.active == 1
+
+    release_root_before_chain_consume.set()
+    await asyncio.wait_for(adapter._supervisor.stop(), timeout=1)
+    await asyncio.sleep(0)
+    assert not any(not task.done() for task in adapter._background_tasks)
+    assert not adapter._processing_chain_task_set()
+    assert not adapter._processing_successor_map()
+    assert not adapter._session_tasks
+    assert not adapter._active_sessions
+
+
+@pytest.mark.asyncio
+async def test_cancel_background_tasks_timeout_clears_processing_tracking(monkeypatch):
+    adapter = _make_adapter()
+    cancellation_started = asyncio.Event()
+    allow_straggler_exit = asyncio.Event()
+
+    async def cancellation_swallowing_task():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellation_started.set()
+            await allow_straggler_exit.wait()
+
+    straggler = asyncio.create_task(cancellation_swallowing_task())
+    successor = asyncio.create_task(asyncio.Event().wait())
+    await asyncio.sleep(0)
+    adapter._background_tasks.add(straggler)
+    adapter._processing_chain_task_set().add(straggler)
+    adapter._processing_successor_map()[straggler] = successor
+    original_wait_for = asyncio.wait_for
+
+    async def immediate_timeout(*args, **kwargs):
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr(platform_base.asyncio, "wait_for", immediate_timeout)
+    await adapter.cancel_background_tasks()
+    monkeypatch.setattr(platform_base.asyncio, "wait_for", original_wait_for)
+    await original_wait_for(cancellation_started.wait(), timeout=1)
+
+    assert not straggler.done()
+    assert not adapter._background_tasks
+    assert not adapter._processing_chain_task_set()
+    assert not adapter._processing_successor_map()
+
+    allow_straggler_exit.set()
+    await original_wait_for(straggler, timeout=1)
+    successor.cancel()
+    await asyncio.gather(successor, return_exceptions=True)
 
 
 def test_aiohttp_adapter_to_response_handles_sdk_response_shapes():
@@ -538,6 +1109,51 @@ async def test_retry_delay_honors_retry_after(monkeypatch):
     assert adapter._teams_app.activity_sender.send.call_count == 3
     assert teams.asyncio.sleep.await_args_list[0].args == (1.5,)
     assert teams.asyncio.sleep.await_args_list[1].args == (20.0,)
+
+
+@pytest.mark.asyncio
+async def test_later_chunk_failure_does_not_replay_successful_teams_chunk(monkeypatch):
+    adapter = _make_adapter(text_budget_bytes=10, outbound_max_attempts=2)
+    monkeypatch.setattr(teams.asyncio, "sleep", AsyncMock())
+    adapter._teams_app = MagicMock()
+    adapter._teams_app.activity_sender.send = AsyncMock(
+        side_effect=[
+            SimpleNamespace(id="m1"),
+            Exception("timeout"),
+            Exception("timeout"),
+        ]
+    )
+    ref = teams._sdk_conversation_reference(SERVICE_URL, _bot(), _conversation())
+
+    result = await adapter._send_with_retry(
+        "chat",
+        "alpha beta gamma",
+        metadata={"teams_reference": teams._conversation_reference_dict(ref)},
+    )
+
+    assert result.success is False
+    assert adapter._teams_app.activity_sender.send.call_count == 3
+    assert [call.args[0].text for call in adapter._teams_app.activity_sender.send.await_args_list] == ["alpha", "beta", "beta"]
+
+
+@pytest.mark.asyncio
+async def test_persistent_teams_delivery_failure_uses_only_transport_attempt_limit(monkeypatch, caplog):
+    adapter = _make_adapter(outbound_max_attempts=3)
+    monkeypatch.setattr(teams.asyncio, "sleep", AsyncMock())
+    adapter._teams_app = MagicMock()
+    adapter._teams_app.activity_sender.send = AsyncMock(side_effect=[Exception("timeout")] * 3)
+    ref = teams._sdk_conversation_reference(SERVICE_URL, _bot(), _conversation())
+
+    result = await adapter._send_with_retry(
+        "chat",
+        "response with secret text",
+        metadata={"teams_reference": teams._conversation_reference_dict(ref)},
+    )
+
+    assert result.success is False
+    assert adapter._teams_app.activity_sender.send.call_count == 3
+    assert "Teams response delivery failed after bounded send attempt" in caplog.text
+    assert "response with secret text" not in caplog.text
 
 
 def test_send_image_rejects_http_url_without_graph_fallback():
