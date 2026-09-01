@@ -22,17 +22,24 @@ import secrets
 import sys
 import time
 import uuid
+import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 import socket
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
+    ExternalActor,
+    ExternalActorKind,
+    ExternalAttachmentDescriptor,
+    ExternalConversationMessage,
+    ExternalConversationSnapshot,
+    ExternalHistoryMode,
     MessageEvent,
     MessageType,
     ProcessingOutcome,
@@ -40,6 +47,7 @@ from gateway.platforms.base import (
     cache_image_from_bytes,
     cache_media_bytes,
     is_network_accessible,
+    render_external_conversation_snapshot,
 )
 from marlow_constants import get_marlow_home
 from tools.url_safety import is_safe_url
@@ -73,6 +81,30 @@ _REDACTION = "[REDACTED]"
 _LOCK_SCOPE = "teams-client"
 _RECEIPT_VERSION = 1
 
+TEAMS_THREAD_CONTEXT_RE = re.compile(r"(?:^|;)messageid=([^;]+)(?=;|$)")
+GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
+GRAPH_REPLY_TOP = 50
+GRAPH_CONTEXT_TIMEOUT_SECONDS = 30.0
+GRAPH_RETRY_AFTER_DEFAULT_SECONDS = 1.0
+GRAPH_CONTEXT_RETRY_ATTEMPTS = 2
+GRAPH_CONTEXT_RETRY_DELAY_SECONDS = 1.0
+
+
+class TeamsThreadContextError(Exception):
+    user_facing_message: str
+
+    def __init__(self, message: str, *, user_facing_message: str) -> None:
+        super().__init__(message)
+        self.user_facing_message = user_facing_message
+
+
+@dataclass(frozen=True, slots=True)
+class TeamsThreadLocator:
+    tenant_id: str
+    team_aad_group_id: str
+    channel_id: str
+    root_message_id: str
+
 try:  # pragma: no cover - exercised by dependency install in live environments.
     from microsoft_teams.api.activities.message.message import MessageActivityInput
     from microsoft_teams.api.activities.typing import TypingActivityInput
@@ -94,7 +126,7 @@ try:  # pragma: no cover - exercised by dependency install in live environments.
     from microsoft_teams.apps import App
     from microsoft_teams.apps.http.adapter import HttpRequest, HttpResponse, HttpServerAdapter
     from microsoft_teams.apps.http.http_server import HttpServer
-    from microsoft_teams.common import Client
+    from microsoft_teams.common import Client, ClientOptions
     from microsoft_teams.cards import AdaptiveCard, SubmitAction, TextBlock
 
     TEAMS_AVAILABLE = True
@@ -297,8 +329,15 @@ def _activity_to_dict(activity: Any) -> Dict[str, Any]:
 
 
 def _activity_from_core(activity: Any) -> Any:
+    if isinstance(activity, dict):
+        if Activity is None:
+            return activity
+        try:
+            return Activity.model_validate(activity)
+        except Exception:
+            return activity
     if Activity is None:
-        raise RuntimeError("Teams SDK activity model is unavailable")
+        return activity
     try:
         return Activity.model_validate(activity.model_dump(mode="json"))
     except Exception:
@@ -362,6 +401,13 @@ def _sdk_conversation_reference(service_url: str, bot: Any, conversation: Any) -
 
 
 def _extract_channel_data(activity: Any) -> Dict[str, Any]:
+    if isinstance(activity, dict):
+        data = activity.get("channelData")
+        if data is None:
+            data = activity.get("channel_data")
+        if isinstance(data, dict):
+            return dict(data)
+        return {}
     channel_data = getattr(activity, "channel_data", None)
     if channel_data is None:
         return {}
@@ -390,6 +436,10 @@ def _extract_channel_type(channel_data: Dict[str, Any]) -> Optional[str]:
 
 
 def _extract_conversation_type(activity: Any) -> str:
+    if isinstance(activity, dict):
+        conv = activity.get("conversation") or {}
+        if isinstance(conv, dict):
+            return str(conv.get("conversation_type") or conv.get("conversationType") or conv.get("is_group") or "").strip()
     conv = getattr(activity, "conversation", None)
     if conv is None:
         return ""
@@ -446,6 +496,11 @@ def _entity_mentions_bot(entity: Any, recipient_id: str, fallback_bot_id: str) -
 
 
 def _recipient_bot_id(activity: Any) -> str:
+    if isinstance(activity, dict):
+        recipient = activity.get("recipient") or {}
+        if isinstance(recipient, dict):
+            return _normalize_uuid(recipient.get("id"))
+        return ""
     recipient = getattr(activity, "recipient", None)
     return _normalize_uuid(recipient.get("id") if isinstance(recipient, dict) else getattr(recipient, "id", None))
 
@@ -486,7 +541,8 @@ def _strip_bot_mentions(activity: Any, bot_id: str) -> Tuple[str, bool]:
 def _activity_mentions_bot(activity: Any, bot_id: str) -> bool:
     recipient_id = _recipient_bot_id(activity)
     fallback_bot_id = _normalize_uuid(bot_id)
-    for entity in getattr(activity, "entities", None) or []:
+    entities = activity.get("entities", []) if isinstance(activity, dict) else getattr(activity, "entities", None) or []
+    for entity in entities:
         if _entity_mentions_bot(entity, recipient_id, fallback_bot_id):
             return True
     return False
@@ -839,6 +895,7 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
         self._status_reasons: List[str] = []
         self._lock_acquired = False
         self._message_handler = None
+        self._team_aad_group_cache: Dict[Tuple[str, str], str] = {}
 
 
     @staticmethod
@@ -993,6 +1050,7 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
                 pass
             self._teams_app = None
         self._teams_adapter = None
+        self._team_aad_group_cache.clear()
         self._release_lock()
 
     def _build_http_app(self) -> None:
@@ -1034,6 +1092,7 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
                 pass
             self._teams_app = None
         self._teams_adapter = None
+        self._team_aad_group_cache.clear()
         self._release_lock()
         self._status_reasons.clear()
         self._status = "disabled"
@@ -1205,8 +1264,485 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
             return str(tenant)
         return ""
 
+
     def _is_safe_attachment_url(self, url: str) -> bool:
         return bool(is_safe_url(url))
+
+    def _thread_context_enabled(self) -> bool:
+        thread_context = self.config.extra.get("thread_context") or {}
+        return bool(thread_context.get("enabled", False))
+
+    def _thread_context_require_complete(self) -> bool:
+        thread_context = self.config.extra.get("thread_context") or {}
+        return bool(thread_context.get("require_complete", True))
+
+    def _graph_client(self) -> Any:
+        if not self._teams_app:
+            raise TeamsThreadContextError(
+                "Teams app is not connected",
+                user_facing_message="I could not read the Teams thread because Marlow is not connected to Teams right now.",
+            )
+        get_graph = getattr(self._teams_app, "get_app_graph", None)
+        if get_graph is not None:
+            try:
+                graph = get_graph(self._tenant_id)
+                if hasattr(graph, "get") and callable(graph.get):
+                    return graph
+            except ImportError:
+                pass
+        get_graph_token = getattr(self._teams_app, "_get_graph_token", None)
+        if get_graph_token is None or Client is None or ClientOptions is None:
+            raise TeamsThreadContextError(
+                "Teams SDK Graph client is unavailable",
+                user_facing_message="I could not read the Teams thread because the Teams Graph client is not available.",
+            )
+        return Client(
+            ClientOptions(
+                base_url=GRAPH_BASE_URL,
+                timeout=GRAPH_CONTEXT_TIMEOUT_SECONDS,
+                token=lambda: get_graph_token(self._tenant_id),
+            )
+        )
+
+    def _parse_root_message_id(self, activity: Any) -> Optional[str]:
+        conversation = getattr(activity, "conversation", None)
+        conversation_id = getattr(conversation, "id", None) if conversation is not None else None
+        if conversation_id is None and isinstance(activity, dict):
+            conversation = activity.get("conversation") or {}
+            conversation_id = conversation.get("id") if isinstance(conversation, dict) else None
+        conversation_id = str(conversation_id or "")
+        if conversation_id.count("messageid=") != 1:
+            return None
+        matches = TEAMS_THREAD_CONTEXT_RE.findall(conversation_id)
+        if len(matches) != 1:
+            return None
+        value = matches[0].strip()
+        return value or None
+
+    async def _thread_locator(self, activity: Any) -> Optional[TeamsThreadLocator]:
+        channel_data = _extract_channel_data(activity)
+        if _extract_channel_type(channel_data) not in {"standard", None}:
+            return None
+        team_id = await self._resolve_team_aad_group_id_from_channel_data(channel_data)
+        if not team_id or not _is_valid_uuid(team_id):
+            return None
+        channel_id = _extract_channel_id(channel_data)
+        root_message_id = self._parse_root_message_id(activity)
+        if not channel_id or not root_message_id:
+            return None
+        return TeamsThreadLocator(
+            tenant_id=self._tenant_id,
+            team_aad_group_id=_normalize_uuid(team_id),
+            channel_id=str(channel_id),
+            root_message_id=str(root_message_id),
+        )
+
+    async def _resolve_team_aad_group_id_from_channel_data(self, channel_data: Dict[str, Any]) -> Optional[str]:
+        team_data = channel_data.get("team") if isinstance(channel_data.get("team"), dict) else {}
+        direct = (
+            channel_data.get("aad_group_id")
+            or channel_data.get("aadGroupId")
+            or channel_data.get("team_aad_group_id")
+            or team_data.get("aad_group_id")
+            or team_data.get("aadGroupId")
+            or (_normalize_uuid(team_data.get("id")) if team_data.get("id") and _is_valid_uuid(team_data.get("id")) else None)
+        )
+        if direct and _is_valid_uuid(direct):
+            return _normalize_uuid(direct)
+
+        internal_team_id = _extract_team_id(channel_data)
+        if not internal_team_id:
+            return None
+        cache_key = (self._tenant_id, str(internal_team_id))
+        cached = self._team_aad_group_cache.get(cache_key)
+        if cached:
+            return cached
+
+        api = getattr(getattr(self._teams_app, "api", None), "teams", None)
+        get_team = getattr(api, "get_by_id", None)
+        if get_team is None:
+            return None
+
+        details = get_team(str(internal_team_id))
+        if inspect.isawaitable(details):
+            details = await details
+        aad_group_id = getattr(details, "aad_group_id", None) if not isinstance(details, dict) else details.get("aad_group_id")
+        if not aad_group_id or not _is_valid_uuid(aad_group_id):
+            return None
+        normalized = _normalize_uuid(aad_group_id)
+        self._team_aad_group_cache[cache_key] = normalized
+        return normalized
+
+    async def enrich_authorized_event(self, event: MessageEvent) -> MessageEvent:
+        activity = getattr(event, "raw_message", None)
+        if activity is None or not isinstance(getattr(event, "raw_message", None), dict):
+            return event
+        activity_obj = _activity_from_core(activity)
+        return await self._enrich_thread_context(event, activity_obj)
+
+    async def _enrich_thread_context(self, event: MessageEvent, activity: Any) -> MessageEvent:
+        if not self._thread_context_enabled():
+            return event
+        if not event.source or event.source.chat_type != "channel":
+            return event
+        channel_data = _extract_channel_data(activity)
+        if _extract_channel_type(channel_data) not in {"standard", None}:
+            raise TeamsThreadContextError(
+                "Teams thread context is supported only for standard channels",
+                user_facing_message="Full-thread context is currently supported only in standard Teams channels.",
+            )
+        if not self._thread_context_require_complete():
+            raise TeamsThreadContextError(
+                "Teams thread context require_complete must remain enabled",
+                user_facing_message="Full-thread context cannot run with partial context enabled.",
+            )
+        try:
+            locator = await self._thread_locator(activity)
+            if locator is None:
+                raise TeamsThreadContextError(
+                    "Teams thread context cannot resolve a complete thread locator",
+                    user_facing_message="I could not read the full Teams thread because the thread locator is incomplete.",
+                )
+            snapshot = await self._load_thread_snapshot(event, activity, locator)
+            if not snapshot.complete_through_trigger:
+                raise TeamsThreadContextError(
+                    "Teams thread context was not complete through the trigger",
+                    user_facing_message="I could not read the full Teams thread through your message, so I did not answer from partial context.",
+                )
+            rendered = render_external_conversation_snapshot(snapshot, event)
+            if len(rendered.encode("utf-8")) > self._text_budget_bytes:
+                raise TeamsThreadContextError(
+                    "Teams thread context exceeds the local text budget",
+                    user_facing_message="This Teams thread is too large for the current full-thread context limit, so I did not answer from partial context.",
+                )
+            return dataclasses.replace(event, external_conversation_snapshot=snapshot)
+        except TeamsThreadContextError:
+            raise
+        except Exception as exc:
+            raise TeamsThreadContextError(
+                f"Teams thread context load failed: {type(exc).__name__}",
+                user_facing_message="I could not read the full Teams thread, so I did not answer from partial context.",
+            ) from exc
+
+    async def _load_thread_snapshot(self, event: MessageEvent, activity: Any, locator: TeamsThreadLocator) -> ExternalConversationSnapshot:
+        graph = self._graph_client()
+        messages: Dict[str, Dict[str, Any]] = {}
+        for attempt in range(GRAPH_CONTEXT_RETRY_ATTEMPTS + 1):
+            try:
+                root = await self._graph_get(graph, locator, "root")
+                replies = await self._graph_get_replies(graph, locator)
+                messages.clear()
+                for item in [root] + replies:
+                    message_id = str(item.get("id") or "")
+                    if not message_id:
+                        raise TeamsThreadContextError(
+                            "Graph message missing id",
+                            user_facing_message="I could not read the full Teams thread because Graph returned an incomplete message.",
+                        )
+                    if message_id in messages and messages[message_id] != item:
+                        raise TeamsThreadContextError(
+                            "Graph returned conflicting payloads for message id",
+                            user_facing_message="I could not read the full Teams thread because Graph returned conflicting message data.",
+                        )
+                    messages[message_id] = item
+                return self._build_snapshot(event, activity, locator, messages)
+            except TeamsThreadContextError:
+                raise
+            except Exception as exc:
+                if attempt >= GRAPH_CONTEXT_RETRY_ATTEMPTS or not self._is_retryable_graph_error(exc):
+                    raise TeamsThreadContextError(
+                        f"Teams thread context load failed after retries: {type(exc).__name__}",
+                        user_facing_message=self._graph_user_facing_message(exc),
+                    ) from exc
+                await asyncio.sleep(self._retry_after_delay(exc, attempt))
+        raise TeamsThreadContextError(
+            "Teams thread context load failed",
+            user_facing_message="I could not read the full Teams thread, so I did not answer from partial context.",
+        )
+
+    async def _graph_get(self, graph: Any, locator: TeamsThreadLocator, operation: str) -> Dict[str, Any]:
+        url = self._graph_thread_message_url(locator)
+        return await self._graph_request_json(graph, url, operation)
+
+    async def _graph_get_replies(self, graph: Any, locator: TeamsThreadLocator) -> List[Dict[str, Any]]:
+        replies: List[Dict[str, Any]] = []
+        next_link: Optional[str] = None
+        seen_links: set[str] = set()
+        url = self._graph_thread_replies_url(locator)
+        while True:
+            if next_link:
+                if next_link in seen_links:
+                    raise TeamsThreadContextError(
+                        "Graph replies nextLink loop detected",
+                        user_facing_message="I could not read the full Teams thread because Graph returned a pagination loop.",
+                    )
+                seen_links.add(next_link)
+                url = next_link
+            result = await self._graph_request_json(graph, url, "replies")
+            values = result.get("value")
+            if not isinstance(values, list):
+                raise TeamsThreadContextError(
+                    "Graph replies response missing value",
+                    user_facing_message="I could not read the full Teams thread because Graph returned an incomplete reply page.",
+                )
+            replies.extend(values)
+            next_link = result.get("@odata.nextLink")
+            if not next_link:
+                break
+        return replies
+
+    async def _graph_request_json(self, graph: Any, url: str, operation: str) -> Dict[str, Any]:
+        result = graph.get(url)
+        if inspect.isawaitable(result):
+            result = await result
+        if hasattr(result, "json"):
+            try:
+                result = result.json()
+            except Exception as exc:
+                raise TeamsThreadContextError(
+                    f"Graph {operation} response could not be decoded",
+                    user_facing_message=f"I could not read the full Teams thread because Graph returned malformed {operation} data.",
+                ) from exc
+        if not isinstance(result, dict):
+            raise TeamsThreadContextError(
+                f"Graph {operation} response was not JSON",
+                user_facing_message=f"I could not read the full Teams thread because Graph returned malformed {operation} data.",
+            )
+        return result
+
+    def _graph_status_code(self, exc: Exception) -> Optional[int]:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+        try:
+            return int(status) if status is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _graph_user_facing_message(self, exc: Exception) -> str:
+        status = self._graph_status_code(exc)
+        if status == 401:
+            return "I could not read the full Teams thread because Marlow could not authenticate to Microsoft Graph."
+        if status == 403:
+            return "I could not read the full Teams thread because Marlow is missing thread-read consent in this Team."
+        if status == 404:
+            return "I could not read the full Teams thread because the Team, channel, or root message was not found."
+        if status == 429:
+            return "I could not read the full Teams thread because Microsoft Graph throttled the request. Please retry the mention."
+        if status in {500, 502, 503, 504}:
+            return "I could not read the full Teams thread after a Microsoft Graph service error. Please retry the mention."
+        return "I could not read the full Teams thread, so I did not answer from partial context."
+
+    def _is_retryable_graph_error(self, exc: Exception) -> bool:
+        status = self._graph_status_code(exc)
+        if status == 429 or status in {500, 502, 503, 504}:
+            return True
+        message = str(exc).lower()
+        return any(token in message for token in ("timeout", "429", "500", "502", "503", "504", "rate limit"))
+
+    def _retry_after_delay(self, exc: Exception, attempt: int) -> float:
+        retry_after = _retry_after_seconds(exc)
+        if retry_after is not None:
+            return max(0.0, retry_after)
+        return max(GRAPH_RETRY_AFTER_DEFAULT_SECONDS, GRAPH_CONTEXT_RETRY_DELAY_SECONDS * (attempt + 1))
+
+    def _graph_thread_message_url(self, locator: TeamsThreadLocator) -> str:
+        return "/".join(
+            [
+                "",
+                "teams",
+                self._quote_graph_segment(locator.team_aad_group_id),
+                "channels",
+                self._quote_graph_segment(locator.channel_id),
+                "messages",
+                self._quote_graph_segment(locator.root_message_id),
+            ]
+        )
+
+    def _graph_thread_replies_url(self, locator: TeamsThreadLocator) -> str:
+        return f"{self._graph_thread_message_url(locator)}/replies?$top={GRAPH_REPLY_TOP}"
+
+    def _quote_graph_segment(self, value: str) -> str:
+        return quote(value, safe="")
+
+    def _build_snapshot(
+        self,
+        event: MessageEvent,
+        activity: Any,
+        locator: TeamsThreadLocator,
+        graph_messages: Dict[str, Dict[str, Any]],
+    ) -> ExternalConversationSnapshot:
+        activity_id = str(getattr(activity, "id", "") or "")
+        if not activity_id:
+            raise TeamsThreadContextError(
+                "Triggering activity is missing id",
+                user_facing_message="I could not read the full Teams thread because the triggering Teams message has no stable id.",
+            )
+        activity_data = _activity_to_dict(activity)
+        activity_ts = self._parse_graph_datetime(activity_data.get("created_date_time") or activity_data.get("createdDateTime"))
+        normalized: List[ExternalConversationMessage] = []
+        for message_id, item in graph_messages.items():
+            msg = self._normalize_graph_message(item)
+            if msg is None:
+                raise TeamsThreadContextError(
+                    f"Graph message {message_id} could not be normalized",
+                    user_facing_message="I could not read the full Teams thread because Graph returned an incomplete message.",
+                )
+            normalized.append(msg)
+        normalized.sort(key=lambda msg: (0 if msg.message_id == locator.root_message_id else 1, msg.created_at or datetime.min.replace(tzinfo=timezone.utc), msg.message_id))
+        trigger_index = next((i for i, msg in enumerate(normalized) if msg.message_id == activity_id), None)
+        if trigger_index is not None:
+            graph_message = normalized[trigger_index]
+            normalized = normalized[: trigger_index + 1]
+            normalized[-1] = dataclasses.replace(graph_message, is_trigger=True)
+        else:
+            if activity_ts is None:
+                raise TeamsThreadContextError(
+                    "Triggering activity timestamp is missing",
+                    user_facing_message="I could not read the full Teams thread because the triggering Teams message has no timestamp.",
+                )
+            normalized = [msg for msg in normalized if msg.created_at < activity_ts]
+            trigger_activity = self._normalize_activity(activity)
+            if trigger_activity is None:
+                raise TeamsThreadContextError(
+                    "Triggering activity could not be normalized",
+                    user_facing_message="I could not read the full Teams thread because the triggering Teams message could not be normalized.",
+                )
+            normalized.append(trigger_activity)
+        return ExternalConversationSnapshot(
+            source_kind="teams_channel_thread",
+            platform=Platform(TEAMS_PLATFORM),
+            chat_id=getattr(getattr(event, "source", None), "chat_id", ""),
+            thread_id=getattr(getattr(event, "source", None), "thread_id", ""),
+            captured_at=_utc_now(),
+            trigger_message_id=activity_id,
+            complete_through_trigger=True,
+            history_mode=ExternalHistoryMode.REPLACE_VISIBLE_SESSION_HISTORY,
+            messages=tuple(normalized),
+        )
+
+    def _normalize_graph_message(self, item: Dict[str, Any]) -> Optional[ExternalConversationMessage]:
+        message_id = str(item.get("id") or "")
+        if not message_id:
+            return None
+        created_at = self._parse_graph_datetime(item.get("createdDateTime") or item.get("created_date_time"))
+        edited_at = self._parse_graph_datetime(item.get("lastEditedDateTime") or item.get("last_edited_date_time"))
+        deleted_at = self._parse_graph_datetime(item.get("deletedDateTime") or item.get("deleted_date_time"))
+        subject = item.get("subject")
+        text = self._graph_body_text(item.get("body"))
+        if deleted_at is not None:
+            text = "[message deleted]"
+        elif edited_at is not None:
+            text = f"{text}\n[edited]"
+        attachments = self._normalize_graph_attachments(item.get("attachments") or [])
+        return ExternalConversationMessage(
+            message_id=message_id,
+            parent_message_id=item.get("replyToId"),
+            actor=self._actor_from_graph(item.get("from")),
+            created_at=created_at or _utc_now(),
+            edited_at=edited_at,
+            deleted_at=deleted_at,
+            subject=str(subject) if subject is not None else None,
+            text=text,
+            attachments=tuple(attachments),
+        )
+
+    def _normalize_activity(self, activity: Any) -> Optional[ExternalConversationMessage]:
+        message_id = str(getattr(activity, "id", "") or "")
+        if not message_id:
+            return None
+        created_at = self._parse_graph_datetime(getattr(activity, "created_date_time", None) or getattr(activity, "createdDateTime", None)) or _utc_now()
+        text = _activity_text(activity)
+        if text:
+            text = _strip_bot_mentions(activity, _normalize_uuid(self._client_id))[0]
+        return ExternalConversationMessage(
+            message_id=message_id,
+            parent_message_id=getattr(activity, "reply_to_id", None) or getattr(activity, "replyToId", None),
+            actor=self._actor_from_graph(_activity_to_dict(activity).get("from")),
+            created_at=created_at,
+            edited_at=self._parse_graph_datetime(getattr(activity, "last_edited_date_time", None) or getattr(activity, "lastEditedDateTime", None)),
+            deleted_at=self._parse_graph_datetime(getattr(activity, "deleted_date_time", None) or getattr(activity, "deletedDateTime", None)),
+            subject=getattr(activity, "subject", None),
+            text=text,
+            attachments=(),
+            is_trigger=True,
+        )
+
+    def _graph_body_text(self, body: Any) -> str:
+        if isinstance(body, dict):
+            content = body.get("content")
+            content_type = body.get("contentType") or body.get("content_type")
+            if isinstance(content, str):
+                if content_type == "text":
+                    return _safe_text(content)
+                return self._html_to_text(content)
+        if body is None:
+            return ""
+        return _safe_text(body)
+
+    def _html_to_text(self, html: str) -> str:
+        html = re.sub(r"(?is)<(script|style|noscript)\b[^>]*>.*?</\1>", "", html)
+        try:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(html, "html.parser")
+            for tag in soup(["script", "style", "noscript"]):
+                tag.decompose()
+            for br in soup.find_all("br"):
+                br.replace_with("\n")
+            for p in soup.find_all("p"):
+                p.append("\n\n")
+            return _safe_text(soup.get_text("\n"))
+        except Exception:
+            return _safe_text(re.sub(r"<[^>]+>", "\n", html))
+
+    def _normalize_graph_attachments(self, attachments: Any) -> List[ExternalAttachmentDescriptor]:
+        result: List[ExternalAttachmentDescriptor] = []
+        for index, attachment in enumerate(attachments or []):
+            if not isinstance(attachment, dict):
+                attachment = _dict_from_sdk_object(attachment)
+            name = attachment.get("name") or attachment.get("id")
+            content_type = attachment.get("contentType") or attachment.get("content_type")
+            result.append(
+                ExternalAttachmentDescriptor(
+                    attachment_id=attachment.get("id"),
+                    name=str(name) if name is not None else None,
+                    content_type=str(content_type) if content_type is not None else None,
+                    reference_kind=self._attachment_reference_kind(str(content_type or ""), str(name or "")),
+                )
+            )
+        return result[:12]
+
+    def _attachment_reference_kind(self, content_type: str, name: str) -> str:
+        if content_type.startswith("image/"):
+            return "image"
+        if content_type.startswith("text/"):
+            return "file"
+        if content_type.startswith("application/vnd.microsoft.card"):
+            return "card"
+        if name.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+            return "image"
+        if name.endswith((".txt", ".md", ".csv", ".log")):
+            return "file"
+        return "unknown"
+
+    def _actor_from_graph(self, identity: Any) -> ExternalActor:
+        if isinstance(identity, dict):
+            user = identity.get("user") or identity.get("application") or identity.get("device") or identity.get("conversation")
+            if isinstance(user, dict):
+                display = user.get("displayName") or user.get("display_name") or user.get("name")
+                stable_id = user.get("id") or user.get("aadObjectId") or user.get("aad_object_id")
+                kind = ExternalActorKind.USER
+                if identity.get("application") or "application" in user:
+                    kind = ExternalActorKind.APPLICATION
+                return ExternalActor(kind=kind, stable_id=str(stable_id) if stable_id else None, display_name=str(display) if display else None)
+        return ExternalActor(kind=ExternalActorKind.UNKNOWN, stable_id=None, display_name=None)
+
+    def _parse_graph_datetime(self, value: Any) -> Optional[datetime]:
+        if not isinstance(value, str):
+            return None
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
 
     async def _build_dispatch_task(self, activity: Any) -> Optional[TeamsDispatchTask]:
         receipt_key = _canonical_activity_key(activity, self._client_id, self._tenant_id)

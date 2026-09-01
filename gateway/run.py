@@ -1142,10 +1142,13 @@ from gateway.delivery import DeliveryRouter
 from gateway.platforms.base import (
     BasePlatformAdapter,
     EphemeralReply,
+    ExternalConversationSnapshot,
+    ExternalHistoryMode,
     MessageEvent,
     MessageType,
     _reply_anchor_for_event,
     merge_pending_message_event,
+    render_external_conversation_snapshot,
 )
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
@@ -6480,6 +6483,45 @@ class GatewayRunner:
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
+
+        # Ask the owning adapter to attach turn-scoped authorized context.
+        # This runs after sender authorization and before session creation or
+        # agent execution. Enrichment must not alter the authenticated actor or
+        # route; a source mutation is treated as a failed turn.
+        adapter = self.adapters.get(source.platform)
+        if adapter:
+            try:
+                enriched_event = await adapter.enrich_authorized_event(event)
+                if enriched_event.source is not original_source:
+                    logger.warning(
+                        "Authorized event enrichment changed source identity; rejecting event platform=%s chat=%s",
+                        original_source.platform.value if original_source.platform else "unknown",
+                        original_source.chat_id or "unknown",
+                    )
+                    return None
+                event = enriched_event
+            except Exception as exc:
+                user_facing_message = getattr(exc, "user_facing_message", None)
+                if not isinstance(user_facing_message, str) or not user_facing_message.strip():
+                    user_facing_message = "I could not read the full conversation context, so I did not answer from partial context."
+                try:
+                    await adapter.send(
+                        original_source.chat_id,
+                        user_facing_message,
+                        metadata=self._thread_metadata_for_source(original_source, self._reply_anchor_for_event(event)),
+                    )
+                except Exception as send_exc:
+                    logger.warning(
+                        "Failed to deliver authorized enrichment error for %s: %s",
+                        original_source.platform.value if original_source.platform else "unknown",
+                        send_exc,
+                    )
+                logger.warning(
+                    "Authorized event enrichment failed for %s: %s",
+                    original_source.platform.value if original_source.platform else "unknown",
+                    exc,
+                )
+                return None
         
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
@@ -7591,6 +7633,12 @@ class GatewayRunner:
         """
         history = history or []
         message_text = event.text or ""
+        _external_snapshot = getattr(event, "external_conversation_snapshot", None)
+        if (
+            _external_snapshot
+            and getattr(_external_snapshot, "history_mode", None) == ExternalHistoryMode.REPLACE_VISIBLE_SESSION_HISTORY
+        ):
+            message_text = render_external_conversation_snapshot(_external_snapshot, event)
         _group_sessions_per_user = getattr(self.config, "group_sessions_per_user", True)
         _thread_sessions_per_user = getattr(self.config, "thread_sessions_per_user", False)
         # Use the same helper every other call site uses so the write key here
@@ -8049,6 +8097,13 @@ class GatewayRunner:
 
         # Load conversation history from transcript
         history = self.session_store.load_transcript(session_entry.session_id)
+        _external_snapshot = getattr(event, "external_conversation_snapshot", None)
+        if (
+            _external_snapshot
+            and getattr(_external_snapshot, "history_mode", None) == ExternalHistoryMode.REPLACE_VISIBLE_SESSION_HISTORY
+            and getattr(_external_snapshot, "complete_through_trigger", False)
+        ):
+            history = []
         
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
@@ -17184,6 +17239,8 @@ class GatewayRunner:
                     "conversation_history": agent_history,
                     "task_id": session_id,
                 }
+                if getattr(event, "external_conversation_snapshot", None):
+                    _conversation_kwargs["persist_user_message"] = event.raw_user_message or message
                 _conversation_kwargs.update(
                     _work_experience_turn_kwargs(
                         source,
