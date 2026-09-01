@@ -44,8 +44,8 @@ def _account(user_id=USER_ID, *, name="Alice", type="person"):
     return teams.Account(id=user_id, aad_object_id=user_id, type=type, name=name)
 
 
-def _bot():
-    return teams.Account(id=CLIENT_ID, aad_object_id=CLIENT_ID, type="bot", name="Marlow")
+def _bot(account_id=CLIENT_ID):
+    return teams.Account(id=account_id, aad_object_id=CLIENT_ID, type="bot", name="Marlow")
 
 
 def _conversation(conversation_type="personal", *, conversation_id="conv-1", tenant_id=TENANT_ID):
@@ -68,13 +68,14 @@ def _activity(
     channel_data=None,
     attachments=None,
     service_url=SERVICE_URL,
+    recipient_id=CLIENT_ID,
 ):
     data = {
         "serviceUrl": service_url,
         "channelId": "msteams",
         "from": _account(user_id).model_dump(mode="json", exclude_none=True),
         "conversation": _conversation(conversation_type, conversation_id=conversation_id, tenant_id=tenant_id).model_dump(mode="json", exclude_none=True),
-        "recipient": _bot().model_dump(mode="json", exclude_none=True),
+        "recipient": _bot(recipient_id).model_dump(mode="json", exclude_none=True),
         "type": "message",
         "id": activity_id,
     }
@@ -270,6 +271,85 @@ def test_bot_mention_is_stripped_but_other_mentions_remain():
     text, matched = teams._strip_bot_mentions(activity, CLIENT_ID)
     assert matched is True
     assert text == "please answer <at>Bob</at>"
+
+
+def test_teams_channel_account_mention_matches_recipient_and_preserves_other_mentions():
+    channel_account_id = f"28:{CLIENT_ID}"
+    adapter = _make_adapter()
+    activity = _activity(
+        conversation_type="channel",
+        text="Marlow please answer <at>Bob</at>",
+        recipient_id=channel_account_id,
+        entities=[
+            _mention(user_id=channel_account_id, text="Marlow"),
+            _mention(user_id=OTHER_USER_ID, text="<at>Bob</at>"),
+        ],
+        channel_data={"team": {"id": "team-1"}, "channel": {"id": "chan-1", "type": "standard"}},
+    )
+
+    assert adapter._validate_activity(activity) is True
+    text, matched = teams._strip_bot_mentions(activity, CLIENT_ID)
+    assert matched is True
+    assert text == "please answer <at>Bob</at>"
+
+
+def test_configured_client_id_fallback_preserves_bare_mentions():
+    activity = _activity(
+        conversation_type="groupChat",
+        text="Marlow please answer",
+        recipient_id=f"28:{CLIENT_ID}",
+        entities=[_mention(text="Marlow")],
+    )
+
+    assert teams._activity_mentions_bot(activity, CLIENT_ID) is True
+    text, matched = teams._strip_bot_mentions(activity, CLIENT_ID)
+    assert matched is True
+    assert text == "please answer"
+
+
+def test_conflicting_recipient_id_does_not_fall_back_to_configured_client_id():
+    activity = _activity(
+        conversation_type="groupChat",
+        recipient_id=f"28:{OTHER_USER_ID}",
+        entities=[_mention(text="Marlow")],
+    )
+
+    assert teams._activity_mentions_bot(activity, CLIENT_ID) is False
+    assert _make_adapter()._validate_activity(activity) is False
+
+
+def test_non_mention_entity_cannot_match_or_be_stripped():
+    activity = _activity(
+        conversation_type="groupChat",
+        text="Marlow please answer",
+        entities=[
+            {
+                "type": "message",
+                "mentioned": _account(CLIENT_ID, type="bot").model_dump(mode="json", exclude_none=True),
+                "text": "Marlow",
+            }
+        ],
+    )
+
+    assert teams._activity_mentions_bot(activity, CLIENT_ID) is False
+    text, matched = teams._strip_bot_mentions(activity, CLIENT_ID)
+    assert matched is False
+    assert text == "Marlow please answer"
+
+
+def test_stripping_preserves_other_mention_with_same_display_text():
+    activity = _activity(
+        conversation_type="groupChat",
+        text="Marlow Marlow please answer",
+        entities=[
+            _mention(text="Marlow"),
+            _mention(user_id=OTHER_USER_ID, text="Marlow"),
+        ],
+    )
+
+    text, matched = teams._strip_bot_mentions(activity, CLIENT_ID)
+    assert matched is True
+    assert text == "Marlow please answer"
 
 
 # ---------------------------------------------------------------------------
