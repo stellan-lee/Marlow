@@ -13,6 +13,7 @@ import pytest
 
 import gateway.platforms.base as platform_base
 from gateway.config import PlatformConfig
+from gateway.platforms.base import render_external_conversation_snapshot
 
 from tests.gateway._plugin_adapter_loader import load_plugin_adapter
 
@@ -1360,3 +1361,230 @@ def test_plugin_registration_and_generated_toolset(monkeypatch):
     assert validate_toolset("marlow-teams") is True
     assert validate_toolset("marlow-unknown") is False
     assert len(resolve_toolset("marlow-teams")) > 0
+
+# ---------------------------------------------------------------------------
+# Full channel-thread context
+# ---------------------------------------------------------------------------
+
+TEAMS_THREAD_TEAM_AAD = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+TEAMS_THREAD_TEAM_ID = "team-thread-1"
+TEAMS_THREAD_CHANNEL_ID = "19:thread-channel@thread.tacv2"
+TEAMS_THREAD_CONVERSATION_ID = f"{TEAMS_THREAD_CHANNEL_ID};messageid=1756701234567"
+TEAMS_THREAD_TRIGGER_ID = "1756701234570"
+
+
+def _thread_channel_data(*, channel_type="standard", aad_group_id=TEAMS_THREAD_TEAM_AAD):
+    return {
+        "team": {"id": TEAMS_THREAD_TEAM_ID, "aadGroupId": aad_group_id},
+        "channel": {"id": TEAMS_THREAD_CHANNEL_ID, "type": channel_type},
+        "tenant": {"id": TENANT_ID},
+    }
+
+
+def _thread_activity(*, activity_id=TEAMS_THREAD_TRIGGER_ID, text="Marlow summarize", created_date_time="2026-09-01T00:00:02Z", channel_type="standard"):
+    return teams.Activity.model_validate(
+        {
+            "serviceUrl": SERVICE_URL,
+            "channelId": "msteams",
+            "from": _account(USER_ID).model_dump(mode="json", exclude_none=True),
+            "conversation": {
+                "id": TEAMS_THREAD_CONVERSATION_ID,
+                "tenant_id": TENANT_ID,
+                "conversation_type": "channel",
+            },
+            "recipient": _bot().model_dump(mode="json", exclude_none=True),
+            "type": "message",
+            "id": activity_id,
+            "createdDateTime": created_date_time,
+            "text": text,
+            "channelData": _thread_channel_data(channel_type=channel_type),
+            "entities": [_mention(text="Marlow")],
+        }
+    )
+
+
+def _thread_event(*, activity=None, text="summarize"):
+    return teams.MessageEvent(
+        text=text,
+        message_type=teams.MessageType.TEXT,
+        source=SimpleNamespace(
+            platform=teams.Platform("teams"),
+            chat_id=json.dumps([TENANT_ID, CLIENT_ID, TEAMS_THREAD_TEAM_ID, TEAMS_THREAD_CHANNEL_ID], separators=(",", ":")),
+            chat_type="channel",
+            thread_id=TEAMS_THREAD_CONVERSATION_ID,
+            user_id=USER_ID,
+            user_name="Alice",
+        ),
+        raw_message=teams._activity_to_dict(activity or _thread_activity()),
+        message_id=TEAMS_THREAD_TRIGGER_ID,
+    )
+
+
+def _graph_message(message_id, text, *, created="2026-09-01T00:00:00Z", deleted=False, edited=False, attachment=None):
+    item = {
+        "id": str(message_id),
+        "replyToId": None if str(message_id) == "1756701234567" else "1756701234567",
+        "createdDateTime": created,
+        "from": {"user": {"displayName": "Alice", "id": f"user-{message_id}"}},
+        "body": {
+            "contentType": "html",
+            "content": f"<script>window.evil()</script><p>{text}</p><style>.x{{display:none}}</style>",
+        },
+        "attachments": [],
+    }
+    if edited:
+        item["lastEditedDateTime"] = "2026-09-01T00:00:03Z"
+    if deleted:
+        item["deletedDateTime"] = "2026-09-01T00:00:04Z"
+    if attachment:
+        item["attachments"] = [attachment]
+    return item
+
+
+class _FakeGraph:
+    def __init__(self, pages):
+        self.pages = list(pages)
+        self.urls = []
+
+    def get(self, url):
+        self.urls.append(url)
+        return self.pages.pop(0)
+
+
+def _install_graph(adapter, pages):
+    graph = _FakeGraph(pages)
+    adapter._teams_app = SimpleNamespace(get_app_graph=lambda tenant_id: graph)
+    return graph
+
+
+def test_thread_context_root_parser_accepts_only_messageid_parameter():
+    adapter = _make_adapter(thread_context={"enabled": True})
+    assert adapter._parse_root_message_id(_thread_activity()) == "1756701234567"
+    bad = _thread_activity()
+    bad.conversation.id = "19:opaque@thread.tacv2;messageid=1;messageid=2"
+    assert adapter._parse_root_message_id(bad) is None
+    bad.conversation.id = "19:opaque@thread.tacv2;foo=1"
+    assert adapter._parse_root_message_id(bad) is None
+
+
+def test_thread_context_disabled_makes_no_graph_call():
+    adapter = _make_adapter(thread_context={"enabled": False})
+    event = _thread_event()
+    out = asyncio.run(adapter.enrich_authorized_event(event))
+    assert out.external_conversation_snapshot is None
+
+
+def test_thread_context_rejects_private_channel_before_graph_call():
+    adapter = _make_adapter(thread_context={"enabled": True})
+    event = _thread_event(activity=_thread_activity(channel_type="private"))
+    with pytest.raises(teams.TeamsThreadContextError) as excinfo:
+        asyncio.run(adapter.enrich_authorized_event(event))
+    assert "standard" in excinfo.value.user_facing_message
+
+
+def test_thread_context_pagination_trigger_found_and_later_messages_excluded():
+    adapter = _make_adapter(thread_context={"enabled": True})
+    graph = _install_graph(
+        adapter,
+        [
+            _graph_message("1756701234567", "root"),
+            {
+                "value": [
+                    _graph_message("1756701234568", "reply 1", created="2026-09-01T00:00:01Z"),
+                ],
+                "@odata.nextLink": "/next-page",
+            },
+            {
+                "value": [
+                    _graph_message(TEAMS_THREAD_TRIGGER_ID, "trigger", created="2026-09-01T00:00:02Z"),
+                    _graph_message("1756701234571", "later", created="2026-09-01T00:00:03Z"),
+                ]
+            },
+        ],
+    )
+    event = _thread_event()
+    out = asyncio.run(adapter.enrich_authorized_event(event))
+    snapshot = out.external_conversation_snapshot
+    assert snapshot is not None
+    assert [msg.message_id for msg in snapshot.messages] == ["1756701234567", "1756701234568", TEAMS_THREAD_TRIGGER_ID]
+    assert snapshot.messages[-1].is_trigger is True
+    assert "/next-page" in graph.urls
+    rendered = render_external_conversation_snapshot(snapshot, out)
+    assert "[External conversation context" in rendered
+    assert "root" in rendered
+    assert "reply 1" in rendered
+    assert "Marlow summarize" not in rendered.split("[Current authenticated request", 1)[0]
+    assert "[Current authenticated request" in rendered
+
+
+def test_thread_context_trigger_absent_appends_activity_once_and_strips_mention():
+    adapter = _make_adapter(thread_context={"enabled": True})
+    _install_graph(
+        adapter,
+        [
+            _graph_message("1756701234567", "root"),
+            {"value": [_graph_message("1756701234568", "reply 1", created="2026-09-01T00:00:01Z")]},
+        ],
+    )
+    out = asyncio.run(adapter.enrich_authorized_event(_thread_event()))
+    snapshot = out.external_conversation_snapshot
+    assert [msg.message_id for msg in snapshot.messages] == ["1756701234567", "1756701234568", TEAMS_THREAD_TRIGGER_ID]
+    assert snapshot.messages[-1].text == "summarize"
+    assert snapshot.messages[-1].is_trigger is True
+
+
+def test_thread_context_duplicate_conflicting_graph_ids_fail_closed():
+    adapter = _make_adapter(thread_context={"enabled": True})
+    _install_graph(
+        adapter,
+        [
+            _graph_message("1756701234567", "root"),
+            {"value": [_graph_message("1756701234567", "conflict")]},
+        ],
+    )
+    with pytest.raises(teams.TeamsThreadContextError):
+        asyncio.run(adapter.enrich_authorized_event(_thread_event()))
+
+
+def test_thread_context_normalizes_edited_deleted_html_and_attachments():
+    adapter = _make_adapter(thread_context={"enabled": True})
+    _install_graph(
+        adapter,
+        [
+            _graph_message("1756701234567", "root", edited=True),
+            {"value": [_graph_message("1756701234568", "deleted", deleted=True)]},
+        ],
+    )
+    out = asyncio.run(adapter.enrich_authorized_event(_thread_event()))
+    snapshot = out.external_conversation_snapshot
+    assert snapshot.messages[0].text == "root\n[edited]"
+    assert snapshot.messages[1].text == "[message deleted]"
+    assert snapshot.messages[0].edited_at is not None
+    assert snapshot.messages[1].deleted_at is not None
+
+    attachment_adapter = _make_adapter(thread_context={"enabled": True})
+    _install_graph(
+        attachment_adapter,
+        [
+            _graph_message(
+                "1756701234567",
+                "root",
+                attachment={"id": "att-1", "name": "plan.png", "contentType": "image/png"},
+            ),
+            {"value": []},
+        ],
+    )
+    snapshot = asyncio.run(
+        attachment_adapter.enrich_authorized_event(_thread_event())
+    ).external_conversation_snapshot
+    assert snapshot.messages[0].attachments[0].reference_kind == "image"
+
+
+def test_thread_context_uses_event_route_identity_for_snapshot():
+    adapter = _make_adapter(thread_context={"enabled": True})
+    _install_graph(adapter, [_graph_message("1756701234567", "root"), {"value": []}])
+    event = _thread_event()
+    out = asyncio.run(adapter.enrich_authorized_event(event))
+    snapshot = out.external_conversation_snapshot
+    assert snapshot.chat_id == event.source.chat_id
+    assert snapshot.thread_id == event.source.thread_id
