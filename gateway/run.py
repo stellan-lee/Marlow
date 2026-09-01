@@ -8541,6 +8541,7 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
+                event=event,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -15771,6 +15772,7 @@ class GatewayRunner:
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
         raw_user_message: Optional[str] = None,
+        event: Optional["MessageEvent"] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
