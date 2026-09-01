@@ -412,34 +412,82 @@ def _mentioned_id(entity: Any) -> str:
     return _normalize_uuid(raw)
 
 
+def _mentioned_account_id(entity: Any) -> str:
+    mentioned = entity.get("mentioned") if isinstance(entity, dict) else getattr(entity, "mentioned", None)
+    if mentioned is None:
+        return ""
+    raw = mentioned.get("id") if isinstance(mentioned, dict) else getattr(mentioned, "id", None)
+    return _normalize_uuid(raw)
+
+
+def _is_mention_entity(entity: Any) -> bool:
+    entity_type = entity.get("type") if isinstance(entity, dict) else getattr(entity, "type", None)
+    return entity_type == "mention"
+
+
+def _recipient_matches_configured_bot(recipient_id: str, client_id: str) -> bool:
+    if recipient_id == client_id:
+        return True
+    if not recipient_id.startswith("28:"):
+        return False
+    return _normalize_uuid(recipient_id.partition(":")[2]) == client_id
+
+
+def _entity_mentions_bot(entity: Any, recipient_id: str, fallback_bot_id: str) -> bool:
+    if not _is_mention_entity(entity):
+        return False
+    if recipient_id and _mentioned_account_id(entity) == recipient_id:
+        return True
+    return bool(
+        fallback_bot_id
+        and (not recipient_id or _recipient_matches_configured_bot(recipient_id, fallback_bot_id))
+        and _mentioned_id(entity) == fallback_bot_id
+    )
+
+
+def _recipient_bot_id(activity: Any) -> str:
+    recipient = getattr(activity, "recipient", None)
+    return _normalize_uuid(recipient.get("id") if isinstance(recipient, dict) else getattr(recipient, "id", None))
+
+
 def _strip_bot_mentions(activity: Any, bot_id: str) -> Tuple[str, bool]:
     text = _activity_text(activity)
     entities = list(getattr(activity, "entities", None) or [])
     if not entities:
         return text.strip(), False
-    normalized_bot_id = _normalize_uuid(bot_id)
-    bot_mentions = []
-    kept_entities = []
-    for entity in entities:
-        mentioned_id = _mentioned_id(entity)
-        if mentioned_id == normalized_bot_id:
-            bot_mentions.append(entity)
-        else:
-            kept_entities.append(entity)
-    if not bot_mentions:
+    recipient_id = _recipient_bot_id(activity)
+    fallback_bot_id = _normalize_uuid(bot_id)
+    matched_entities = [
+        _entity_mentions_bot(entity, recipient_id, fallback_bot_id)
+        for entity in entities
+    ]
+    if not any(matched_entities):
         return text.strip(), False
-    mention_texts = [getattr(entity, "text", "") for entity in bot_mentions if getattr(entity, "text", None)]
-    for mention_text in mention_texts:
-        if mention_text:
-            text = text.replace(mention_text, "")
-    return text.strip(), True
+
+    pieces = []
+    cursor = 0
+    for entity, matches_bot in zip(entities, matched_entities):
+        if not _is_mention_entity(entity):
+            continue
+        mention_text = entity.get("text") if isinstance(entity, dict) else getattr(entity, "text", None)
+        if not mention_text:
+            continue
+        position = text.find(mention_text, cursor)
+        if position < 0:
+            continue
+        pieces.append(text[cursor:position])
+        if not matches_bot:
+            pieces.append(text[position:position + len(mention_text)])
+        cursor = position + len(mention_text)
+    pieces.append(text[cursor:])
+    return "".join(pieces).strip(), True
 
 
 def _activity_mentions_bot(activity: Any, bot_id: str) -> bool:
-    normalized_bot_id = _normalize_uuid(bot_id)
+    recipient_id = _recipient_bot_id(activity)
+    fallback_bot_id = _normalize_uuid(bot_id)
     for entity in getattr(activity, "entities", None) or []:
-        mentioned_id = _mentioned_id(entity)
-        if mentioned_id == normalized_bot_id:
+        if _entity_mentions_bot(entity, recipient_id, fallback_bot_id):
             return True
     return False
 
