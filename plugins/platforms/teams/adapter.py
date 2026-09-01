@@ -645,7 +645,7 @@ class DispatchCapacity:
 
     @property
     def available(self) -> bool:
-        return (self.active + self.pending) < (self.max_active + self.max_pending)
+        return self.max_active > 0 and (self.active + self.pending) < (self.max_active + self.max_pending)
 
 
 class TeamsDispatchSupervisor:
@@ -655,7 +655,7 @@ class TeamsDispatchSupervisor:
         self._max_active = max_active
         self._max_pending = max_pending
         self._active: set[asyncio.Task] = set()
-        self._pending: asyncio.Queue[TeamsDispatchTask] = asyncio.Queue(maxsize=max_pending)
+        self._pending: asyncio.Queue[TeamsDispatchTask] = asyncio.Queue(maxsize=max_active + max_pending)
         self._processing = 0
         self._closed = False
         self._accepting = True
@@ -674,9 +674,15 @@ class TeamsDispatchSupervisor:
             task.cancel()
         await asyncio.gather(*self._active, return_exceptions=True)
         self._active.clear()
+        while True:
+            try:
+                self._pending.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self._pending.task_done()
 
     async def submit(self, task: TeamsDispatchTask) -> bool:
-        if self._closed or not self._accepting:
+        if self._closed or not self._accepting or self._max_active <= 0:
             return False
         if not self.capacity.available:
             return False
@@ -688,22 +694,27 @@ class TeamsDispatchSupervisor:
 
     def start_worker(self, handler: Callable[[TeamsDispatchTask], Awaitable[None]]) -> None:
         async def _worker() -> None:
-            while True:
+            while not self._closed:
                 item = await self._pending.get()
                 self._processing += 1
                 try:
                     await handler(item)
                 except asyncio.CancelledError:
-                    raise
+                    if self._closed:
+                        raise
+                    logger.debug("Teams dispatch task cancelled; keeping supervisor worker available")
                 except Exception:
                     logger.exception("Teams dispatch task failed", exc_info=True)
                 finally:
                     self._processing -= 1
                     self._pending.task_done()
+                if self._closed:
+                    return
 
-        task = asyncio.create_task(_worker())
-        self._active.add(task)
-        task.add_done_callback(self._active.discard)
+        for _ in range(self._max_active):
+            task = asyncio.create_task(_worker())
+            self._active.add(task)
+            task.add_done_callback(self._active.discard)
 
 
 @dataclass
@@ -1274,7 +1285,9 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
                 return
             task.event.message_type = MessageType.PHOTO if not task.event.text and media_urls else MessageType.TEXT
             if self._message_handler:
-                await self._message_handler(task.event)
+                processing_task = await self.handle_message(task.event)
+                if processing_task is not None:
+                    await processing_task
             self._telemetry.increment("teams_agent_dispatch_total", {"result": "accepted"})
         except asyncio.CancelledError:
             self._telemetry.increment("teams_agent_dispatch_total", {"result": "cancelled"})
@@ -1386,6 +1399,26 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
                 return result
             last_message_id = result.message_id
         return SendResult(success=True, message_id=last_message_id)
+
+    async def _send_with_retry(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Any = None,
+        max_retries: int = 2,
+        base_delay: float = 2.0,
+    ) -> SendResult:
+        """Avoid replaying completed Teams chunks after a later chunk fails."""
+        result = await self.send(
+            chat_id=chat_id,
+            content=content,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+        if not result.success:
+            logger.warning("[%s] Teams response delivery failed after bounded send attempt", self.name)
+        return result
 
     def _chunk_text(self, content: str) -> List[str]:
         if _utf16_len(content) <= self._text_budget_bytes:
