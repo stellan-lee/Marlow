@@ -228,6 +228,31 @@ class MemoryConsolidationStore:
 
         return self._write(action)
 
+    def record_failed_run(self, *, scope_id: str, scope_type: str = "profile", run_id: str,
+                          start_seq: int, end_seq: int, failed_at: float | None = None) -> dict[str, Any]:
+        """Record a failed scheduled attempt without changing its evidence cursor."""
+        scope = self._scope_key(scope_type, scope_id)
+        run = self._id(run_id, "run_id")
+        now = time.time() if failed_at is None else float(failed_at)
+
+        def action(conn: sqlite3.Connection) -> dict[str, Any]:
+            existing = conn.execute(
+                "SELECT status FROM memory_runs WHERE run_id=?", (run,)
+            ).fetchone()
+            if existing is not None:
+                if existing["status"] == "failed":
+                    conn.execute(
+                        "UPDATE memory_runs SET created_at=? WHERE run_id=?", (now, run)
+                    )
+                return {"run_id": run, "replayed": True}
+            conn.execute(
+                "INSERT INTO memory_runs VALUES(?,?,?,?,?,?,?)",
+                (run, scope, int(start_seq), int(end_seq), "failed", now, None),
+            )
+            return {"run_id": run, "replayed": False}
+
+        return self._write(action)
+
     def evidence_after_cursor(self, scope_id: str, scope_type: str = "profile") -> list[dict[str, Any]]:
         scope = self._scope_key(scope_type, scope_id)
         row = self._conn.execute("SELECT ingestion_seq FROM memory_scope_cursors WHERE scope_id=?", (scope,)).fetchone()

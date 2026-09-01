@@ -26,6 +26,21 @@ def test_scope_cursor_and_duplicate_source_delivery(tmp_path: Path) -> None:
         assert store.cursor("person_b") == 0 and other["ingestion_seq"] == 1
 
 
+def test_failed_run_is_recorded_without_advancing_cursor(tmp_path: Path) -> None:
+    with MemoryConsolidationStore((tmp_path / "state.db").resolve()) as store:
+        store.append_evidence(scope_id="person_a", source_key="turn:1", content="fact")
+        first = store.record_failed_run(
+            scope_id="person_a", run_id="failed-run", start_seq=0, end_seq=1, failed_at=10
+        )
+        replay = store.record_failed_run(
+            scope_id="person_a", run_id="failed-run", start_seq=0, end_seq=1, failed_at=20
+        )
+        assert first["replayed"] is False
+        assert replay["replayed"] is True
+        assert store.cursor("person_a") == 0
+        assert store.last_run_at("person_a") == 20
+
+
 def test_typed_scopes_do_not_collide(tmp_path: Path) -> None:
     with MemoryConsolidationStore((tmp_path / "state.db").resolve()) as store:
         first = store.append_evidence(scope_type="a:b", scope_id="c", source_key="same", content="one")

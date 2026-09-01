@@ -403,8 +403,8 @@ class LlmCandidateExtractor(CandidateExtractor):
 
     The model only proposes text and source IDs.  Candidate IDs, scopes, and
     extractor version are assigned locally.  A provider error or malformed
-    response is retried a bounded number of times and then degrades to an
-    empty candidate set (a successful NOOP run), never to unproven memory.
+    response is retried a bounded number of times and then fails the run;
+    this keeps an unavailable extractor distinct from a valid empty result.
     """
 
     def __init__(self, llm: Any = None, *, llm_call: Callable[..., Any] | None = None,
@@ -466,6 +466,7 @@ class LlmCandidateExtractor(CandidateExtractor):
             "supported. Do not combine different scopes."
         )
         raw = None
+        last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
             try:
                 response = self._invoke(instructions=instructions, input_text=payload)
@@ -478,10 +479,15 @@ class LlmCandidateExtractor(CandidateExtractor):
                 if _schema_valid(raw, _EXTRACT_SCHEMA):
                     break
             except Exception as exc:
+                last_error = exc
                 logger.warning("memory consolidation extraction attempt %d failed: %s", attempt + 1, _text(exc, limit=300))
             raw = None
         if not isinstance(raw, Mapping) or not isinstance(raw.get("candidates"), list):
-            return []
+            if last_error is not None:
+                raise RuntimeError(
+                    "memory consolidation extraction exhausted retries"
+                ) from last_error
+            raise RuntimeError("memory consolidation extraction returned an invalid response")
         candidates: list[MemoryCandidate] = []
         for item in raw["candidates"][:64]:
             if not isinstance(item, Mapping):
@@ -845,7 +851,14 @@ class MemoryConsolidationStoreRepository:
             raise ValueError("scope_id is required")
 
     def create_consolidation_run(self, previous_watermark: float, cutoff_watermark: float, *, dry_run: bool) -> dict[str, Any]:
-        return {"id": _canonical_id("run", self.scope_id, int(previous_watermark), int(cutoff_watermark), dry_run)}
+        return {
+            "id": _canonical_id(
+                "run", self.scope_type, self.scope_id,
+                int(previous_watermark), int(cutoff_watermark), dry_run,
+            ),
+            "previous_watermark": int(previous_watermark),
+            "cutoff_watermark": int(cutoff_watermark),
+        }
 
     def current_watermark(self) -> int:
         """Return the latest per-scope ingestion sequence for this store."""
@@ -943,8 +956,22 @@ class MemoryConsolidationStoreRepository:
         )
 
     def mark_consolidation_failed(self, run: Any, reason: str) -> None:
-        # MemoryConsolidationStore rolls back failed commits; no failed-run
-        # mutation is necessary for this adapter.
+        run_id = _text(run.get("id"), limit=256)
+        self.store.record_failed_run(
+            scope_id=self.scope_id,
+            scope_type=self.scope_type,
+            # Keep failed attempts distinct from observed/committed records for
+            # the same evidence window, while refreshing one stable failure row
+            # on later scheduled retries of that window.
+            run_id=_canonical_id("failed_attempt", run_id),
+            start_seq=int(
+                run.get(
+                    "previous_watermark",
+                    self.store.cursor(self.scope_id, self.scope_type),
+                )
+            ),
+            end_seq=int(run.get("cutoff_watermark", self.current_watermark())),
+        )
         logger.warning("memory consolidation failed run=%s reason=%s", _text(run.get("id"), limit=256), _text(reason, limit=1_000))
 
     def mark_consolidation_succeeded(self, run: Any, *, dry_run: bool) -> None:
