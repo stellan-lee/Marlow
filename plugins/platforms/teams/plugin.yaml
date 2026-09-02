@@ -22,3 +22,7 @@ optional_env:
     description: "Allow any authenticated user in the configured tenant"
     prompt: "Allow all users in the configured tenant? (true/false)"
     password: false
+  - name: TEAMS_REACTIONS
+    description: "Enable best-effort Microsoft Teams acknowledgement reactions"
+    prompt: "Enable Teams acknowledgement reactions? (true/false)"
+    password: false

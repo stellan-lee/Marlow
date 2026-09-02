@@ -22,13 +22,15 @@ import secrets
 import sys
 import time
 import uuid
+from collections import OrderedDict
 import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from enum import Enum
 from pathlib import Path
 import socket
-from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Coroutine, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote, urlparse
 
 from gateway.config import Platform, PlatformConfig
@@ -74,6 +76,15 @@ DEFAULT_OUTBOUND_BASE_DELAY = 2.0
 DEFAULT_ATTACHMENT_TIMEOUT_SECONDS = 30.0
 DEFAULT_ATTACHMENT_MAX_BYTES = 50 * 1024 * 1024
 DEFAULT_APPROVAL_TIMEOUT_SECONDS = 300.0
+TEAMS_ACK_REACTION = "1f440_eyes"
+DEFAULT_REACTION_RATE_PER_SECOND = 2.0
+DEFAULT_REACTION_BURST = 2
+DEFAULT_REACTION_TIMEOUT_SECONDS = 1.5
+DEFAULT_REACTION_FRESHNESS_SECONDS = 3.0
+DEFAULT_REACTION_CLIENT_CACHE_SIZE = 8
+DEFAULT_REACTION_MAX_RETRIES = 1
+DEFAULT_REACTION_CLEANUP_TIMEOUT_SECONDS = 0.5
+DEFAULT_REACTION_MAX_INFLIGHT = 16
 SUPPORTED_IMAGE_MIME_PREFIXES = ("image/png", "image/jpeg", "image/gif")
 SUPPORTED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif"}
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -105,6 +116,33 @@ class TeamsThreadLocator:
     channel_id: str
     root_message_id: str
 
+
+@dataclass(frozen=True, slots=True)
+class TeamsReactionConfig:
+    enabled: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class TeamsReactionTarget:
+    service_url: str
+    conversation_id: str
+    activity_id: str
+
+
+class TeamsReactionResult(str, Enum):
+    SUCCESS = "success"
+    DISABLED = "disabled"
+    INVALID_TARGET = "invalid_target"
+    LOCAL_RATE_LIMITED = "local_rate_limited"
+    REMOTE_RATE_LIMITED = "remote_rate_limited"
+    TIMEOUT = "timeout"
+    NOT_FOUND = "not_found"
+    FORBIDDEN = "forbidden"
+    TRANSIENT_FAILURE = "transient_failure"
+    FAILURE = "failure"
+    CANCELLED = "cancelled"
+
+
 try:  # pragma: no cover - exercised by dependency install in live environments.
     from microsoft_teams.api.activities.message.message import MessageActivityInput
     from microsoft_teams.api.activities.typing import TypingActivityInput
@@ -123,6 +161,7 @@ try:  # pragma: no cover - exercised by dependency install in live environments.
         AdaptiveCardInvokeAction,
         AdaptiveCardInvokeValue,
     )
+    from microsoft_teams.api import ApiClient
     from microsoft_teams.apps import App
     from microsoft_teams.apps.http.adapter import HttpRequest, HttpResponse, HttpServerAdapter
     from microsoft_teams.apps.http.http_server import HttpServer
@@ -148,6 +187,7 @@ except ImportError:  # pragma: no cover - import failure is validated by tests.
     AdaptiveCardActionMessageResponse = None  # type: ignore[assignment]
     AdaptiveCardInvokeAction = None  # type: ignore[assignment]
     AdaptiveCardInvokeValue = None  # type: ignore[assignment]
+    ApiClient = None  # type: ignore[assignment]
     App = None  # type: ignore[assignment]
     _SdkMessageActivityInput = None  # type: ignore[assignment]
     HttpRequest = None  # type: ignore[assignment]
@@ -773,6 +813,31 @@ class TeamsDispatchSupervisor:
             task.add_done_callback(self._active.discard)
 
 
+class TeamsReactionRateLimiter:
+    """Non-waiting token bucket for best-effort Teams acknowledgement reactions."""
+
+    def __init__(self, rate_per_second: float = DEFAULT_REACTION_RATE_PER_SECOND, burst: int = DEFAULT_REACTION_BURST) -> None:
+        self._rate_per_second = max(float(rate_per_second), 0.001)
+        self._capacity = max(int(burst), 1)
+        self._tokens = float(self._capacity)
+        self._updated_at = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def try_acquire(self) -> bool:
+        async with self._lock:
+            now = time.monotonic()
+            elapsed = max(0.0, now - self._updated_at)
+            self._updated_at = now
+            self._tokens = min(float(self._capacity), self._tokens + elapsed * self._rate_per_second)
+            if self._tokens >= 1.0:
+                self._tokens -= 1.0
+                return True
+            return False
+
+    def debug_tokens(self) -> float:
+        return round(self._tokens, 3)
+
+
 @dataclass
 class TeamsTelemetry:
     """In-process Teams counters and latency samples."""
@@ -896,6 +961,11 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
         self._lock_acquired = False
         self._message_handler = None
         self._team_aad_group_cache: Dict[Tuple[str, str], str] = {}
+        self._reaction_config = self._parse_reaction_config(config.extra.get("reactions"))
+        self._reaction_tasks: set[asyncio.Task[Any]] = set()
+        self._reaction_limiter = TeamsReactionRateLimiter()
+        self._reaction_api_clients: "OrderedDict[str, Any]" = OrderedDict()
+        self._reaction_closing = False
 
 
     @staticmethod
@@ -993,6 +1063,7 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
             self._build_sdk_app()
             await self._teams_app.initialize()
             self._restore_teams_handler()
+            self._reset_reaction_state()
             self._supervisor = TeamsDispatchSupervisor(self._dispatch_max_active, self._dispatch_max_pending)
             self._supervisor.start_worker(self._dispatch_one)
             self._runner = web.AppRunner(self._app)
@@ -1030,7 +1101,7 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
             platform_state=status,
             error_code=error_code,
             error_message=error_message,
-            telemetry=self._telemetry.snapshot(),
+            telemetry={**self._telemetry.snapshot(), "teams_reaction_runtime": self._reaction_runtime_state()},
         )
 
     def _receipt_dir(self) -> Path:
@@ -1043,6 +1114,7 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
+        await self._cancel_reaction_tasks()
         if self._teams_app:
             try:
                 await self._teams_app.stop()
@@ -1078,6 +1150,7 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
         if self._status == "disabled":
             return
         self._status = "stopping"
+        await self._cancel_reaction_tasks()
         await self._fail_approval_waiters()
         if self._supervisor:
             await self._supervisor.stop()
@@ -1085,6 +1158,7 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
+        await self._cancel_reaction_tasks()
         if self._teams_app:
             try:
                 await self._teams_app.stop()
@@ -1264,6 +1338,23 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
             return str(tenant)
         return ""
 
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        """Schedule a best-effort acknowledgement reaction when Teams processing starts."""
+        if not self._reaction_config.enabled:
+            return
+        try:
+            target = _reaction_target_for_event(event)
+            if target is None:
+                self._record_reaction_result(TeamsReactionResult.INVALID_TARGET, 0.0)
+                return
+            if len(self._reaction_tasks) >= DEFAULT_REACTION_MAX_INFLIGHT:
+                self._record_reaction_result(TeamsReactionResult.LOCAL_RATE_LIMITED, 0.0)
+                return
+            self._spawn_reaction_task(self._add_acknowledgement_reaction(target))
+        except Exception:
+            self._record_reaction_result(TeamsReactionResult.FAILURE, 0.0)
+            logger.debug("[%s] Teams acknowledgement reaction scheduling failed", self.name, exc_info=True)
+
 
     def _is_safe_attachment_url(self, url: str) -> bool:
         return bool(is_safe_url(url))
@@ -1275,6 +1366,32 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
     def _thread_context_require_complete(self) -> bool:
         thread_context = self.config.extra.get("thread_context") or {}
         return bool(thread_context.get("require_complete", True))
+
+    @staticmethod
+    def _parse_reaction_config(value: Any) -> TeamsReactionConfig:
+        if value is None:
+            env_value = os.getenv("TEAMS_REACTIONS")
+            if env_value is None:
+                return TeamsReactionConfig(enabled=False)
+            return TeamsReactionConfig(enabled=TeamsPlatformAdapter._coerce_env_bool(env_value, "TEAMS_REACTIONS"))
+        if not isinstance(value, dict):
+            raise ValueError("teams.reactions must be a mapping")
+        enabled = value.get("enabled", False)
+        if not isinstance(enabled, bool):
+            raise ValueError("teams.reactions.enabled must be explicitly boolean")
+        env_value = os.getenv("TEAMS_REACTIONS")
+        if env_value is not None:
+            enabled = TeamsPlatformAdapter._coerce_env_bool(env_value, "TEAMS_REACTIONS")
+        return TeamsReactionConfig(enabled=enabled)
+
+    @staticmethod
+    def _coerce_env_bool(value: str, name: str) -> bool:
+        normalized = str(value).strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+        raise ValueError(f"{name} must be explicitly boolean")
 
     def _graph_client(self) -> Any:
         if not self._teams_app:
@@ -1766,6 +1883,137 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
             return datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
             return None
+
+    def _reset_reaction_state(self) -> None:
+        self._reaction_closing = False
+        self._reaction_limiter = TeamsReactionRateLimiter()
+        self._reaction_api_clients = OrderedDict()
+
+    async def _cancel_reaction_tasks(self) -> None:
+        self._reaction_closing = True
+        tasks = list(self._reaction_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=DEFAULT_REACTION_CLEANUP_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.debug("[%s] Timed out cancelling Teams acknowledgement reaction tasks", self.name)
+        self._reaction_tasks.clear()
+        self._reaction_api_clients.clear()
+
+    def _reaction_runtime_state(self) -> Dict[str, Any]:
+        return {
+            "enabled": self._reaction_config.enabled,
+            "tasks_inflight": len(self._reaction_tasks),
+            "client_cache_size": len(self._reaction_api_clients),
+            "limiter_tokens": self._reaction_limiter.debug_tokens(),
+        }
+
+    def _record_reaction_result(self, result: TeamsReactionResult, duration: float) -> None:
+        self._telemetry.increment("teams_reaction_operations_total", {"operation": "add", "result": result.value})
+        self._telemetry.observe("teams_reaction_duration_seconds", duration)
+
+    def _spawn_reaction_task(self, coroutine: Coroutine[Any, Any, Any]) -> None:
+        task = asyncio.create_task(coroutine, name="teams-reaction-add")
+        self._reaction_tasks.add(task)
+
+        def _done(completed: asyncio.Task[Any]) -> None:
+            self._reaction_tasks.discard(completed)
+            try:
+                completed.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Unhandled Teams reaction task failure")
+
+        task.add_done_callback(_done)
+
+    def _reaction_api_for_service_url(self, service_url: str) -> Any:
+        if ApiClient is None or self._teams_app is None:
+            raise RuntimeError("Teams SDK API client is unavailable")
+        normalized = _normalize_https_service_url(service_url)
+        if not normalized:
+            raise ValueError("invalid Teams service URL")
+        cached = self._reaction_api_clients.get(normalized)
+        if cached is not None:
+            self._reaction_api_clients.move_to_end(normalized)
+            return cached
+        api = ApiClient(
+            normalized,
+            self._teams_app.api.http,
+            self._teams_app.options.api_client_settings,
+            cloud=self._teams_app.cloud,
+        )
+        self._reaction_api_clients[normalized] = api
+        self._reaction_api_clients.move_to_end(normalized)
+        while len(self._reaction_api_clients) > DEFAULT_REACTION_CLIENT_CACHE_SIZE:
+            self._reaction_api_clients.popitem(last=False)
+        return api
+
+    async def _add_reaction_with_retry(self, target: TeamsReactionTarget) -> TeamsReactionResult:
+        started = time.perf_counter()
+        attempts = 0
+        while attempts <= DEFAULT_REACTION_MAX_RETRIES:
+            if self._reaction_closing:
+                result = TeamsReactionResult.CANCELLED
+                break
+            if not await self._reaction_limiter.try_acquire():
+                result = TeamsReactionResult.LOCAL_RATE_LIMITED
+                break
+            try:
+                await self._send_reaction_once(target)
+                result = TeamsReactionResult.SUCCESS
+                break
+            except asyncio.CancelledError:
+                result = TeamsReactionResult.CANCELLED
+                raise
+            except Exception as exc:
+                attempts += 1
+                result = _reaction_result_from_exception(exc)
+                if attempts > DEFAULT_REACTION_MAX_RETRIES or not _is_reaction_result_retryable(result):
+                    break
+                delay = _retry_after_seconds(exc)
+                if delay is None:
+                    delay = 0.0
+                elapsed = time.perf_counter() - started
+                remaining = max(0.0, DEFAULT_REACTION_FRESHNESS_SECONDS - elapsed)
+                if delay + DEFAULT_REACTION_TIMEOUT_SECONDS >= remaining:
+                    break
+                if delay > 0:
+                    await asyncio.sleep(delay)
+        else:
+            result = TeamsReactionResult.FAILURE
+        return result
+
+    async def _add_acknowledgement_reaction(self, target: TeamsReactionTarget) -> TeamsReactionResult:
+        started = time.perf_counter()
+        result = TeamsReactionResult.FAILURE
+        try:
+            result = await self._add_reaction_with_retry(target)
+            return result
+        except asyncio.CancelledError:
+            result = TeamsReactionResult.CANCELLED
+            raise
+        except Exception as exc:
+            result = _reaction_result_from_exception(exc)
+            return result
+        finally:
+            self._record_reaction_result(result, time.perf_counter() - started)
+
+    async def _send_reaction_once(self, target: TeamsReactionTarget) -> None:
+        api = self._reaction_api_for_service_url(target.service_url)
+        await asyncio.wait_for(
+            api.conversations.add_reaction(
+                target.conversation_id,
+                target.activity_id,
+                TEAMS_ACK_REACTION,
+            ),
+            timeout=DEFAULT_REACTION_TIMEOUT_SECONDS,
+        )
 
     async def _build_dispatch_task(self, activity: Any) -> Optional[TeamsDispatchTask]:
         receipt_key = _canonical_activity_key(activity, self._client_id, self._tenant_id)
@@ -2360,6 +2608,7 @@ def check_teams_requirements() -> bool:
         from microsoft_teams.api.models.entity.mention_entity import MentionEntity as _MentionEntity
         from microsoft_teams.api.models.entity.message_entity import MessageEntity as _MessageEntity
         from microsoft_teams.api.models.invoke_response import InvokeResponse as _InvokeResponse
+        from microsoft_teams.api import ApiClient as _ApiClient
         from microsoft_teams.api.models.adaptive_card import (
             AdaptiveCardActionErrorResponse as _AdaptiveCardActionErrorResponse,
             AdaptiveCardActionMessageResponse as _AdaptiveCardActionMessageResponse,
@@ -2390,6 +2639,7 @@ def check_teams_requirements() -> bool:
         "AdaptiveCardActionMessageResponse": _AdaptiveCardActionMessageResponse,
         "AdaptiveCardInvokeAction": _AdaptiveCardInvokeAction,
         "AdaptiveCardInvokeValue": _AdaptiveCardInvokeValue,
+        "ApiClient": _ApiClient,
         "App": _App,
         "HttpRequest": _HttpRequest,
         "HttpResponse": _HttpResponse,
@@ -2403,6 +2653,93 @@ def check_teams_requirements() -> bool:
     })
     TEAMS_AVAILABLE = True
     return True
+
+
+
+def _normalize_https_service_url(value: Any) -> str:
+    if not value:
+        return ""
+    raw = str(value).strip()
+    if not raw:
+        return ""
+    normalized = raw.rstrip("/")
+    parsed = urlparse(normalized)
+    if parsed.scheme != "https":
+        return ""
+    if not parsed.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        return ""
+    return normalized
+
+
+def _normalized_nonempty(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _reaction_target_for_event(event: MessageEvent) -> Optional[TeamsReactionTarget]:
+    try:
+        metadata = getattr(getattr(event, "source", None), "metadata", None)
+        if not isinstance(metadata, dict):
+            return None
+        reference_data = metadata.get("teams_reference")
+        if not isinstance(reference_data, dict):
+            return None
+        reference = _ref_from_dict(reference_data)
+        if reference is None:
+            return None
+        service_url = _normalize_https_service_url(getattr(reference, "service_url", None))
+        conversation_id = _normalized_nonempty(getattr(getattr(reference, "conversation", None), "id", None))
+        activity_id = _normalized_nonempty(getattr(event, "message_id", None))
+        if not service_url or not conversation_id or not activity_id:
+            return None
+        return TeamsReactionTarget(
+            service_url=service_url,
+            conversation_id=conversation_id,
+            activity_id=activity_id,
+        )
+    except Exception:
+        return None
+
+
+def _reaction_status_code(exc: Exception) -> Optional[int]:
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        status = response.get("status_code") or response.get("status")
+    else:
+        status = getattr(response, "status_code", None) or getattr(response, "status", None)
+    if status is None:
+        return None
+    try:
+        return int(status)
+    except (TypeError, ValueError):
+        return None
+
+
+def _reaction_result_from_exception(exc: Exception) -> TeamsReactionResult:
+    if isinstance(exc, asyncio.TimeoutError):
+        return TeamsReactionResult.TIMEOUT
+    status = _reaction_status_code(exc)
+    if status == 429:
+        return TeamsReactionResult.REMOTE_RATE_LIMITED
+    if status == 404:
+        return TeamsReactionResult.NOT_FOUND
+    if status in {401, 403}:
+        return TeamsReactionResult.FORBIDDEN
+    if status in {500, 502, 503, 504}:
+        return TeamsReactionResult.TRANSIENT_FAILURE
+    message = str(exc).lower()
+    if any(token in message for token in ("timeout", "rate limit", "temporary", "connection")):
+        return TeamsReactionResult.TRANSIENT_FAILURE
+    return TeamsReactionResult.FAILURE
+
+
+def _is_reaction_result_retryable(result: TeamsReactionResult) -> bool:
+    return result in {
+        TeamsReactionResult.REMOTE_RATE_LIMITED,
+        TeamsReactionResult.TIMEOUT,
+        TeamsReactionResult.TRANSIENT_FAILURE,
+    }
 
 
 def _is_connected(config: PlatformConfig) -> bool:
@@ -2504,7 +2841,13 @@ def _retry_after_seconds(exc: Exception) -> Optional[float]:
     response = getattr(exc, "response", None)
     value = None
     if response is not None:
-        value = getattr(response, "headers", {}).get("Retry-After") or getattr(response, "headers", {}).get("retry-after")
+        if isinstance(response, dict):
+            value = response.get("Retry-After") or response.get("retry-after")
+            headers = response.get("headers") or {}
+            if isinstance(headers, dict):
+                value = value or headers.get("Retry-After") or headers.get("retry-after")
+        else:
+            value = getattr(response, "headers", {}).get("Retry-After") or getattr(response, "headers", {}).get("retry-after")
     if value is None:
         match = re.search(r"retry-after[:=]\s*([\d.]+)", str(exc), flags=re.IGNORECASE)
         value = match.group(1).strip() if match else None
