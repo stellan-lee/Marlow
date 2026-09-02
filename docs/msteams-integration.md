@@ -951,6 +951,7 @@ Add this top-level configuration:
 teams:
   enabled: false
   client_id: ""
+  graph_client_id: ""
   tenant_id: ""
   host: "127.0.0.1"
   port: 3978
@@ -964,13 +965,22 @@ The required secret is:
 TEAMS_CLIENT_SECRET
 ```
 
+When `teams.graph_client_id` differs from `teams.client_id` and
+`thread_context.enabled` is `true`, the optional Graph/RSC secret is required:
+
+```text
+TEAMS_GRAPH_CLIENT_SECRET
+```
+
 ### Validation
 
 When `teams.enabled` is true:
 
 * `client_id` is required and must be a valid UUID;
+* `graph_client_id` is optional, defaults to `client_id`, and must be a valid UUID when supplied;
 * `tenant_id` is required and must be a valid UUID;
 * `TEAMS_CLIENT_SECRET` is required and nonempty;
+* `TEAMS_GRAPH_CLIENT_SECRET` is required only when the effective Graph identity differs from the Bot identity and thread context is enabled;
 * `port` must be within the valid TCP port range;
 * every `allowed_users` entry must be a valid Azure AD object ID;
 * duplicate user IDs are normalized and removed;
@@ -984,7 +994,7 @@ The plugin remains disabled unless `enabled` is explicitly true.
 
 `config.yaml` is the source of truth for non-secret settings.
 
-The profile’s secret environment file is the source of truth for `TEAMS_CLIENT_SECRET`.
+The profile’s secret environment file is the source of truth for `TEAMS_CLIENT_SECRET` and `TEAMS_GRAPH_CLIENT_SECRET`.
 
 A plugin YAML bridge may mirror values into process-local environment variables only when required by existing registry hooks. Mirrored variables are implementation details and must not become competing configuration sources.
 
@@ -1008,15 +1018,16 @@ https://<operator-host>/api/messages
 * explain that a public HTTPS ingress is required;
 * explain that Marlow does not provision DNS, TLS, tunnels, or Azure resources;
 * explain that personal chat, group chat, and standard channels are supported;
-* clearly identify private/shared channels, meetings, files, Graph, and proactive delivery as unsupported.
+* clearly identify private/shared channels, meetings, files, Graph, and proactive delivery as unsupported;
+* explain the three Teams identity values separately: Teams app package ID, Bot client ID, and Graph/RSC client ID.
 
 ### Operator-Owned Teams Registration
 
 Operator documentation must cover:
 
 1. creating or selecting a Microsoft Entra application;
-2. configuring the bot application identity;
-3. creating a client secret;
+2. configuring the bot application identity and, when needed, a separate Graph/RSC application identity;
+3. creating a bot client secret and, for separate Graph identity mode, a Graph/RSC client secret;
 4. enabling the Microsoft Teams channel;
 5. setting the public messaging endpoint;
 6. creating a Teams application manifest;

@@ -4,9 +4,20 @@ The bundled Teams platform plugin exposes Marlow to Microsoft Teams through the
 official `microsoft-teams-apps==2.0.16` SDK.
 
 Runtime configuration is read from `config.yaml` under `teams:` and from the
-profile secret `TEAMS_CLIENT_SECRET`. The plugin is disabled by default and
+profile secrets `TEAMS_CLIENT_SECRET` and, when using a separate Graph/RSC
+application, `TEAMS_GRAPH_CLIENT_SECRET`. The plugin is disabled by default and
 supports Milestone 1 personal chats, group chats, and standard channel threads
 for one configured tenant.
+
+## Bot and Graph identities
+
+Marlow uses `teams.client_id` and `TEAMS_CLIENT_SECRET` for Bot Framework
+messaging. Thread-context hydration uses the effective Graph identity:
+`teams.graph_client_id` when configured, otherwise `teams.client_id`. If the
+Graph identity differs from the Bot identity and `thread_context.enabled` is
+`true`, `TEAMS_GRAPH_CLIENT_SECRET` is required. This lets a Teams app use one
+Entra application for Bot Framework and a different Entra application for the
+Team RSC grant.
 
 ## Acknowledgement reactions
 

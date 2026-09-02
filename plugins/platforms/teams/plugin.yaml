@@ -14,6 +14,11 @@ requires_env:
     url: "https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade"
     password: true
 optional_env:
+  - name: TEAMS_GRAPH_CLIENT_SECRET
+    description: "Microsoft Teams Graph/RSC client secret; required when teams.graph_client_id differs from teams.client_id and thread_context is enabled"
+    prompt: "Microsoft Teams Graph/RSC client secret"
+    url: "https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade"
+    password: true
   - name: TEAMS_ALLOWED_USERS
     description: "Comma-separated Azure AD object IDs allowed to talk to the bot"
     prompt: "Allowed Azure AD object IDs (comma-separated)"

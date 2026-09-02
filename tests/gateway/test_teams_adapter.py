@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import base64
 import json
 from pathlib import Path
@@ -23,7 +24,8 @@ CLIENT_ID = "11111111-1111-4111-8111-111111111111"
 TENANT_ID = "22222222-2222-4222-8222-222222222222"
 USER_ID = "33333333-3333-4333-8333-333333333333"
 OTHER_USER_ID = "44444444-4444-4444-8444-444444444444"
-BOT_ID = CLIENT_ID
+GRAPH_CLIENT_ID = "55555555-5555-4555-8555-555555555555"
+GRAPH_SECRET = "graph-secret"
 SERVICE_URL = "https://smba.trafficmanager.net/teams"
 
 
@@ -134,6 +136,8 @@ def _approval_activity(*, user_id=USER_ID, tenant_id=TENANT_ID, conversation_id=
         ({"client_id": "not-a-uuid"}, "teams.client_id"),
         ({"tenant_id": "not-a-uuid"}, "teams.tenant_id"),
         ({"client_secret": ""}, "TEAMS_CLIENT_SECRET"),
+        ({"graph_client_id": "not-a-uuid"}, "teams.graph_client_id"),
+        ({"thread_context": {"enabled": True}, "graph_client_id": GRAPH_CLIENT_ID}, "TEAMS_GRAPH_CLIENT_SECRET"),
         ({"port": 70000}, "teams.port"),
         ({"allowed_users": ["not-a-uuid"]}, "teams.allowed_users"),
         ({"allow_all_users": "yes"}, "teams.allow_all_users"),
@@ -148,6 +152,41 @@ def test_disabled_config_allows_placeholder_values():
     adapter = teams.TeamsPlatformAdapter(_cfg(enabled=False, client_id="", tenant_id="", client_secret=""))
     assert adapter._validate_config() is None
     assert adapter._enabled is False
+
+
+def test_identity_resolution_keeps_shared_identity_default():
+    adapter = _make_adapter()
+    assert adapter._identity_plan.bot_client_id == CLIENT_ID
+    assert adapter._identity_plan.graph_client_id == CLIENT_ID
+    assert adapter._identity_plan.graph_secret == "secret"
+    assert adapter._identity_plan.graph_identity_mode == "shared"
+
+
+def test_identity_resolution_uses_explicit_graph_secret_in_shared_identity():
+    adapter = _make_adapter(graph_client_id=CLIENT_ID, graph_client_secret=GRAPH_SECRET)
+    assert adapter._identity_plan.graph_client_id == CLIENT_ID
+    assert adapter._identity_plan.graph_secret == GRAPH_SECRET
+    assert adapter._identity_plan.graph_identity_mode == "shared"
+
+
+def test_identity_resolution_requires_graph_secret_for_separate_identity_when_thread_context_enabled():
+    adapter = _make_adapter(thread_context={"enabled": True}, graph_client_id=GRAPH_CLIENT_ID)
+    with pytest.raises(ValueError, match="TEAMS_GRAPH_CLIENT_SECRET"):
+        adapter._validate_config()
+
+
+def test_identity_resolution_allows_separate_identity_without_graph_secret_when_thread_context_disabled():
+    adapter = _make_adapter(thread_context={"enabled": False}, graph_client_id=GRAPH_CLIENT_ID)
+    assert adapter._identity_plan.graph_client_id == GRAPH_CLIENT_ID
+    assert adapter._identity_plan.graph_identity_mode == "separate"
+    assert adapter._identity_plan.graph_secret == ""
+
+
+def test_identity_resolution_prefers_graph_secret_for_separate_identity():
+    adapter = _make_adapter(thread_context={"enabled": True}, graph_client_id=GRAPH_CLIENT_ID, graph_client_secret=GRAPH_SECRET)
+    assert adapter._identity_plan.graph_client_id == GRAPH_CLIENT_ID
+    assert adapter._identity_plan.graph_secret == GRAPH_SECRET
+    assert adapter._identity_plan.graph_identity_mode == "separate"
 
 
 def test_normalize_allowed_users_deduplicates_and_normalizes():
@@ -213,6 +252,22 @@ def test_personal_group_channel_sources_are_separated():
     assert "team-1" in channel.chat_id
     assert "chan-1" in channel.chat_id
     assert channel.metadata is None
+
+
+def test_graph_identity_does_not_change_source_or_receipt_identity():
+    adapter = _make_adapter(graph_client_id=GRAPH_CLIENT_ID, graph_client_secret=GRAPH_SECRET)
+    activity = _activity(
+        conversation_type="channel",
+        conversation_id="19:opaque@thread.tacv2;messageid=1756701234567",
+        channel_data={"team": {"id": "team-1"}, "channel": {"id": "chan-1", "type": "standard"}},
+        text=None,
+    )
+    shared = _make_adapter()._build_source(activity)
+    separate = adapter._build_source(activity)
+    assert separate.chat_id == shared.chat_id
+    assert separate.thread_id == shared.thread_id
+    assert separate.metadata == shared.metadata
+    assert teams._canonical_activity_key(activity, adapter._bot_client_id, TENANT_ID) == teams._canonical_activity_key(activity, CLIENT_ID, TENANT_ID)
 
 
 def test_teams_source_metadata_is_preserved_for_adapter_sends():
@@ -1040,6 +1095,8 @@ async def test_sdk_initialize_overwrites_handler_and_restore_keeps_marlow_author
     adapter._build_http_app()
     adapter._build_sdk_app()
 
+    assert adapter._teams_app.credentials.client_id == CLIENT_ID
+    assert adapter._teams_app.credentials.client_secret == "secret"
     assert adapter._teams_app.server.on_request.__func__ is adapter._handle_teams_activity.__func__
     assert adapter._teams_app.server.on_request.__self__ is adapter
     await adapter._teams_app.initialize()
@@ -1453,7 +1510,7 @@ class _FakeGraph:
 
 def _install_graph(adapter, pages):
     graph = _FakeGraph(pages)
-    adapter._teams_app = SimpleNamespace(get_app_graph=lambda tenant_id: graph)
+    adapter._graph_http_client = SimpleNamespace(get=lambda url: graph.get(url))
     return graph
 
 
@@ -1465,6 +1522,49 @@ def test_thread_context_root_parser_accepts_only_messageid_parameter():
     assert adapter._parse_root_message_id(bad) is None
     bad.conversation.id = "19:opaque@thread.tacv2;foo=1"
     assert adapter._parse_root_message_id(bad) is None
+
+
+class _FakeMsalApp:
+    def __init__(self):
+        self.silent_calls = 0
+        self.client_calls = 0
+
+    def acquire_token_silent_with_error(self, scopes, account=None):
+        self.silent_calls += 1
+        return {"access_token": "silent-token", "expires_on": time.time() + 3600}
+
+    def acquire_token_for_client(self, scopes):
+        self.client_calls += 1
+        return {"access_token": "client-token", "expires_on": time.time() + 3600}
+
+
+def test_graph_token_provider_uses_graph_identity_and_scope(monkeypatch):
+    msal_cls = MagicMock(return_value=_FakeMsalApp())
+    provider = teams.TeamsGraphTokenProvider(GRAPH_CLIENT_ID, GRAPH_SECRET, TENANT_ID, msal_cls=msal_cls)
+    assert msal_cls.call_args.kwargs["client_id"] == GRAPH_CLIENT_ID
+    assert msal_cls.call_args.kwargs["client_credential"] == GRAPH_SECRET
+    assert msal_cls.call_args.kwargs["authority"].endswith(f"/{TENANT_ID}/v2.0")
+    assert asyncio.run(provider.get_token()) == "silent-token"
+    assert provider._scope == [teams.GRAPH_SCOPE]
+
+
+def test_graph_token_provider_redacts_msal_result():
+    redacted = teams._redact_msal_result({"access_token": "token", "refresh_token": "refresh", "client_secret": "secret", "client_id": "id"})
+    assert redacted["access_token"] == teams._REDACTION
+    assert redacted["refresh_token"] == teams._REDACTION
+    assert redacted["client_secret"] == teams._REDACTION
+    assert redacted["client_id"] == "id"
+
+
+def test_graph_client_uses_token_provider(monkeypatch):
+    provider = MagicMock()
+    provider.get_token = AsyncMock(return_value="token")
+    options_cls = MagicMock()
+    http_client_cls = MagicMock()
+    graph = teams.TeamsGraphClient(provider, http_client_cls=http_client_cls, options_cls=options_cls)
+    assert options_cls.call_args.kwargs["base_url"] == teams.GRAPH_BASE_URL
+    assert options_cls.call_args.kwargs["timeout"] == teams.GRAPH_CONTEXT_TIMEOUT_SECONDS
+    assert options_cls.call_args.kwargs["token"] is provider.get_token
 
 
 def test_thread_context_disabled_makes_no_graph_call():
@@ -1499,7 +1599,8 @@ def test_graph_request_failure_logs_graph_response_details(caplog):
 
     assert (
         "Teams Graph request failed: operation=replies status=429 url=/graph-url "
-        "request_id=request-1 client_request_id=client-request-1 body=too many requests"
+        "request_id=request-1 client_request_id=client-request-1 "
+        "identity_mode=shared client_hash=bd7662a5eeb4 team_hash= channel_hash= body=too many requests"
     ) in caplog.text
 
 
