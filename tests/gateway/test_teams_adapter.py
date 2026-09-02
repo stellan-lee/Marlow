@@ -13,7 +13,7 @@ import pytest
 
 import gateway.platforms.base as platform_base
 from gateway.config import PlatformConfig
-from gateway.platforms.base import render_external_conversation_snapshot
+from gateway.platforms.base import MessageEvent, MessageType, render_external_conversation_snapshot
 
 from tests.gateway._plugin_adapter_loader import load_plugin_adapter
 
@@ -1588,3 +1588,457 @@ def test_thread_context_uses_event_route_identity_for_snapshot():
     snapshot = out.external_conversation_snapshot
     assert snapshot.chat_id == event.source.chat_id
     assert snapshot.thread_id == event.source.thread_id
+
+
+# ---------------------------------------------------------------------------
+# Acknowledgement reactions
+# ---------------------------------------------------------------------------
+
+
+def _reaction_event_from_activity(activity):
+    adapter = _make_adapter()
+    reference = teams._sdk_conversation_reference(
+        getattr(activity, "service_url", ""),
+        getattr(activity, "recipient", None),
+        getattr(activity, "conversation", None),
+    )
+    source = adapter._build_source(activity, reference=reference)
+    return MessageEvent(
+        text=getattr(activity, "text", "") or "",
+        message_type=MessageType.TEXT,
+        source=source,
+        raw_message=teams._activity_to_dict(activity),
+        message_id=getattr(activity, "id", None),
+    )
+
+
+def _reaction_event(activity=None, *, message_id="msg-1", conversation_type="personal", conversation_id="conv-1", service_url=SERVICE_URL, channel_data=None, text="hello"):
+    if activity is None:
+        activity = _activity(
+            activity_id=message_id,
+            conversation_type=conversation_type,
+            conversation_id=conversation_id,
+            service_url=service_url,
+            channel_data=channel_data,
+            text=text,
+        )
+    return _reaction_event_from_activity(activity)
+
+
+def test_reaction_config_defaults_to_disabled_and_env_can_enable():
+    adapter = _make_adapter()
+    assert adapter._reaction_config.enabled is False
+
+    adapter = _make_adapter(reactions={"enabled": True})
+    assert adapter._reaction_config.enabled is True
+
+
+def test_reaction_config_env_can_enable_without_yaml(monkeypatch):
+    monkeypatch.setenv("TEAMS_REACTIONS", "true")
+    adapter = _make_adapter()
+    assert adapter._reaction_config.enabled is True
+
+    monkeypatch.setenv("TEAMS_REACTIONS", "false")
+    adapter = _make_adapter()
+    assert adapter._reaction_config.enabled is False
+
+
+def test_reaction_config_env_rejects_invalid_without_yaml(monkeypatch):
+    monkeypatch.setenv("TEAMS_REACTIONS", "maybe")
+    with pytest.raises(ValueError, match="TEAMS_REACTIONS"):
+        _make_adapter()
+
+
+def test_reaction_config_env_override_precedence(monkeypatch):
+    adapter = _make_adapter(reactions={"enabled": True})
+    assert adapter._reaction_config.enabled is True
+
+    monkeypatch.setenv("TEAMS_REACTIONS", "false")
+    adapter = _make_adapter(reactions={"enabled": True})
+    assert adapter._reaction_config.enabled is False
+
+
+def test_reaction_config_rejects_non_bool_yaml():
+    with pytest.raises(ValueError, match="teams.reactions.enabled"):
+        _make_adapter(reactions={"enabled": "yes"})
+
+
+def test_reaction_target_extraction_personal_group_and_channel(monkeypatch):
+    personal = _reaction_event(message_id="msg-personal", conversation_type="personal", conversation_id="dm-1")
+    assert teams._reaction_target_for_event(personal) == teams.TeamsReactionTarget(
+        service_url=SERVICE_URL,
+        conversation_id="dm-1",
+        activity_id="msg-personal",
+    )
+
+    group = _reaction_event(message_id="msg-group", conversation_type="groupChat", conversation_id="group-1")
+    assert teams._reaction_target_for_event(group).conversation_id == "group-1"
+
+    channel = _reaction_event(
+        message_id="msg-channel",
+        conversation_type="channel",
+        conversation_id="thread-1",
+        channel_data={"team": {"id": "team-1"}, "channel": {"id": "chan-1", "type": "standard"}},
+        text=None,
+    )
+    assert teams._reaction_target_for_event(channel) == teams.TeamsReactionTarget(
+        service_url=SERVICE_URL,
+        conversation_id="thread-1",
+        activity_id="msg-channel",
+    )
+
+
+@pytest.mark.parametrize(
+    "service_url",
+    [
+        "http://smba.trafficmanager.net/teams",
+        "https://smba.trafficmanager.net/teams?x=1",
+        "https://user:pass@smba.trafficmanager.net/teams",
+        "https://smba.trafficmanager.net/teams/#frag",
+    ],
+)
+def test_reaction_target_rejects_invalid_service_urls(service_url):
+    activity = _activity(service_url=service_url)
+    event = _reaction_event(activity=activity)
+    assert teams._reaction_target_for_event(event) is None
+
+
+@pytest.mark.asyncio
+async def test_reaction_api_client_factory_is_service_url_bound_and_bounded(monkeypatch):
+    adapter = _make_adapter(reactions={"enabled": True})
+    app = SimpleNamespace(
+        api=SimpleNamespace(http="http-client"),
+        options=SimpleNamespace(api_client_settings="api-settings"),
+        cloud="public",
+    )
+    adapter._teams_app = app
+
+    def fake_api_client(service_url, http_client, api_client_settings, *, cloud):
+        return MagicMock(service_url=service_url, http_client=http_client, api_client_settings=api_client_settings, cloud=cloud)
+
+    monkeypatch.setattr(teams, "ApiClient", fake_api_client)
+
+    first = adapter._reaction_api_for_service_url("https://service-a.example/teams/")
+    second = adapter._reaction_api_for_service_url("https://service-b.example/teams")
+    third = adapter._reaction_api_for_service_url("https://service-a.example/teams")
+
+    assert first is third
+    assert first is not second
+    assert first.service_url == "https://service-a.example/teams"
+    assert first.http_client == "http-client"
+    assert first.api_client_settings == "api-settings"
+    assert first.cloud == "public"
+
+    for index in range(teams.DEFAULT_REACTION_CLIENT_CACHE_SIZE):
+        adapter._reaction_api_for_service_url(f"https://evict-{index}.example/teams")
+
+    assert len(adapter._reaction_api_clients) == teams.DEFAULT_REACTION_CLIENT_CACHE_SIZE
+
+
+@pytest.mark.asyncio
+async def test_reaction_rate_limiter_refills_by_monotonic_time(monkeypatch):
+    now = 100.0
+    monkeypatch.setattr(teams.time, "monotonic", lambda: now)
+    limiter = teams.TeamsReactionRateLimiter(rate_per_second=1.0, burst=1)
+
+    assert await limiter.try_acquire() is True
+    assert await limiter.try_acquire() is False
+
+    now = 101.0
+    assert await limiter.try_acquire() is True
+
+
+@pytest.mark.asyncio
+async def test_on_processing_start_skips_when_disabled():
+    adapter = _make_adapter()
+    adapter._spawn_reaction_task = MagicMock()
+    await adapter.on_processing_start(_reaction_event())
+    adapter._spawn_reaction_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_on_processing_start_schedules_reaction_without_waiting(monkeypatch):
+    adapter = _make_adapter(reactions={"enabled": True})
+    event = _reaction_event()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_add(target):
+        entered.set()
+        await release.wait()
+        return teams.TeamsReactionResult.SUCCESS
+
+    adapter._add_acknowledgement_reaction = AsyncMock(side_effect=slow_add)
+    await adapter.on_processing_start(event)
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    release.set()
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_ack_reaction_success_records_metric_and_calls_sdk(monkeypatch):
+    adapter = _make_adapter(reactions={"enabled": True})
+    target = teams._reaction_target_for_event(_reaction_event())
+    fake_api = MagicMock()
+    fake_api.conversations.add_reaction = AsyncMock()
+    adapter._reaction_api_for_service_url = MagicMock(return_value=fake_api)
+
+    result = await adapter._add_acknowledgement_reaction(target)
+
+    assert result == teams.TeamsReactionResult.SUCCESS
+    fake_api.conversations.add_reaction.assert_awaited_once_with("conv-1", "msg-1", teams.TEAMS_ACK_REACTION)
+    snapshot = adapter._telemetry.snapshot()
+    assert snapshot["counters"]["teams_reaction_operations_total"]["{\"operation\": \"add\", \"result\": \"success\"}"] == 1
+
+
+@pytest.mark.asyncio
+async def test_ack_reaction_local_rate_limited_drops_without_retry():
+    adapter = _make_adapter(reactions={"enabled": True})
+    adapter._reaction_limiter = teams.TeamsReactionRateLimiter(rate_per_second=0.001, burst=0)
+    assert await adapter._reaction_limiter.try_acquire()
+    target = teams._reaction_target_for_event(_reaction_event())
+
+    result = await adapter._add_acknowledgement_reaction(target)
+
+    assert result == teams.TeamsReactionResult.LOCAL_RATE_LIMITED
+
+
+@pytest.mark.asyncio
+async def test_ack_reaction_timeout_is_bounded_and_recorded():
+    adapter = _make_adapter(reactions={"enabled": True})
+
+    async def never_responds(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    fake_api = MagicMock()
+    fake_api.conversations.add_reaction = AsyncMock(side_effect=never_responds)
+    adapter._reaction_api_for_service_url = MagicMock(return_value=fake_api)
+    target = teams._reaction_target_for_event(_reaction_event())
+
+    result = await adapter._add_acknowledgement_reaction(target)
+
+    assert result == teams.TeamsReactionResult.TIMEOUT
+    fake_api.conversations.add_reaction.assert_awaited_once()
+    snapshot = adapter._telemetry.snapshot()
+    assert snapshot["counters"]["teams_reaction_operations_total"]["{\"operation\": \"add\", \"result\": \"timeout\"}"] == 1
+
+
+@pytest.mark.asyncio
+async def test_on_processing_start_drops_reaction_when_inflight_cap_reached():
+    adapter = _make_adapter(reactions={"enabled": True})
+    inflight = {asyncio.create_task(asyncio.sleep(10)) for _ in range(teams.DEFAULT_REACTION_MAX_INFLIGHT)}
+    adapter._reaction_tasks.update(inflight)
+    adapter._spawn_reaction_task = MagicMock()
+    try:
+        await adapter.on_processing_start(_reaction_event())
+    finally:
+        for task in inflight:
+            task.cancel()
+        await asyncio.gather(*inflight, return_exceptions=True)
+
+    adapter._spawn_reaction_task.assert_not_called()
+    snapshot = adapter._telemetry.snapshot()
+    assert snapshot["counters"]["teams_reaction_operations_total"]["{\"operation\": \"add\", \"result\": \"local_rate_limited\"}"] == 1
+
+
+@pytest.mark.asyncio
+async def test_queued_same_session_reaction_starts_when_processing_begins(tmp_path, monkeypatch):
+    monkeypatch.setenv("MARLOW_HOME", str(tmp_path))
+    adapter = _start_supervisor(_make_adapter(reactions={"enabled": True}), max_active=1, max_pending=1)
+    adapter._receipt_store = teams.TeamsReceiptStore(teams.get_marlow_home() / "teams" / "receipts")
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    release_first = asyncio.Event()
+    seen_activity_ids = []
+
+    async def add_reaction(target):
+        seen_activity_ids.append(target.activity_id)
+        return teams.TeamsReactionResult.SUCCESS
+
+    async def handler(event):
+        if event.text == "first":
+            first_started.set()
+            await release_first.wait()
+        elif event.text == "second":
+            second_started.set()
+        return "ok"
+
+    adapter._add_acknowledgement_reaction = AsyncMock(side_effect=add_reaction)
+    adapter.set_message_handler(handler)
+
+    response = await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-queued-1", text="first", conversation_id="shared")))
+    assert response.status == 200
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+    await asyncio.sleep(0)
+    assert seen_activity_ids == ["msg-queued-1"]
+
+    response = await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-queued-2", text="second", conversation_id="shared")))
+    assert response.status == 200
+    await asyncio.sleep(0)
+    assert seen_activity_ids == ["msg-queued-1"]
+
+    release_first.set()
+    await asyncio.wait_for(second_started.wait(), timeout=1)
+    for _ in range(20):
+        if seen_activity_ids == ["msg-queued-1", "msg-queued-2"]:
+            break
+        await asyncio.sleep(0.01)
+    assert seen_activity_ids == ["msg-queued-1", "msg-queued-2"]
+    await asyncio.wait_for(adapter._supervisor.stop(), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_rejected_activity_does_not_schedule_reaction(tmp_path, monkeypatch):
+    monkeypatch.setenv("MARLOW_HOME", str(tmp_path))
+    adapter = _start_supervisor(_make_adapter(reactions={"enabled": True}), max_active=2, max_pending=2)
+    adapter._receipt_store = teams.TeamsReceiptStore(teams.get_marlow_home() / "teams" / "receipts")
+    adapter._spawn_reaction_task = MagicMock()
+    adapter.set_message_handler(AsyncMock(return_value="ok"))
+
+    try:
+        assert (await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-duplicate")))).status == 200
+        await asyncio.sleep(0.05)
+        assert adapter._spawn_reaction_task.call_count == 1
+
+        assert (await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-duplicate")))).status == 200
+        await asyncio.sleep(0.05)
+        assert adapter._spawn_reaction_task.call_count == 1
+    finally:
+        await adapter._supervisor.stop()
+
+
+@pytest.mark.asyncio
+async def test_rejected_teams_gates_do_not_schedule_reaction(tmp_path, monkeypatch):
+    monkeypatch.setenv("MARLOW_HOME", str(tmp_path))
+    adapter = _start_supervisor(_make_adapter(reactions={"enabled": True}), max_active=0, max_pending=0)
+    adapter._receipt_store = teams.TeamsReceiptStore(teams.get_marlow_home() / "teams" / "receipts")
+    adapter._spawn_reaction_task = MagicMock()
+    try:
+        assert (await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-tenant", tenant_id=OTHER_USER_ID)))).status == 200
+        assert (await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-group-no-mention", conversation_type="groupChat", text="hello Marlow")))).status == 200
+        assert (await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-capacity")))).status == 503
+    finally:
+        await adapter._supervisor.stop()
+
+    adapter._spawn_reaction_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reaction_task_cleanup_cancels_and_clears_state():
+    adapter = _make_adapter(reactions={"enabled": True})
+    adapter._reaction_api_clients["cached"] = object()
+    blocked = asyncio.Event()
+
+    async def never_finishes():
+        await blocked.wait()
+
+    task = asyncio.create_task(never_finishes())
+    adapter._reaction_tasks.add(task)
+
+    await adapter._cancel_reaction_tasks()
+
+    assert task.done()
+    assert task.cancelled()
+    assert not adapter._reaction_tasks
+    assert not adapter._reaction_api_clients
+
+
+@pytest.mark.asyncio
+async def test_ack_reaction_429_retries_once_with_retry_after(monkeypatch):
+    adapter = _make_adapter(reactions={"enabled": True})
+    fake_api = MagicMock()
+    retry_error = RuntimeError("rate limit")
+    retry_error.response = teams.HttpResponse(body={}, status=429, headers={"Retry-After": "0"})
+    fake_api.conversations.add_reaction = AsyncMock(side_effect=[retry_error, None])
+    adapter._reaction_api_for_service_url = MagicMock(return_value=fake_api)
+    target = teams._reaction_target_for_event(_reaction_event())
+
+    result = await adapter._add_acknowledgement_reaction(target)
+
+    assert result == teams.TeamsReactionResult.SUCCESS
+    assert fake_api.conversations.add_reaction.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_ack_reaction_429_long_retry_after_does_not_retry():
+    adapter = _make_adapter(reactions={"enabled": True})
+    fake_api = MagicMock()
+    retry_error = RuntimeError("rate limit")
+    retry_error.response = teams.HttpResponse(body={}, status=429, headers={"Retry-After": "60"})
+    fake_api.conversations.add_reaction = AsyncMock(side_effect=[retry_error, None])
+    adapter._reaction_api_for_service_url = MagicMock(return_value=fake_api)
+    target = teams._reaction_target_for_event(_reaction_event())
+
+    result = await adapter._add_acknowledgement_reaction(target)
+
+    assert result == teams.TeamsReactionResult.REMOTE_RATE_LIMITED
+    assert fake_api.conversations.add_reaction.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_ack_reaction_404_and_403_are_not_retried(monkeypatch):
+    adapter = _make_adapter(reactions={"enabled": True})
+    fake_api = MagicMock()
+    not_found_error = RuntimeError("not found")
+    not_found_error.response = teams.HttpResponse(body={}, status=404)
+    fake_api.conversations.add_reaction = AsyncMock(side_effect=not_found_error)
+    adapter._reaction_api_for_service_url = MagicMock(return_value=fake_api)
+    target = teams._reaction_target_for_event(_reaction_event())
+
+    result = await adapter._add_acknowledgement_reaction(target)
+
+    assert result == teams.TeamsReactionResult.NOT_FOUND
+    assert fake_api.conversations.add_reaction.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_ack_reaction_failure_does_not_break_final_response():
+    adapter = _start_supervisor(_make_adapter(reactions={"enabled": True}))
+    adapter._receipt_store = teams.TeamsReceiptStore(teams.get_marlow_home() / "teams" / "receipts")
+    adapter._add_acknowledgement_reaction = AsyncMock(side_effect=RuntimeError("boom"))
+
+    async def handler(event):
+        return "ok"
+
+    adapter.set_message_handler(handler)
+    adapter.send = AsyncMock(return_value=teams.SendResult(success=True))
+    try:
+        response = await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-reaction-fail")))
+        assert response.status == 200
+        for _ in range(20):
+            if adapter.send.await_count:
+                break
+            await asyncio.sleep(0.01)
+        assert adapter.send.await_count == 1
+    finally:
+        await adapter._supervisor.stop()
+
+
+@pytest.mark.asyncio
+async def test_slow_reaction_task_does_not_delay_http_ack_or_handler_start():
+    adapter = _start_supervisor(_make_adapter(reactions={"enabled": True}))
+    adapter._receipt_store = teams.TeamsReceiptStore(teams.get_marlow_home() / "teams" / "receipts")
+    reaction_started = asyncio.Event()
+    release_reaction = asyncio.Event()
+    handler_started = asyncio.Event()
+
+    async def slow_reaction(target):
+        reaction_started.set()
+        await release_reaction.wait()
+        return teams.TeamsReactionResult.SUCCESS
+
+    async def handler(event):
+        handler_started.set()
+        return "ok"
+
+    adapter._add_acknowledgement_reaction = AsyncMock(side_effect=slow_reaction)
+    adapter.set_message_handler(handler)
+
+    response = await adapter._handle_teams_activity(MagicMock(body=_activity(activity_id="msg-slow-reaction")))
+    assert response.status == 200
+    await asyncio.wait_for(handler_started.wait(), timeout=1)
+    await asyncio.wait_for(reaction_started.wait(), timeout=1)
+
+    release_reaction.set()
+    await asyncio.sleep(0)
+    await adapter._supervisor.stop()
