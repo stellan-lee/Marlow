@@ -94,11 +94,130 @@ _RECEIPT_VERSION = 1
 
 TEAMS_THREAD_CONTEXT_RE = re.compile(r"(?:^|;)messageid=([^;]+)(?=;|$)")
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
+GRAPH_SCOPE = "https://graph.microsoft.com/.default"
+GRAPH_AUTHORITY_HOST = "https://login.microsoftonline.com"
 GRAPH_REPLY_TOP = 50
 GRAPH_CONTEXT_TIMEOUT_SECONDS = 30.0
 GRAPH_RETRY_AFTER_DEFAULT_SECONDS = 1.0
 GRAPH_CONTEXT_RETRY_ATTEMPTS = 2
 GRAPH_CONTEXT_RETRY_DELAY_SECONDS = 1.0
+TEAMS_GRAPH_CLIENT_SECRET = "TEAMS_GRAPH_CLIENT_SECRET"
+
+
+def _redact_msal_result(result: Any) -> str:
+    if not isinstance(result, dict):
+        return _REDACTION
+    redacted = dict(result)
+    for key in ("access_token", "refresh_token", "client_secret"):
+        if key in redacted:
+            redacted[key] = _REDACTION
+    return redacted
+
+
+class TeamsGraphAuthError(Exception):
+    user_facing_message = "I could not read the full Teams thread because Marlow could not authenticate to Microsoft Graph."
+
+
+@dataclass(frozen=True, slots=True)
+class TeamsIdentityPlan:
+    tenant_id: str
+    bot_client_id: str
+    bot_secret: str
+    graph_client_id: str
+    graph_secret: str
+    graph_identity_mode: str
+
+
+class TeamsGraphTokenProvider:
+    """MSAL-backed app-only token provider for Microsoft Graph thread reads."""
+
+    def __init__(
+        self,
+        client_id: str,
+        client_secret: str,
+        tenant_id: str,
+        *,
+        scope: str = GRAPH_SCOPE,
+        msal_cls: Any = None,
+    ) -> None:
+        if not client_id or not client_secret or not tenant_id:
+            raise ValueError("Teams Graph credentials are incomplete")
+        if msal_cls is None:
+            try:
+                import msal
+            except ImportError as exc:  # pragma: no cover - exercised in dependency-missing environments.
+                raise RuntimeError("Microsoft Graph thread context requires msal") from exc
+            msal_cls = msal.ConfidentialClientApplication
+        self._client_id = client_id
+        self._tenant_id = tenant_id
+        self._scope = [scope]
+        self._authority = f"{GRAPH_AUTHORITY_HOST}/{tenant_id}/v2.0"
+        self._app = msal_cls(client_id=client_id, client_credential=client_secret, authority=self._authority)
+        self._token: Optional[str] = None
+        self._expires_at = 0.0
+        self._lock = asyncio.Lock()
+
+    async def get_token(self) -> str:
+        now = time.time()
+        if self._token and self._expires_at > now + 60:
+            return self._token
+        async with self._lock:
+            now = time.time()
+            if self._token and self._expires_at > now + 60:
+                return self._token
+            result = await asyncio.to_thread(self._app.acquire_token_silent_with_error, self._scope, account=None)
+            if not result or "access_token" not in result:
+                result = await asyncio.to_thread(self._app.acquire_token_for_client, scopes=self._scope)
+            if not result or "access_token" not in result:
+                raise TeamsGraphAuthError("Microsoft Graph token acquisition failed")
+            token = str(result["access_token"])
+            expires_on = result.get("expires_on")
+            try:
+                self._expires_at = float(expires_on)
+            except (TypeError, ValueError):
+                self._expires_at = now + 3600
+            self._token = token
+            return token
+
+
+class TeamsGraphClient:
+    """Small Graph HTTP client using the independent Teams Graph token provider."""
+
+    def __init__(
+        self,
+        token_provider: TeamsGraphTokenProvider,
+        *,
+        http_client_cls: Any = None,
+        options_cls: Any = None,
+        base_url: str = GRAPH_BASE_URL,
+        timeout: float = GRAPH_CONTEXT_TIMEOUT_SECONDS,
+    ) -> None:
+        if http_client_cls is None:
+            http_client_cls = Client
+        if options_cls is None:
+            options_cls = ClientOptions
+        if http_client_cls is None or options_cls is None:
+            raise TeamsThreadContextError(
+                "Teams SDK Graph HTTP client is unavailable",
+                user_facing_message="I could not read the Teams thread because the Teams Graph client is not available.",
+            )
+        self._http_client = http_client_cls(
+            options_cls(
+                base_url=base_url,
+                timeout=timeout,
+                token=token_provider.get_token,
+            )
+        )
+
+    async def get(self, url: str) -> Any:
+        return await self._http_client.get(url)
+
+    async def close(self) -> None:
+        http = getattr(getattr(self._http_client, "http", None), "aclose", None)
+        if http is not None:
+            result = http()
+            if inspect.isawaitable(result):
+                await result
 
 
 class TeamsThreadContextError(Exception):
@@ -920,7 +1039,7 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform(TEAMS_PLATFORM))
         self._enabled = self._coerce_enabled(config.extra.get("enabled", False))
-        self._client_id = str(config.extra.get("client_id", "") or "").strip()
+        self._bot_client_id = str(config.extra.get("client_id", "") or "").strip()
         self._tenant_id = str(config.extra.get("tenant_id", "") or "").strip()
         self._host = self._coerce_host(config.extra.get("host", DEFAULT_HOST))
         self._port = self._coerce_port(config.extra.get("port", DEFAULT_PORT))
@@ -928,7 +1047,8 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
         self._allow_all_users = config.extra.get("allow_all_users", False)
         if not isinstance(self._allow_all_users, bool):
             raise ValueError("teams.allow_all_users must be explicitly boolean")
-        self._secret = str(config.extra.get("client_secret", "") or os.getenv("TEAMS_CLIENT_SECRET", "")).strip()
+        self._bot_secret = str(config.extra.get("client_secret", "") or os.getenv("TEAMS_CLIENT_SECRET", "")).strip()
+        self._identity_plan = self._resolve_identity_plan()
         self._max_body_bytes = int(config.extra.get("max_body_bytes", DEFAULT_MAX_BODY_BYTES) or DEFAULT_MAX_BODY_BYTES)
         self._read_timeout_seconds = float(config.extra.get("read_timeout_seconds", DEFAULT_READ_TIMEOUT_SECONDS) or DEFAULT_READ_TIMEOUT_SECONDS)
         self._auth_timeout_seconds = float(config.extra.get("auth_timeout_seconds", DEFAULT_AUTH_TIMEOUT_SECONDS) or DEFAULT_AUTH_TIMEOUT_SECONDS)
@@ -948,6 +1068,8 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
         self._app = None
         self._teams_app = None
         self._teams_adapter = None
+        self._graph_token_provider: Optional[TeamsGraphTokenProvider] = None
+        self._graph_http_client: Optional[TeamsGraphClient] = None
         self._supervisor: Optional[TeamsDispatchSupervisor] = None
         self._receipt_store: Optional[TeamsReceiptStore] = None
         self._references: Dict[str, Any] = {}
@@ -1025,12 +1147,20 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
     def _validate_config(self) -> None:
         if not self._enabled:
             return
-        if not _is_valid_uuid(self._client_id):
+        if not _is_valid_uuid(self._bot_client_id):
             raise ValueError("teams.client_id must be a valid UUID")
         if not _is_valid_uuid(self._tenant_id):
             raise ValueError("teams.tenant_id must be a valid UUID")
-        if not self._secret:
+        if not self._bot_secret:
             raise ValueError("TEAMS_CLIENT_SECRET is required")
+        graph_client_id = self._identity_plan.graph_client_id
+        if graph_client_id and not _is_valid_uuid(graph_client_id):
+            raise ValueError("teams.graph_client_id must be a valid UUID")
+        if self._thread_context_enabled():
+            if self._identity_plan.graph_identity_mode == "separate" and not self._identity_plan.graph_secret:
+                raise ValueError(f"{TEAMS_GRAPH_CLIENT_SECRET} is required when teams.graph_client_id differs from teams.client_id")
+            if not self._identity_plan.graph_secret:
+                raise ValueError("Teams Graph secret is required when thread_context.enabled is true")
         if is_network_accessible(self._host):
             logger.warning("Teams listener binds to non-loopback host %s; ensure an operator-managed ingress and firewall policy.", self._host)
         for user_id in self._allowed_users:
@@ -1061,6 +1191,7 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
                 self._set_status("degraded", f"receipt cleanup failed: {exc}")
             self._build_http_app()
             self._build_sdk_app()
+            self._build_graph_client()
             await self._teams_app.initialize()
             self._restore_teams_handler()
             self._reset_reaction_state()
@@ -1080,14 +1211,14 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
             raise
 
     def _acquire_lock(self) -> None:
-        acquired, _ = acquire_scoped_lock(_LOCK_SCOPE, self._client_id)
+        acquired, _ = acquire_scoped_lock(_LOCK_SCOPE, self._bot_client_id)
         self._lock_acquired = acquired
         if not acquired:
             raise RuntimeError("Teams credential lock is already held")
 
     def _release_lock(self) -> None:
         if self._lock_acquired:
-            release_scoped_lock(_LOCK_SCOPE, self._client_id)
+            release_scoped_lock(_LOCK_SCOPE, self._bot_client_id)
             self._lock_acquired = False
 
     def _set_status(self, status: str, reason: str = "") -> None:
@@ -1101,7 +1232,15 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
             platform_state=status,
             error_code=error_code,
             error_message=error_message,
-            telemetry={**self._telemetry.snapshot(), "teams_reaction_runtime": self._reaction_runtime_state()},
+            telemetry={
+                **self._telemetry.snapshot(),
+                "teams_reaction_runtime": self._reaction_runtime_state(),
+                "teams_graph_identity_mode": self._identity_plan.graph_identity_mode,
+                "teams_graph_configured": bool(self._graph_token_provider),
+                "bot_client_id_fingerprint": self._identity_fingerprint(self._bot_client_id),
+                "graph_client_id_fingerprint": self._identity_fingerprint(self._identity_plan.graph_client_id),
+                "tenant_id_fingerprint": self._identity_fingerprint(self._tenant_id),
+            },
         )
 
     def _receipt_dir(self) -> Path:
@@ -1122,6 +1261,13 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
                 pass
             self._teams_app = None
         self._teams_adapter = None
+        if self._graph_http_client:
+            try:
+                await self._graph_http_client.close()
+            except Exception:
+                logger.debug("Teams Graph HTTP client cleanup failed", exc_info=True)
+        self._graph_token_provider = None
+        self._graph_http_client = None
         self._team_aad_group_cache.clear()
         self._release_lock()
 
@@ -1134,13 +1280,50 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
             raise RuntimeError("Teams SDK App is unavailable")
         self._teams_adapter = TeamsAiohttpAdapter(self._app, ingress_handler=self._handle_ingress)
         self._teams_app = App(
-            client_id=self._client_id,
-            client_secret=self._secret,
+            client_id=self._bot_client_id,
+            client_secret=self._bot_secret,
             tenant_id=self._tenant_id,
             http_server_adapter=self._teams_adapter,
             messaging_endpoint="/api/messages",
         )
         self._teams_app.server.on_request = self._handle_teams_activity
+
+    def _resolve_identity_plan(self) -> TeamsIdentityPlan:
+        bot_id = _normalize_uuid(self._bot_client_id)
+        bot_secret = self._bot_secret
+        graph_id = _normalize_uuid(self.config.extra.get("graph_client_id")) or bot_id
+        explicit_graph_secret = str(self.config.extra.get("graph_client_secret", "") or os.getenv(TEAMS_GRAPH_CLIENT_SECRET, "")).strip()
+        if graph_id == bot_id:
+            graph_secret = explicit_graph_secret or bot_secret
+            mode = "shared"
+        else:
+            graph_secret = explicit_graph_secret
+            mode = "separate"
+        return TeamsIdentityPlan(
+            tenant_id=_normalize_uuid(self._tenant_id),
+            bot_client_id=bot_id,
+            bot_secret=bot_secret,
+            graph_client_id=graph_id,
+            graph_secret=graph_secret,
+            graph_identity_mode=mode,
+        )
+
+    def _identity_fingerprint(self, value: str) -> str:
+        if not value:
+            return ""
+        return hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()[:12]
+
+    def _build_graph_client(self) -> None:
+        if not self._thread_context_enabled():
+            self._graph_token_provider = None
+            self._graph_http_client = None
+            return
+        self._graph_token_provider = TeamsGraphTokenProvider(
+            client_id=self._identity_plan.graph_client_id,
+            client_secret=self._identity_plan.graph_secret,
+            tenant_id=self._tenant_id,
+        )
+        self._graph_http_client = TeamsGraphClient(self._graph_token_provider)
 
     def _restore_teams_handler(self) -> None:
         if self._teams_app is not None:
@@ -1166,6 +1349,13 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
                 pass
             self._teams_app = None
         self._teams_adapter = None
+        if self._graph_http_client:
+            try:
+                await self._graph_http_client.close()
+            except Exception:
+                logger.debug("Teams Graph HTTP client cleanup failed", exc_info=True)
+        self._graph_token_provider = None
+        self._graph_http_client = None
         self._team_aad_group_cache.clear()
         self._release_lock()
         self._status_reasons.clear()
@@ -1281,7 +1471,7 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
     async def _authenticate_activity(self, activity: Any, authorization: str) -> None:
         if not authorization.startswith("Bearer "):
             raise ValueError("missing bearer token")
-        if not self._secret:
+        if not self._bot_secret:
             raise ValueError("missing client secret")
 
     def _validate_activity(self, activity: Any) -> bool:
@@ -1297,7 +1487,7 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
         sender_id = _normalize_uuid(getattr(sender, "aad_object_id", None))
         if not sender_id:
             return False
-        bot_id = _normalize_uuid(self._client_id)
+        bot_id = _normalize_uuid(self._bot_client_id)
         if sender_id == bot_id:
             return False
         if _extract_conversation_type(activity) not in SUPPORTED_CONVERSATION_TYPES:
@@ -1312,7 +1502,7 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
         has_image = any(_is_supported_image_attachment(a) for a in getattr(activity, "attachments", None) or [])
         if not text and not has_image:
             return False
-        bot_id = _normalize_uuid(self._client_id)
+        bot_id = _normalize_uuid(self._bot_client_id)
         if _extract_conversation_type(activity) in {"groupChat", "channel"} and not _activity_mentions_bot(activity, bot_id):
             return False
         return True
@@ -1393,33 +1583,13 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
             return False
         raise ValueError(f"{name} must be explicitly boolean")
 
-    def _graph_client(self) -> Any:
-        if not self._teams_app:
+    def _graph_client(self) -> TeamsGraphClient:
+        if not self._graph_http_client:
             raise TeamsThreadContextError(
-                "Teams app is not connected",
+                "Teams Graph client is not connected",
                 user_facing_message="I could not read the Teams thread because Marlow is not connected to Teams right now.",
             )
-        get_graph = getattr(self._teams_app, "get_app_graph", None)
-        if get_graph is not None:
-            try:
-                graph = get_graph(self._tenant_id)
-                if hasattr(graph, "get") and callable(graph.get):
-                    return graph
-            except ImportError:
-                pass
-        get_graph_token = getattr(self._teams_app, "_get_graph_token", None)
-        if get_graph_token is None or Client is None or ClientOptions is None:
-            raise TeamsThreadContextError(
-                "Teams SDK Graph client is unavailable",
-                user_facing_message="I could not read the Teams thread because the Teams Graph client is not available.",
-            )
-        return Client(
-            ClientOptions(
-                base_url=GRAPH_BASE_URL,
-                timeout=GRAPH_CONTEXT_TIMEOUT_SECONDS,
-                token=lambda: get_graph_token(self._tenant_id),
-            )
-        )
+        return self._graph_http_client
 
     def _parse_root_message_id(self, activity: Any) -> Optional[str]:
         conversation = getattr(activity, "conversation", None)
@@ -1579,7 +1749,7 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
 
     async def _graph_get(self, graph: Any, locator: TeamsThreadLocator, operation: str) -> Dict[str, Any]:
         url = self._graph_thread_message_url(locator)
-        return await self._graph_request_json(graph, url, operation)
+        return await self._graph_request_json(graph, url, operation, locator)
 
     async def _graph_get_replies(self, graph: Any, locator: TeamsThreadLocator) -> List[Dict[str, Any]]:
         replies: List[Dict[str, Any]] = []
@@ -1595,7 +1765,7 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
                     )
                 seen_links.add(next_link)
                 url = next_link
-            result = await self._graph_request_json(graph, url, "replies")
+            result = await self._graph_request_json(graph, url, "replies", locator)
             values = result.get("value")
             if not isinstance(values, list):
                 raise TeamsThreadContextError(
@@ -1608,7 +1778,7 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
                 break
         return replies
 
-    async def _graph_request_json(self, graph: Any, url: str, operation: str) -> Dict[str, Any]:
+    async def _graph_request_json(self, graph: Any, url: str, operation: str, locator: Optional[TeamsThreadLocator] = None) -> Dict[str, Any]:
         try:
             result = graph.get(url)
             if inspect.isawaitable(result):
@@ -1620,12 +1790,17 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
                 logger.error(
                     "Teams Graph request failed: "
                     "operation=%s status=%s url=%s "
-                    "request_id=%s client_request_id=%s body=%s",
+                    "request_id=%s client_request_id=%s "
+                    "identity_mode=%s client_hash=%s team_hash=%s channel_hash=%s body=%s",
                     operation,
                     getattr(response, "status_code", None),
                     url,
                     headers.get("request-id"),
                     headers.get("client-request-id"),
+                    self._identity_plan.graph_identity_mode,
+                    self._identity_fingerprint(self._identity_plan.graph_client_id),
+                    self._identity_fingerprint(locator.team_aad_group_id if locator else ""),
+                    self._identity_fingerprint(locator.channel_id if locator else ""),
                     getattr(response, "text", ""),
                 )
             else:
@@ -1659,6 +1834,9 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
             return None
 
     def _graph_user_facing_message(self, exc: Exception) -> str:
+        user_facing_message = getattr(exc, "user_facing_message", None)
+        if user_facing_message:
+            return user_facing_message
         status = self._graph_status_code(exc)
         if status == 401:
             return "I could not read the full Teams thread because Marlow could not authenticate to Microsoft Graph."
@@ -1793,7 +1971,7 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
         created_at = self._parse_graph_datetime(getattr(activity, "created_date_time", None) or getattr(activity, "createdDateTime", None)) or _utc_now()
         text = _activity_text(activity)
         if text:
-            text = _strip_bot_mentions(activity, _normalize_uuid(self._client_id))[0]
+            text = _strip_bot_mentions(activity, _normalize_uuid(self._bot_client_id))[0]
         return ExternalConversationMessage(
             message_id=message_id,
             parent_message_id=getattr(activity, "reply_to_id", None) or getattr(activity, "replyToId", None),
@@ -2016,7 +2194,7 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
         )
 
     async def _build_dispatch_task(self, activity: Any) -> Optional[TeamsDispatchTask]:
-        receipt_key = _canonical_activity_key(activity, self._client_id, self._tenant_id)
+        receipt_key = _canonical_activity_key(activity, self._bot_client_id, self._tenant_id)
         payload_hash = _canonical_payload_hash(activity)
         if self._receipt_store:
             claim, accepted = self._receipt_store.claim(receipt_key, payload_hash, self._receipt_ttl_days)
@@ -2028,7 +2206,7 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
             if claim == "collision":
                 self._last_receipt_error = "activity id collision"
             return None
-        text, _ = _strip_bot_mentions(activity, _normalize_uuid(self._client_id))
+        text, _ = _strip_bot_mentions(activity, _normalize_uuid(self._bot_client_id))
         reference = _sdk_conversation_reference(getattr(activity, "service_url", ""), getattr(activity, "recipient", None), getattr(activity, "conversation", None))
         source = self._build_source(activity, reference=reference)
         self._references[(source.chat_id, source.thread_id or "")] = _conversation_reference_dict(reference)
@@ -2056,11 +2234,11 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
         channel_data = _extract_channel_data(activity)
         conversation_type = _extract_conversation_type(activity)
         if conversation_type == "channel":
-            chat_id = json.dumps([self._tenant_id, self._client_id, _extract_team_id(channel_data), _extract_channel_id(channel_data)], separators=(",", ":"))
+            chat_id = json.dumps([self._tenant_id, self._bot_client_id, _extract_team_id(channel_data), _extract_channel_id(channel_data)], separators=(",", ":"))
             thread_id = str(getattr(getattr(activity, "conversation", None), "id", "") or "")
             chat_type = "channel"
         else:
-            chat_id = json.dumps([self._tenant_id, self._client_id, getattr(getattr(activity, "conversation", None), "id", "")], separators=(",", ":"))
+            chat_id = json.dumps([self._tenant_id, self._bot_client_id, getattr(getattr(activity, "conversation", None), "id", "")], separators=(",", ":"))
             thread_id = None
             chat_type = "dm" if conversation_type == "personal" else "group"
         sender = getattr(activity, "from_", None)
@@ -2810,6 +2988,14 @@ def _setup_teams() -> None:
         return
     save_env_value("TEAMS_CLIENT_SECRET", secret)
     print_success("TEAMS_CLIENT_SECRET saved")
+    if prompt_yes_no("Use a separate Entra application for Microsoft Graph/RSC?", False):
+        graph_client_id = prompt("Microsoft Graph/RSC application client ID")
+        graph_secret = prompt("Microsoft Graph/RSC client secret", password=True)
+        if not graph_client_id or not graph_secret:
+            return
+        save_env_value(TEAMS_GRAPH_CLIENT_SECRET, graph_secret)
+        print_success(f"{TEAMS_GRAPH_CLIENT_SECRET} saved")
+        print_info("Graph/RSC client ID must match the Teams manifest webApplicationInfo.id and the Team permissionGrants.clientAppId.")
     allowed_users = prompt("Allowed Azure AD object IDs (comma-separated, leave empty for deny-by-default)")
     if allowed_users:
         save_env_value("TEAMS_ALLOWED_USERS", allowed_users.replace(" ", ""))

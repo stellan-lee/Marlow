@@ -120,7 +120,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         "lark-oapi==1.5.3",
         "qrcode==7.4.2",
     ),
-    "platform.teams": ("microsoft-teams-apps==2.0.16",),
+    "platform.teams": ("microsoft-teams-apps==2.0.16", "msal==1.38.0"),
     # ─── Terminal backends ─────────────────────────────────────────────────
 
     # ─── Skills ────────────────────────────────────────────────────────────

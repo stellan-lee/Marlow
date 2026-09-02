@@ -373,19 +373,21 @@ The implementation must follow every returned `@odata.nextLink` until no next li
 
 ### 9.6 Graph credential
 
-Use an app-only Microsoft Graph client backed by the same Entra application identity configured for the Teams bot:
+This section is superseded by `docs/microsoft-teams-gateway-separate-bot-and-graph-identities-engineering-design.md`.
+
+Use an app-only Microsoft Graph client backed by the effective Graph identity. The Graph identity defaults to the Bot identity for backward compatibility but may be configured separately when the Teams application's RSC grant is associated with `webApplicationInfo.id` rather than `bots[].botId`:
 
 ```text
-CLIENT_ID
-CLIENT_SECRET
+GRAPH_CLIENT_ID
+GRAPH_SECRET
 TENANT_ID
 scope = https://graph.microsoft.com/.default
 ```
 
 Preferred construction:
 
-- use the pinned Teams SDK's app Graph client when it exposes the required Graph calls; or
-- construct a narrow Microsoft Graph client with the same application credentials.
+- use the pinned Teams SDK's shared HTTP client with an independent token provider; or
+- construct a narrow Microsoft Graph client with the effective Graph application credentials.
 
 Do not forward or repurpose the inbound Bot Framework bearer token as a Graph token.
 
@@ -454,14 +456,18 @@ For manifest v1.25 or later, the relevant shape is:
 
 Identity requirements:
 
+This identity equality rule is superseded by `docs/microsoft-teams-gateway-separate-bot-and-graph-identities-engineering-design.md`:
+
 ```text
 bots[].botId
-    == webApplicationInfo.id
-    == backend CLIENT_ID
-    == Entra Application (client) ID
+    == teams.client_id
+
+webApplicationInfo.id
+    == effective teams.graph_client_id
+    == permissionGrants[].clientAppId
 ```
 
-The manifest's top-level `id` remains the Teams app package ID and is not substituted for the client ID.
+The manifest's top-level `id` remains the Teams app package ID and is not substituted for any client ID.
 
 ### 10.3 Installation and consent
 
@@ -1146,7 +1152,8 @@ Add one explicit non-secret setting under the existing Teams block:
 ```yaml
 teams:
   enabled: true
-  client_id: "<application-client-id>"
+  client_id: "<bot-client-id>"
+  graph_client_id: "<graph-client-id>" # optional; defaults to client_id
   tenant_id: "<directory-tenant-id>"
   host: "127.0.0.1"
   port: 3978
@@ -1163,7 +1170,8 @@ Rules:
 - `thread_context.enabled` defaults to `false` for existing configurations during rollout, because enabling it requires a new manifest permission and Team reinstall/consent.
 - New Teams setup may default it to `true` only when setup also explains the RSC manifest and installation requirements.
 - `require_complete` is fixed to `true` in the first release. Exposing `false` would violate the feature contract and should be rejected by validation rather than treated as a supported mode.
-- Existing `TEAMS_CLIENT_SECRET` is reused. No second Graph secret is introduced.
+- `TEAMS_CLIENT_SECRET` is reused only when `teams.graph_client_id` is absent or equal to `teams.client_id`.
+- When `teams.graph_client_id` differs from `teams.client_id` and thread context is enabled, `TEAMS_GRAPH_CLIENT_SECRET` is required.
 
 Do not add configurable arbitrary Team/channel IDs. The exact locator comes from each authenticated activity.
 
@@ -1176,10 +1184,11 @@ Do not add configurable arbitrary Team/channel IDs. The exact locator comes from
 On adapter connect:
 
 1. validate existing Teams credentials and configuration;
-2. initialize the Teams SDK as before;
-3. initialize or bind the app-only Graph client when thread context is enabled;
-4. initialize bounded Team-ID metadata cache and in-flight coordinator; and
-5. report readiness only after required local components are constructed.
+2. resolve Bot and effective Graph identities;
+3. initialize the Teams SDK with Bot credentials;
+4. initialize or bind the app-only Graph client with Graph credentials when thread context is enabled;
+5. initialize bounded Team-ID metadata cache and in-flight coordinator; and
+6. report readiness only after required local components are constructed.
 
 A Team-specific RSC grant cannot be globally proven at startup. It is verified operationally on the first read in each Team.
 
@@ -1208,6 +1217,9 @@ Add privacy-safe metrics/events:
 
 ```text
 teams_thread_context_attempt_total{result}
+teams_graph_token_requests_total{result}
+teams_graph_requests_total{operation,status,result,identity_mode}
+teams_graph_request_duration_seconds{operation}
 teams_thread_context_graph_requests_total{operation,status_class}
 teams_thread_context_reply_pages_total
 teams_thread_context_messages_total

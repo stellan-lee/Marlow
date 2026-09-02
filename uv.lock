@@ -1406,6 +1406,7 @@ slack = [
 ]
 teams = [
     { name = "microsoft-teams-apps" },
+    { name = "msal" },
 ]
 tts-premium = [
     { name = "elevenlabs" },
@@ -1440,6 +1441,7 @@ requires-dist = [
     { name = "mcp", marker = "extra == 'mcp'", specifier = "==1.26.0" },
     { name = "microsoft-teams-apps", marker = "extra == 'teams'", specifier = "==2.0.16" },
     { name = "mistralai", marker = "extra == 'mistral'", specifier = "==2.4.8" },
+    { name = "msal", marker = "extra == 'teams'", specifier = "==1.38.0" },
     { name = "numpy", marker = "extra == 'voice'", specifier = "==2.4.3" },
     { name = "openai", specifier = "==2.24.0" },
     { name = "prompt-toolkit", specifier = "==3.0.52" },
