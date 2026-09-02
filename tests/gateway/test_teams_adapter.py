@@ -1482,6 +1482,27 @@ def test_thread_context_rejects_private_channel_before_graph_call():
     assert "standard" in excinfo.value.user_facing_message
 
 
+def test_graph_request_failure_logs_graph_response_details(caplog):
+    adapter = _make_adapter(thread_context={"enabled": True})
+    response = SimpleNamespace(
+        status_code=429,
+        headers={"request-id": "request-1", "client-request-id": "client-request-1"},
+        text="too many requests",
+    )
+    error = RuntimeError("Graph unavailable")
+    error.response = response
+    graph = SimpleNamespace(get=MagicMock(side_effect=error))
+
+    with caplog.at_level("ERROR"):
+        with pytest.raises(RuntimeError, match="Graph unavailable"):
+            asyncio.run(adapter._graph_request_json(graph, "/graph-url", "replies"))
+
+    assert (
+        "Teams Graph request failed: operation=replies status=429 url=/graph-url "
+        "request_id=request-1 client_request_id=client-request-1 body=too many requests"
+    ) in caplog.text
+
+
 def test_thread_context_pagination_trigger_found_and_later_messages_excluded():
     adapter = _make_adapter(thread_context={"enabled": True})
     graph = _install_graph(

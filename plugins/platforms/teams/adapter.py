@@ -1492,9 +1492,32 @@ class TeamsPlatformAdapter(BasePlatformAdapter):
         return replies
 
     async def _graph_request_json(self, graph: Any, url: str, operation: str) -> Dict[str, Any]:
-        result = graph.get(url)
-        if inspect.isawaitable(result):
-            result = await result
+        try:
+            result = graph.get(url)
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception as exc:
+            response = getattr(exc, "response", None)
+            if response is not None:
+                headers = getattr(response, "headers", {}) or {}
+                logger.error(
+                    "Teams Graph request failed: "
+                    "operation=%s status=%s url=%s "
+                    "request_id=%s client_request_id=%s body=%s",
+                    operation,
+                    getattr(response, "status_code", None),
+                    url,
+                    headers.get("request-id"),
+                    headers.get("client-request-id"),
+                    getattr(response, "text", ""),
+                )
+            else:
+                logger.exception(
+                    "Teams Graph request failed: operation=%s url=%s",
+                    operation,
+                    url,
+                )
+            raise
         if hasattr(result, "json"):
             try:
                 result = result.json()
