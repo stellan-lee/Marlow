@@ -483,7 +483,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union
+from typing import Dict, List, Mapping, Optional, Any, Callable, Awaitable, Tuple, Union
 from enum import Enum
 
 from pathlib import Path as _Path
@@ -1432,6 +1432,7 @@ class ExternalConversationMessage:
 
 class ExternalHistoryMode(str, Enum):
     REPLACE_VISIBLE_SESSION_HISTORY = "replace_visible_session_history"
+    EXTERNAL_AUTHORITATIVE_STATELESS = "external_authoritative_stateless"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1445,6 +1446,7 @@ class ExternalConversationSnapshot:
     complete_through_trigger: bool
     history_mode: ExternalHistoryMode
     messages: tuple[ExternalConversationMessage, ...]
+    metadata: Mapping[str, str] = field(default_factory=dict)
 
 
 def render_external_conversation_snapshot(

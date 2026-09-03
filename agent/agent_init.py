@@ -176,6 +176,7 @@ def init_agent(
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
     skip_memory: bool = False,
+    skip_profile_memory: bool = False,
     session_db=None,
     parent_session_id: str = None,
     iteration_budget: "IterationBudget" = None,
@@ -185,6 +186,7 @@ def init_agent(
     checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
+    conversation_persistence_policy: str = "session",
 ):
     """
     Initialize the AI Agent.
@@ -607,6 +609,7 @@ def init_agent(
     # SQLite session store (optional -- provided by CLI or gateway)
     agent._session_db = session_db
     agent._parent_session_id = parent_session_id
+    agent._conversation_persistence_policy = conversation_persistence_policy
     agent._last_flushed_db_idx = 0  # tracks DB-write cursor to prevent duplicate writes
     agent._session_db_created = False  # DB row deferred to run_conversation()
     agent._session_init_model_config = {
@@ -642,6 +645,11 @@ def init_agent(
     agent._memory_store = None
     agent._memory_enabled = False
     agent._user_profile_enabled = False
+    agent._memory_recall_enabled = True
+    agent._memory_read_scope = "session"
+    agent._memory_write_mode = "auto"
+    agent._automatic_memory_ingestion_enabled = True
+    agent._background_review_enabled = True
     agent._memory_post_turn_prefetch_enabled = False
     agent._memory_recall_query_builder_enabled = False
     agent._memory_recall_query_recent_turns = 6
@@ -663,7 +671,8 @@ def init_agent(
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
-    if not skip_memory:
+    mem_config = {}
+    if not skip_memory and not skip_profile_memory:
         try:
             mem_config = _agent_cfg.get("memory", {})
             experience_config = _agent_cfg.get("experience", {})
@@ -674,6 +683,14 @@ def init_agent(
                 agent._memory_structured_cards_enabled = False
             agent._memory_enabled = mem_config.get("memory_enabled", False)
             agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
+            agent._memory_read_scope = str(mem_config.get("memory_read_scope", "session") or "session")
+            agent._memory_write_mode = str(mem_config.get("memory_write_mode", "auto") or "auto")
+            agent._automatic_memory_ingestion_enabled = bool(
+                mem_config.get("automatic_memory_ingestion_enabled", True)
+            )
+            agent._background_review_enabled = bool(
+                mem_config.get("background_review_enabled", True)
+            )
             agent._memory_post_turn_prefetch_enabled = bool(
                 mem_config.get("post_turn_prefetch_enabled", False)
             )

@@ -108,6 +108,8 @@ class MemoryRecallRequest:
     principal_id: str
     repository_id: str | None
     project_id: str | None
+    scope_type: str | None
+    scope_id: str | None
     provider_trust_domain: str | None
     provider_is_local: bool
     max_candidates: int = 8
@@ -119,6 +121,8 @@ class MemoryRecallRequest:
         object.__setattr__(self, "principal_id", _text(self.principal_id, "principal_id", 256))
         object.__setattr__(self, "repository_id", _text(self.repository_id, "repository_id", 256, optional=True))
         object.__setattr__(self, "project_id", _text(self.project_id, "project_id", 256, optional=True))
+        object.__setattr__(self, "scope_type", _text(self.scope_type, "scope_type", 64, optional=True))
+        object.__setattr__(self, "scope_id", _text(self.scope_id, "scope_id", 256, optional=True))
         object.__setattr__(
             self,
             "provider_trust_domain",
