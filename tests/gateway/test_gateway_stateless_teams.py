@@ -184,7 +184,7 @@ async def test_stateless_teams_skips_session_store_and_uses_fresh_agent() -> Non
         assert kwargs["history"] == []
         assert kwargs["session_id"] is None
         assert "session_db" not in kwargs
-        assert kwargs["conversation_persistence_policy"] == "none"
+        assert "conversation_persistence_policy" not in kwargs
         assert kwargs["event"] is event
         return _agent_result()
 
@@ -243,6 +243,7 @@ async def test_stateless_teams_replaces_only_visible_history_snapshot() -> None:
 
     async def fake_run_agent(**kwargs):
         captured.update(kwargs)
+        assert "conversation_persistence_policy" not in kwargs
         return _agent_result()
 
     runner._run_agent = AsyncMock(side_effect=fake_run_agent)

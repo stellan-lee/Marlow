@@ -8629,8 +8629,7 @@ class GatewayRunner:
                 event=event,
                 stateless_thread=stateless_thread,
                 skip_memory=stateless_thread,
-                conversation_persistence_policy="none" if stateless_thread else "session",
-            )
+                )
 
             # Stop persistent typing indicator now that the agent is done
             try:
