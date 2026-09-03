@@ -484,6 +484,8 @@ class MemoryManager:
                     principal_id="local-owner",
                     repository_id=None,
                     project_id=None,
+                    scope_type=getattr(self, "_scope_type", None),
+                    scope_id=getattr(self, "_scope_id", None),
                     provider_trust_domain=f"memory-provider:{provider.name}",
                     provider_is_local=provider.name == "builtin",
                     max_candidates=8,
@@ -994,6 +996,15 @@ class MemoryManager:
                     "Memory provider '%s' on_delegation failed: %s",
                     provider.name, type(e).__name__,
                 )
+
+    def set_recall_scope(self, *, scope_type: str | None, scope_id: str | None) -> None:
+        """Set the durable-memory recall scope for the next agent turn."""
+        if scope_type:
+            scope_type = str(scope_type).strip()
+        if scope_id:
+            scope_id = str(scope_id).strip()
+        self._scope_type = scope_type or None
+        self._scope_id = scope_id or None
 
     def shutdown_all(self) -> None:
         """Shut down all providers (reverse order for clean teardown)."""

@@ -278,6 +278,13 @@ class AIAgent:
         parent_session_id: str = None,
         iteration_budget: "IterationBudget" = None,
         fallback_providers: List[Dict[str, Any]] = None,
+        conversation_persistence_policy: str = "session",
+        skip_profile_memory: bool = False,
+        memory_write_mode: str = "auto",
+        automatic_memory_ingestion_enabled: bool = True,
+        background_review_enabled: bool = True,
+        memory_recall_scope_type: str | None = None,
+        memory_recall_scope_id: str | None = None,
         checkpoints_enabled: bool = False,
         checkpoint_max_snapshots: int = 20,
         checkpoint_max_total_size_mb: int = 500,
@@ -335,6 +342,13 @@ class AIAgent:
             parent_session_id=parent_session_id,
             iteration_budget=iteration_budget,
             fallback_providers=fallback_providers,
+            conversation_persistence_policy=conversation_persistence_policy,
+            skip_profile_memory=skip_profile_memory,
+            memory_write_mode=memory_write_mode,
+            automatic_memory_ingestion_enabled=automatic_memory_ingestion_enabled,
+            background_review_enabled=background_review_enabled,
+            memory_recall_scope_type=memory_recall_scope_type,
+            memory_recall_scope_id=memory_recall_scope_id,
             checkpoints_enabled=checkpoints_enabled,
             checkpoint_max_snapshots=checkpoint_max_snapshots,
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
@@ -363,6 +377,8 @@ class AIAgent:
 
     def _ensure_db_session(self) -> None:
         """Create session DB row on first use. Disables _session_db on failure."""
+        if self._conversation_persistence_policy == "none":
+            return
         if self._session_db_created or not self._session_db:
             return
         try:
@@ -1260,7 +1276,7 @@ class AIAgent:
         written, so repeated calls (from multiple exit paths) only write
         truly new messages — preventing the duplicate-write bug (#860).
         """
-        if not self._session_db:
+        if self._conversation_persistence_policy == "none" or not self._session_db:
             return
         self._apply_persist_user_message_override(messages)
         try:
@@ -1556,7 +1572,7 @@ class AIAgent:
         fewer messages") is preserved so resume + branch don't clobber a
         fuller existing snapshot.
         """
-        if not getattr(self, "_session_json_enabled", False):
+        if self._conversation_persistence_policy == "none" or not getattr(self, "_session_json_enabled", False):
             return
         messages = messages or self._session_messages
         if not messages:
@@ -2174,7 +2190,7 @@ class AIAgent:
         providers are strictly best-effort — a misconfigured or offline
         backend must not block the user from seeing their response.
         """
-        if interrupted:
+        if interrupted or getattr(self, "_conversation_persistence_policy", "session") == "none":
             return
         # The consolidation evidence ledger is independent of an external
         # memory provider.  When explicitly enabled, append only completed

@@ -38,6 +38,7 @@ class TurnOrigin(StrEnum):
     CLASSIC_CLI = "classic_cli"
     TELEGRAM = "telegram"
     TELEGRAM_GUEST = "telegram_guest"
+    TEAMS = "teams"
     CLI_BACKGROUND = "cli_background"
     TUI = "tui"
     GATEWAY = "gateway"
@@ -54,6 +55,7 @@ class TurnOrigin(StrEnum):
             TurnOrigin.CLASSIC_CLI,
             TurnOrigin.TELEGRAM,
             TurnOrigin.TELEGRAM_GUEST,
+            TurnOrigin.TEAMS,
         }
 
 
