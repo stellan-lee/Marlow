@@ -181,12 +181,17 @@ def init_agent(
     parent_session_id: str = None,
     iteration_budget: "IterationBudget" = None,
     fallback_providers: List[Dict[str, Any]] = None,
+    conversation_persistence_policy: str = "session",
+    memory_write_mode: str = "auto",
+    automatic_memory_ingestion_enabled: bool = True,
+    background_review_enabled: bool = True,
+    memory_recall_scope_type: str | None = None,
+    memory_recall_scope_id: str | None = None,
     checkpoints_enabled: bool = False,
     checkpoint_max_snapshots: int = 20,
     checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
-    conversation_persistence_policy: str = "session",
 ):
     """
     Initialize the AI Agent.

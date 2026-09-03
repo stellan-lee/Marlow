@@ -5,6 +5,7 @@ pieces. The OpenAI client and tool loading are mocked so no network calls
 are made.
 """
 
+import inspect
 import io
 import json
 import logging
@@ -17,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from agent.codex_responses_adapter import _normalize_codex_response
+from agent.agent_init import init_agent
 
 import run_agent
 from run_agent import AIAgent
@@ -42,6 +44,14 @@ def _make_tool_defs(*names: str) -> list:
         }
         for n in names
     ]
+
+
+def test_aiagent_constructor_matches_delegated_initializer_signature():
+    """Every constructor keyword must be accepted by ``init_agent``."""
+    constructor_params = set(inspect.signature(AIAgent.__init__).parameters) - {"self"}
+    initializer_params = set(inspect.signature(init_agent).parameters) - {"agent"}
+
+    assert constructor_params == initializer_params
 
 
 def test_is_destructive_command_treats_cp_as_mutating():
