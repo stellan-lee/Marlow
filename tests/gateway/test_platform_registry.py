@@ -520,6 +520,57 @@ class TestApplyYamlConfigFnDispatch:
         finally:
             reg.unregister("myextraplat")
 
+    def test_teams_hook_flattens_top_level_settings_into_platform_extra(
+        self, tmp_path, monkeypatch
+    ):
+        """Teams' top-level toggles merge beside nested platform credentials."""
+        home = self._write_config(
+            tmp_path,
+            "teams:\n"
+            "  reactions:\n"
+            "    enabled: true\n"
+            "  thread_context:\n"
+            "    enabled: true\n"
+            "    require_complete: true\n"
+            "platforms:\n"
+            "  teams:\n"
+            "    enabled: true\n"
+            "    host: 0.0.0.0\n"
+            "    extra:\n"
+            "      host: 0.0.0.0\n"
+            "      enabled: true\n"
+            "      client_id: 11111111-1111-4111-8111-111111111111\n"
+            "      client_secret: secret\n"
+            "      graph_client_id: 55555555-5555-4555-8555-555555555555\n"
+            "      graph_client_secret: graph-secret\n"
+            "      tenant_id: 22222222-2222-4222-8222-222222222222\n",
+        )
+        monkeypatch.setenv("MARLOW_HOME", str(home))
+        monkeypatch.delenv("TEAMS_REACTIONS", raising=False)
+
+        from gateway.config import load_gateway_config
+        from tests.gateway._plugin_adapter_loader import load_plugin_adapter
+
+        cfg = load_gateway_config()
+        platform_cfg = cfg.platforms[Platform("teams")]
+
+        assert platform_cfg.extra["thread_context"] == {
+            "enabled": True,
+            "require_complete": True,
+        }
+        assert platform_cfg.extra["reactions"] == {"enabled": True}
+        assert (
+            platform_cfg.extra["client_id"]
+            == "11111111-1111-4111-8111-111111111111"
+        )
+        assert platform_cfg.extra["host"] == "0.0.0.0"
+        assert "extra" not in platform_cfg.extra
+
+        teams = load_plugin_adapter("teams")
+        adapter = teams.TeamsPlatformAdapter(platform_cfg)
+        assert adapter._thread_context_enabled() is True
+        assert adapter._reaction_config.enabled is True
+
     def test_hook_receives_full_yaml_and_platform_subdict(
         self, tmp_path, monkeypatch
     ):

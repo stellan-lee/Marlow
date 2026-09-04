@@ -3159,7 +3159,7 @@ def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> Optional[dict]:
     extra = dict(platform_cfg.get("extra", {}))
     for key, value in teams_cfg.items():
         extra[key] = value
-    return {"extra": extra}
+    return extra
 
 
 def register(ctx) -> None:
