@@ -39,7 +39,7 @@ class TestTTYPromptFlow:
         from marlow_cli import plugins
 
         script = _write_hook_script(tmp_path)
-        plugins._plugin_manager = plugins.PluginManager()
+        plugins._plugin_managers = {str(__import__("marlow_constants").get_marlow_home().absolute()): plugins.PluginManager()}
 
         with patch("sys.stdin") as mock_stdin, patch("builtins.input", return_value="y"):
             mock_stdin.isatty.return_value = True
@@ -58,7 +58,7 @@ class TestTTYPromptFlow:
         from marlow_cli import plugins
 
         script = _write_hook_script(tmp_path)
-        plugins._plugin_manager = plugins.PluginManager()
+        plugins._plugin_managers = {str(__import__("marlow_constants").get_marlow_home().absolute()): plugins.PluginManager()}
 
         with patch("sys.stdin") as mock_stdin, patch("builtins.input", return_value="n"):
             mock_stdin.isatty.return_value = True
@@ -76,7 +76,7 @@ class TestTTYPromptFlow:
         from marlow_cli import plugins
 
         script = _write_hook_script(tmp_path)
-        plugins._plugin_manager = plugins.PluginManager()
+        plugins._plugin_managers = {str(__import__("marlow_constants").get_marlow_home().absolute()): plugins.PluginManager()}
 
         # First call: TTY, approved.
         with patch("sys.stdin") as mock_stdin, patch("builtins.input", return_value="y"):
@@ -109,7 +109,7 @@ class TestNonTTYFlow:
         from marlow_cli import plugins
 
         script = _write_hook_script(tmp_path)
-        plugins._plugin_manager = plugins.PluginManager()
+        plugins._plugin_managers = {str(__import__("marlow_constants").get_marlow_home().absolute()): plugins.PluginManager()}
 
         with patch("sys.stdin") as mock_stdin:
             mock_stdin.isatty.return_value = False
@@ -123,7 +123,7 @@ class TestNonTTYFlow:
         from marlow_cli import plugins
 
         script = _write_hook_script(tmp_path)
-        plugins._plugin_manager = plugins.PluginManager()
+        plugins._plugin_managers = {str(__import__("marlow_constants").get_marlow_home().absolute()): plugins.PluginManager()}
 
         with patch("sys.stdin") as mock_stdin:
             mock_stdin.isatty.return_value = False
@@ -137,7 +137,7 @@ class TestNonTTYFlow:
         from marlow_cli import plugins
 
         script = _write_hook_script(tmp_path)
-        plugins._plugin_manager = plugins.PluginManager()
+        plugins._plugin_managers = {str(__import__("marlow_constants").get_marlow_home().absolute()): plugins.PluginManager()}
         monkeypatch.setenv("MARLOW_ACCEPT_HOOKS", "1")
 
         with patch("sys.stdin") as mock_stdin:
@@ -152,7 +152,7 @@ class TestNonTTYFlow:
         from marlow_cli import plugins
 
         script = _write_hook_script(tmp_path)
-        plugins._plugin_manager = plugins.PluginManager()
+        plugins._plugin_managers = {str(__import__("marlow_constants").get_marlow_home().absolute()): plugins.PluginManager()}
 
         with patch("sys.stdin") as mock_stdin:
             mock_stdin.isatty.return_value = False
@@ -309,4 +309,3 @@ class TestHooksAutoAcceptParsing:
         assert shell_hooks._resolve_effective_accept(
             {"hooks_auto_accept": "false"}, accept_hooks_arg=True,
         ) is True
-

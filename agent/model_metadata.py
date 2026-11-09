@@ -1210,18 +1210,6 @@ def get_model_context_length(
     if isinstance(config_context_length, int) and config_context_length > 0:
         return config_context_length
 
-    if custom_providers and base_url and model:
-        try:
-            from marlow_cli.config import get_custom_provider_context_length
-
-            configured = get_custom_provider_context_length(
-                model=model, base_url=base_url, custom_providers=custom_providers
-            )
-            if configured:
-                return configured
-        except Exception:
-            pass
-
     model = _strip_provider_prefix(model)
     normalized_provider = str(provider or "").strip().lower()
 

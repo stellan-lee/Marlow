@@ -60,53 +60,6 @@ class TestInterruptModule:
 # Unit tests: pre-tool interrupt check
 # ---------------------------------------------------------------------------
 
-class TestPreToolCheck:
-    """Verify that _execute_tool_calls skips all tools when interrupted."""
-
-    def test_all_tools_skipped_when_interrupted(self):
-        """Mock an interrupted agent and verify no tools execute."""
-        from unittest.mock import MagicMock
-
-        # Build a fake assistant_message with 3 tool calls
-        tc1 = MagicMock()
-        tc1.id = "tc_1"
-        tc1.function.name = "terminal"
-        tc1.function.arguments = '{"command": "rm -rf /"}'
-
-        tc2 = MagicMock()
-        tc2.id = "tc_2"
-        tc2.function.name = "terminal"
-        tc2.function.arguments = '{"command": "echo hello"}'
-
-        tc3 = MagicMock()
-        tc3.id = "tc_3"
-        tc3.function.name = "web_search"
-        tc3.function.arguments = '{"query": "test"}'
-
-        assistant_msg = MagicMock()
-        assistant_msg.tool_calls = [tc1, tc2, tc3]
-
-        messages = []
-
-        # Create a minimal mock agent with _interrupt_requested = True
-        agent = MagicMock()
-        agent._interrupt_requested = True
-        agent.log_prefix = ""
-        agent._persist_session = MagicMock()
-
-        # Import and call the method
-        import types
-        from run_agent import AIAgent
-        # Bind the real methods to our mock so dispatch works correctly
-        agent._execute_tool_calls_sequential = types.MethodType(AIAgent._execute_tool_calls_sequential, agent)
-        agent._execute_tool_calls_concurrent = types.MethodType(AIAgent._execute_tool_calls_concurrent, agent)
-        AIAgent._execute_tool_calls(agent, assistant_msg, messages, "default")
-
-        # All 3 should be skipped
-        assert len(messages) == 3
-        for msg in messages:
-            assert msg["role"] == "tool"
-            assert "cancelled" in msg["content"].lower() or "interrupted" in msg["content"].lower()
 
         # No actual tool handlers should have been called
         # (handle_function_call should NOT have been invoked)
@@ -207,77 +160,6 @@ class TestSIGKILLEscalation:
 # Regression: _run_tool cleanup on BaseException (issue #35309)
 # ---------------------------------------------------------------------------
 
-class TestRunToolCleanupOnBaseException:
-    """Verify that _run_tool cleans up _interrupted_threads even when
-    _invoke_tool raises a BaseException (e.g. CancelledError).
-
-    Regression test for #35309: without the finally block, a BaseException
-    bypasses ``except Exception``, leaking the worker tid into
-    _interrupted_threads.  ThreadPoolExecutor recycles tids, so the next
-    tool scheduled on the same thread is instantly "interrupted".
-    """
-
-    def test_cleanup_on_base_exception(self):
-        from unittest.mock import MagicMock, patch
-        import types
-        from tools.interrupt import set_interrupt, is_interrupted, _interrupted_threads, _lock
-
-        # Clear global state
-        with _lock:
-            _interrupted_threads.clear()
-
-        # Build a minimal mock agent with the attributes _run_tool needs
-        agent = MagicMock()
-        agent._interrupt_requested = False
-        agent._tool_worker_threads = set()
-        agent._tool_worker_threads_lock = threading.Lock()
-
-        # _set_interrupt delegates to the real module
-        def _mock_set_interrupt(active, tid=None):
-            set_interrupt(active, tid)
-        agent._set_interrupt = _mock_set_interrupt
-
-        # _invoke_tool raises BaseException (simulating CancelledError)
-        agent._invoke_tool = MagicMock(side_effect=BaseException("simulated CancelledError"))
-
-        # Bind the real concurrent method so we get _run_tool
-        from run_agent import AIAgent
-        agent._execute_tool_calls_concurrent = types.MethodType(
-            AIAgent._execute_tool_calls_concurrent, agent
-        )
-
-        # Build a single tool call
-        tc = MagicMock()
-        tc.id = "tc_base_exc"
-        tc.function.name = "dummy_tool"
-        tc.function.arguments = "{}"
-
-        assistant_msg = MagicMock()
-        assistant_msg.tool_calls = [tc]
-
-        # _execute_tool_calls_concurrent will submit _run_tool to a
-        # ThreadPoolExecutor.  The BaseException propagates out of the
-        # worker, but the finally block should still clean up.
-        try:
-            agent._execute_tool_calls_concurrent(assistant_msg, [], "default")
-        except Exception:
-            pass  # ThreadPoolExecutor may re-raise
-
-        # After the worker finishes (even with BaseException), the worker
-        # tid should have been removed from _interrupted_threads and
-        # _tool_worker_threads.
-        assert len(agent._tool_worker_threads) == 0, (
-            f"_tool_worker_threads not cleaned up: {agent._tool_worker_threads}"
-        )
-
-        # Verify no stale tid is left in the global interrupt set.  The
-        # worker thread is recycled by ThreadPoolExecutor, so a leaked tid
-        # would poison the next task on that thread.  We cleared the set at
-        # the start and never set any interrupt ourselves, so a leak from
-        # _run_tool is the only way an entry could land here.
-        with _lock:
-            leaked = set(_interrupted_threads)
-        assert leaked == set(), f"leaked tids in _interrupted_threads: {leaked}"
 
 
 # ---------------------------------------------------------------------------

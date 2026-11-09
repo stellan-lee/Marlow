@@ -326,8 +326,8 @@ def _default_structured_llm() -> Any:
 
     Keeping this import lazy means the scheduler and observe-only tests remain
     usable in installations without an LLM provider.  Provider routing,
-    credentials, timeout handling, and structured parsing stay in
-    ``agent.plugin_llm`` / ``agent.auxiliary_client``.
+    structured parsing stays in ``agent.plugin_llm``; execution uses
+    ``agent.codex_tasks`` and the same managed app-server adapter.
     """
     from agent.plugin_llm import PluginLlm
 

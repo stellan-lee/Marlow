@@ -26,7 +26,6 @@ import sys
 from contextlib import redirect_stderr, redirect_stdout
 from typing import Optional
 
-from marlow_cli.fallback_config import get_fallback_chain
 
 
 def _normalize_toolsets(toolsets: object = None) -> list[str] | None:
@@ -236,79 +235,10 @@ def _create_session_db_for_oneshot():
         return None
 
 
-def _resolve_query_runtime(cfg: dict, model: str | None, provider: str | None) -> tuple[str, dict]:
-    """Resolve the model and runtime shared by the two single-query commands."""
-    from marlow_cli.models import detect_provider_for_model, get_default_model_for_provider
-    from marlow_cli.model_normalize import normalize_model_for_provider
+def _resolve_query_runtime(cfg, model, provider):
     from marlow_cli.runtime_provider import resolve_runtime_provider
-
-    # Resolve effective model: explicit arg → env var → config.
-    model_cfg = cfg.get("model") or {}
-    if isinstance(model_cfg, str):
-        cfg_model = model_cfg
-    else:
-        cfg_model = model_cfg.get("default") or model_cfg.get("model") or ""
-
-    env_model = os.getenv("MARLOW_INFERENCE_MODEL", "").strip()
-    effective_model = (model or "").strip() or env_model or cfg_model
-
-    # Resolve effective provider: explicit arg → (auto-detect from model if
-    # model was explicit) → env / config (handled inside resolve_runtime_provider).
-    #
-    # When --model is given without --provider, auto-detect the provider that
-    # serves that model — same semantic as `/model <name>` in an interactive
-    # session.  Without this, resolve_runtime_provider() would fall back to
-    # the user's configured default provider, which may not host the model
-    # the caller just asked for.
-    effective_provider = (provider or "").strip() or None
-    explicit_base_url_from_alias: Optional[str] = None
-    if effective_provider is None and (model or env_model):
-        # Only auto-detect when the model was explicitly requested via arg or
-        # env var (not when it came from config — that's the "use my defaults"
-        # path and the configured provider is already correct).
-        explicit_model = (model or "").strip() or env_model
-        if explicit_model:
-            # First check DIRECT_ALIASES populated from config.yaml `model_aliases:`.
-            # These map a user-defined alias to (model, provider, base_url) for
-            # endpoints not in any catalog (local servers, custom proxies, etc.).
-            try:
-                from marlow_cli import model_switch as _ms
-                _ms._ensure_direct_aliases()
-                direct = _ms.DIRECT_ALIASES.get(explicit_model.strip().lower())
-            except Exception:
-                direct = None
-            if direct is not None:
-                effective_model = direct.model
-                effective_provider = direct.provider
-                if direct.base_url:
-                    explicit_base_url_from_alias = direct.base_url.rstrip("/")
-            else:
-                cfg_provider = ""
-                if isinstance(model_cfg, dict):
-                    cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
-                current_provider = (
-                    cfg_provider
-                    or os.getenv("MARLOW_INFERENCE_PROVIDER", "").strip().lower()
-                    or "auto"
-                )
-                detected = detect_provider_for_model(explicit_model, current_provider)
-                if detected:
-                    effective_provider, effective_model = detected
-
-    runtime = resolve_runtime_provider(
-        requested=effective_provider,
-        target_model=effective_model or None,
-        explicit_base_url=explicit_base_url_from_alias,
-    )
-
-    resolved_provider = runtime.get("provider") or ""
-    if not effective_model or effective_model in {effective_provider, runtime.get("name")}:
-        effective_model = runtime.get("model") or effective_model
-    if not effective_model:
-        effective_model = get_default_model_for_provider(resolved_provider) or ""
-    if effective_model and resolved_provider == "openai-codex":
-        effective_model = normalize_model_for_provider(effective_model, resolved_provider)
-    return effective_model, runtime
+    runtime = resolve_runtime_provider(requested=provider, target_model=model)
+    return runtime["model"], runtime
 
 
 def _run_agent(
@@ -342,7 +272,6 @@ def _run_agent(
     session_db = _create_session_db_for_oneshot()
     # Read the effective fallback chain from profile config so oneshot workers
     # honour the same merge semantics as interactive CLI and gateway sessions.
-    _fb = get_fallback_chain(cfg)
 
     ignore_rules = os.environ.get("MARLOW_IGNORE_RULES") == "1"
     agent = AIAgent(
@@ -357,7 +286,6 @@ def _run_agent(
         skip_context_files=ignore_rules,
         skip_memory=ignore_rules,
         session_db=session_db,
-        fallback_providers=_fb or None,
         # Let the model proceed when no user can answer clarifying questions.
         clarify_callback=_oneshot_clarify_callback,
     )
@@ -381,15 +309,5 @@ def _run_agent(
                     session_db.close()
 
 
-def _oneshot_clarify_callback(question: str, choices=None) -> str:
-    """Clarify is disabled in oneshot mode — tell the agent to pick a
-    default and proceed instead of stalling or erroring."""
-    if choices:
-        return (
-            f"[oneshot mode: no user available. Pick the best option from "
-            f"{choices} using your own judgment and continue.]"
-        )
-    return (
-        "[oneshot mode: no user available. Make the most reasonable "
-        "assumption you can and continue.]"
-    )
+def _oneshot_clarify_callback(question, choices=None):
+    raise PermissionError("No interactive clarification channel; task is waiting for user input")

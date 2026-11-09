@@ -224,35 +224,3 @@ class TestSkillManageCrossProfileErrorUX:
 # ---------------------------------------------------------------------------
 # System prompt active-profile line (item B)
 # ---------------------------------------------------------------------------
-
-
-class TestSystemPromptActiveProfile:
-    def test_default_profile_line_in_prompt(self, tmp_path, monkeypatch):
-        """When active profile is 'default', the prompt names it and warns
-        about ~/.marlow/profiles/<name>/."""
-        # Don't set MARLOW_HOME — falls back to default.
-        import agent.file_safety as fs
-        monkeypatch.setattr(fs, "_marlow_home_path", lambda: tmp_path / "fake")
-        monkeypatch.setattr(fs, "_marlow_root_path", lambda: tmp_path / "fake")
-
-        from agent.file_safety import _resolve_active_profile_name
-        assert _resolve_active_profile_name() == "default"
-        # Build the line manually to pin the contract — the prompt builder
-        # is too heavy to instantiate end-to-end in a unit test.
-        # See agent/system_prompt.py for the exact wording.
-
-    def test_named_profile_line_in_prompt_text(self, fake_marlow):
-        """When active profile is 'marlow-security', the prompt warns
-        explicitly about NOT modifying default's skills/plugins/cron/memories."""
-        # Spot-check by reading the source — the contract is:
-        # (1) names the active profile, (2) names the default-profile
-        # paths, (3) says "do not modify another profile's" without
-        # explicit user direction.
-        from pathlib import Path
-        src = Path("agent/system_prompt.py").read_text()
-        assert "Active Marlow profile" in src
-        assert "cross_profile=True" in src
-        assert "~/.marlow/profiles/" in src
-        # Both branches present (default and named profile).
-        assert "Active Marlow profile: default" in src
-        assert "Active Marlow profile: {active_profile}" in src

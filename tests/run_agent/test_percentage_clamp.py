@@ -47,30 +47,3 @@ class TestGatewayStatsPercentClamp:
         context_length = 200_000
         pct = min(100, last_prompt_tokens / context_length * 100) if context_length else 0
         assert pct == 75.0
-
-
-class TestSourceLinesAreClamped:
-    """Verify the actual source files have min(100, ...) applied."""
-
-    @staticmethod
-    def _read_file(rel_path: str) -> str:
-        import os
-        base = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-        with open(os.path.join(base, rel_path)) as f:
-            return f.read()
-
-    def test_gateway_run_clamped(self):
-        src = self._read_file("gateway/run.py")
-        # Check that the stats handler has min(100, ...)
-        assert "min(100, ctx.last_prompt_tokens" in src, (
-            "gateway/run.py stats pct is not clamped with min(100, ...)"
-        )
-
-
-    def test_memory_tool_clamped(self):
-        src = self._read_file("tools/memory_tool.py")
-        # Both _success_response and _render_block should have min(100, ...)
-        count = src.count("min(100, int((current / limit)")
-        assert count >= 2, (
-            f"memory_tool.py has only {count} clamped pct lines, expected >= 2"
-        )

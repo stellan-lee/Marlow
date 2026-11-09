@@ -106,7 +106,7 @@ def test_multi_query_orchestration_returns_each_subquery_own_keyed_result():
     """
     from types import SimpleNamespace
 
-    from agent.conversation_loop import _recall_multi_query
+    from agent.memory_recall import _recall_multi_query
     from agent.memory_manager import MemoryManager
 
     manager = MemoryManager()
@@ -127,7 +127,7 @@ def test_multi_query_orchestration_never_injects_stale_query_a_for_query_b():
     """A stale entry keyed to query A must never surface for other subqueries."""
     from types import SimpleNamespace
 
-    from agent.conversation_loop import _recall_multi_query
+    from agent.memory_recall import _recall_multi_query
     from agent.memory_manager import MemoryManager
     from agent.memory_recall_query import build_recall_query_plan
 

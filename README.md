@@ -12,7 +12,7 @@
 
 **An AI agent with persistent memory, local tools, and messaging integrations.** Marlow searches past conversations, uses reusable skills, and can create skills at your request. Run it locally, on a cloud VM, or through a messaging gateway.
 
-Use a Codex subscription or any local/custom OpenAI-compatible endpoint. Switch with `marlow model`.
+All inference runs through Codex app-server 0.159.2 in a Marlow-managed profile. Use native Codex authentication or a Codex Responses provider with tool support. See [runtime configuration and migration](docs/architecture/phase-2-validation.md).
 
 <table>
 <tr><td><b>Scriptable command line</b></td><td>Run a single query with image input and session history, or use a stdout-only invocation in a script.</td></tr>
@@ -20,8 +20,8 @@ Use a Codex subscription or any local/custom OpenAI-compatible endpoint. Switch 
 <tr><td><b>Persistent memory and skills</b></td><td>Local memory, project-scoped work experience and decisions, FTS5 session search, and user-initiated skill creation. <a href="https://github.com/plastic-labs/honcho">Honcho</a> dialectic user modeling. Compatible with the <a href="https://agentskills.io">agentskills.io</a> open standard.</td></tr>
 <tr><td><b>Scheduled automations</b></td><td>Built-in cron scheduler with delivery to any platform. Daily reports, nightly backups, weekly audits — all in natural language, running unattended.</td></tr>
 <tr><td><b>Delegates and parallelizes</b></td><td>Spawn isolated subagents for parallel workstreams. Write Python scripts that call tools via RPC, collapsing multi-step pipelines into zero-context-cost turns.</td></tr>
-<tr><td><b>Runs where you work</b></td><td>Local, Docker, and SSH terminal backends cover direct development, isolated containers, and remote hosts.</td></tr>
-<tr><td><b>Research-ready</b></td><td>Batch trajectory generation, trajectory compression for training the next generation of tool-calling models.</td></tr>
+<tr><td><b>Runs where you work</b></td><td>Agent shell and files run through the managed Codex local sandbox with explicit project grants. Docker/SSH agent execution is not migrated.</td></tr>
+<tr><td><b>Research-ready</b></td><td>Batch runs use the same Codex adapter and retain attributable local history.</td></tr>
 </table>
 
 ---
@@ -54,7 +54,7 @@ marlow chat -q "Hello"
 ```bash
 marlow chat -q "Hello" # Run one query and save the session
 marlow -z "Hello"      # Return final text on stdout for scripts
-marlow model        # Choose your LLM provider and model
+marlow model        # Edit the managed profile’s native Codex model
 marlow tools        # Configure which tools are enabled
 marlow config set   # Set individual config values
 marlow gateway      # Start the messaging gateway (Telegram, Discord, etc.)

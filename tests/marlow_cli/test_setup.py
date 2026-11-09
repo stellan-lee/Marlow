@@ -254,39 +254,6 @@ def test_setup_keyboard_interrupt_gracefully_handled(tmp_path, monkeypatch):
 
 
 
-def test_select_provider_and_model_accepts_named_provider_from_providers_section(
-    tmp_path, monkeypatch, capsys
-):
-    monkeypatch.setenv("MARLOW_HOME", str(tmp_path))
-    _clear_provider_env(monkeypatch)
-
-    cfg = load_config()
-    cfg["model"] = {
-        "provider": "volcengine-plan",
-        "default": "doubao-seed-2.0-code",
-    }
-    cfg["providers"] = {
-        "volcengine-plan": {
-            "name": "volcengine-plan",
-            "base_url": "https://ark.cn-beijing.volces.com/api/coding/v3",
-            "default_model": "doubao-seed-2.0-code",
-            "models": {"doubao-seed-2.0-code": {}},
-        }
-    }
-    save_config(cfg)
-
-    monkeypatch.setattr(
-        "marlow_cli.main._prompt_provider_choice",
-        lambda choices, default=0: len(choices) - 1,
-    )
-
-    from marlow_cli.main import select_provider_and_model
-
-    select_provider_and_model()
-
-    out = capsys.readouterr().out
-    assert "Warning: Unknown provider 'volcengine-plan'" not in out
-    assert "Active provider:  volcengine-plan" in out
 
 
 def test_codex_setup_uses_runtime_access_token_for_live_model_list(tmp_path, monkeypatch):

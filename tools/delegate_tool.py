@@ -64,12 +64,8 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
 #
 # Fix: install a non-interactive callback into every subagent worker thread
 # via ThreadPoolExecutor(initializer=_set_subagent_approval_cb, initargs=(cb,)).
-# The callback is chosen by the `delegation.subagent_auto_approve` config:
-#   false (default) → _subagent_auto_deny (safe; matches leaf tool blocklist)
-#   true            → _subagent_auto_approve (opt-in YOLO for cron/batch)
-# Both emit a logger.warning for audit; gateway sessions are unaffected
-# because they resolve approvals via tools/approval.py's per-session queue,
-# not through these TLS callbacks.
+# A trusted gateway context may request its operation-bound approval. A child
+# without that context must fail safely instead of reading stdin or approving.
 def _subagent_auto_deny(command: str, description: str, **kwargs) -> str:
     """Auto-deny dangerous commands in subagent threads (safe default).
 
@@ -77,37 +73,14 @@ def _subagent_auto_deny(command: str, description: str, **kwargs) -> str:
     never calls input() (which would deadlock the parent TUI).
     """
     logger.warning(
-        "Subagent auto-denied dangerous command: %s (%s). "
-        "Set delegation.subagent_auto_approve: true to allow.",
+        "Subagent denied dangerous command without a human approval channel: %s (%s).",
         command, description,
     )
     return "deny"
 
 
-def _subagent_auto_approve(command: str, description: str, **kwargs) -> str:
-    """Auto-approve dangerous commands in subagent threads (opt-in YOLO).
-
-    Only installed when delegation.subagent_auto_approve=true. Returns 'once'
-    so the subagent proceeds without blocking the parent UI.
-    """
-    logger.warning(
-        "Subagent auto-approved dangerous command: %s (%s)",
-        command, description,
-    )
-    return "once"
-
-
 def _get_subagent_approval_callback():
-    """Return the callback to install into subagent worker threads.
-
-    Config key: delegation.subagent_auto_approve (bool, default False).
-    Reads via the same _load_config() path as the rest of delegate_task so
-    priority is config.yaml > (no env override for this knob) > default.
-    """
-    cfg = _load_config()
-    val = cfg.get("subagent_auto_approve", False)
-    if is_truthy_value(val):
-        return _subagent_auto_approve
+    """No unattended child may manufacture approval for a dangerous operation."""
     return _subagent_auto_deny
 
 # Build a description fragment listing toolsets available for subagents.
@@ -908,11 +881,6 @@ def _build_child_agent(
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
     )
-    # Extract the parent's API key so custom-runtime subagents can inherit it.
-    parent_api_key = getattr(parent_agent, "api_key", None)
-    if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
-        parent_api_key = parent_agent._client_kwargs.get("api_key")
-
     # Resolve the child's effective model early so it can ride on every event.
     effective_model_for_cb = model or getattr(parent_agent, "model", None)
 
@@ -949,19 +917,11 @@ def _build_child_agent(
 
         child_thinking_cb = _child_thinking
 
-    # Resolve effective credentials: config override > parent inherit
-    effective_model = model or parent_agent.model
-    effective_provider = override_provider or getattr(parent_agent, "provider", None)
-    effective_base_url = override_base_url or parent_agent.base_url
-    effective_api_key = override_api_key or parent_api_key
-    # A child on a different retained runtime must re-derive its wire mode.
-    _parent_provider = getattr(parent_agent, "provider", None) or ""
-    if override_api_mode is not None:
-        effective_api_mode = override_api_mode
-    elif effective_provider != _parent_provider:
-        effective_api_mode = None  # force re-derivation from provider's defaults
-    else:
-        effective_api_mode = getattr(parent_agent, "api_mode", None)
+    effective_model = parent_agent.model
+    effective_provider = parent_agent.provider
+    effective_base_url = None
+    effective_api_key = None
+    effective_api_mode = "codex_app_server"
     # Resolve reasoning config: delegation override > parent inherit
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
     child_reasoning = parent_reasoning
@@ -981,22 +941,20 @@ def _build_child_agent(
     except Exception as exc:
         logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
-    # Inherit the parent's fallback provider chain so subagents can recover
-    # from rate-limits and credential exhaustion exactly like the top-level
-    # agent does.
-    parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
-
     child = AIAgent(
         base_url=effective_base_url,
         api_key=effective_api_key,
         model=effective_model,
+        workspace_scope=parent_agent._workspace_scope,
+        conversation_shared=parent_agent._conversation_shared,
+        project_path=parent_agent.session_cwd if parent_agent.session_cwd != str(parent_agent.environment.workspace) else None,
+        authorized_projects=[{'path': path, 'writable': writable} for path, writable in parent_agent.environment.projects],
         provider=effective_provider,
         api_mode=effective_api_mode,
         max_iterations=max_iterations,
         max_tokens=getattr(parent_agent, "max_tokens", None),
         reasoning_config=child_reasoning,
         prefill_messages=getattr(parent_agent, "prefill_messages", None),
-        fallback_providers=parent_fallback,
         enabled_toolsets=child_toolsets,
         quiet_mode=True,
         ephemeral_system_prompt=child_prompt,
@@ -1008,6 +966,12 @@ def _build_child_agent(
         thinking_callback=child_thinking_cb,
         session_db=getattr(parent_agent, "_session_db", None),
         parent_session_id=getattr(parent_agent, "session_id", None),
+        user_id=getattr(parent_agent, "_user_id", None),
+        user_id_alt=getattr(parent_agent, "_user_id_alt", None),
+        chat_id=getattr(parent_agent, "_chat_id", None),
+        chat_type=getattr(parent_agent, "_chat_type", None),
+        thread_id=getattr(parent_agent, "_thread_id", None),
+        gateway_session_key=getattr(parent_agent, "_gateway_session_key", None),
         tool_progress_callback=child_progress_cb,
         iteration_budget=None,  # fresh budget per subagent
     )
@@ -1325,7 +1289,7 @@ def _run_single_child(
             # Install a non-interactive approval callback in the worker thread
             # so dangerous-command prompts from the subagent don't fall back to
             # input() and deadlock the parent's prompt_toolkit TUI.
-            # Callback (deny vs approve) is governed by delegation.subagent_auto_approve.
+            # No approval channel means denial; a config flag cannot grant consent.
             initializer=_set_subagent_approval_cb,
             initargs=(_get_subagent_approval_callback(),),
         )
@@ -1340,7 +1304,8 @@ def _run_single_child(
                 task_id=child_task_id,
             )
 
-        _child_future = _timeout_executor.submit(_run_with_thread_capture)
+        from tools.thread_context import propagate_context_to_thread
+        _child_future = _timeout_executor.submit(propagate_context_to_thread(_run_with_thread_capture))
         try:
             result = _child_future.result(timeout=child_timeout)
         except Exception as _timeout_exc:
@@ -2242,97 +2207,10 @@ def delegate_task(
     return json.dumps(_execute_and_aggregate(), ensure_ascii=False)
 
 
-def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
-    """Resolve credentials for subagent delegation.
-
-    If ``delegation.base_url`` is configured, subagents use that direct
-    OpenAI-compatible endpoint. ``delegation.api_key`` overrides the key; when
-    omitted, ``api_key`` is returned as ``None`` so ``_build_child_agent``
-    inherits the parent agent's key (``effective_api_key = override_api_key or
-    parent_api_key``). This lets providers that store their key outside
-    ``OPENAI_API_KEY`` (e.g. ``MINIMAX_API_KEY``, ``DASHSCOPE_API_KEY``) work
-    without a duplicate config entry.
-
-    Otherwise, if ``delegation.provider`` is configured, the full credential
-    bundle (base_url, api_key, api_mode, provider) is resolved via the runtime
-    provider system — the same path used by CLI/gateway startup. This lets
-    subagents run on a completely different provider:model pair.
-
-    If neither base_url nor provider is configured, returns None values so the
-    child inherits everything from the parent agent.
-
-    Raises ValueError with a user-friendly message on credential failure.
-    """
-    configured_model = str(cfg.get("model") or "").strip() or None
-    configured_provider = str(cfg.get("provider") or "").strip() or None
-    configured_base_url = str(cfg.get("base_url") or "").strip() or None
-    configured_api_key = str(cfg.get("api_key") or "").strip() or None
-    configured_api_mode = str(cfg.get("api_mode") or "").strip().lower() or None
-
-    if configured_base_url:
-        # When delegation.api_key is not set, return None so _build_child_agent
-        # falls back to the parent agent's API key via the credential inheritance
-        # path (effective_api_key = override_api_key or parent_api_key). This
-        # supports local endpoints with no key and parent credential inheritance.
-        api_key = configured_api_key  # None → inherited from parent in _build_child_agent
-
-        base_lower = configured_base_url.lower()
-        provider = "custom"
-        api_mode = "chat_completions"
-        if (
-            base_url_hostname(configured_base_url) == "chatgpt.com"
-            and "/backend-api/codex" in base_lower
-        ):
-            provider = "openai-codex"
-            api_mode = "codex_responses"
-        if configured_api_mode in {"chat_completions", "codex_responses"}:
-            api_mode = configured_api_mode
-
-        return {
-            "model": configured_model,
-            "provider": provider,
-            "base_url": configured_base_url,
-            "api_key": api_key,
-            "api_mode": api_mode,
-        }
-
-    if not configured_provider:
-        # No provider override — child inherits everything from parent
-        return {
-            "model": configured_model,
-            "provider": None,
-            "base_url": None,
-            "api_key": None,
-            "api_mode": None,
-        }
-
-    # Provider is configured — resolve full credentials
-    try:
-        from marlow_cli.runtime_provider import resolve_runtime_provider
-
-        runtime = resolve_runtime_provider(requested=configured_provider, target_model=configured_model)
-    except Exception as exc:
-        raise ValueError(
-            f"Cannot resolve delegation provider '{configured_provider}': {exc}. "
-            f"Check that the provider is configured (API key set, valid provider name), "
-            f"or set delegation.base_url/delegation.api_key for a direct endpoint. "
-            "Available providers: openai-codex or a configured custom endpoint."
-        ) from exc
-
-    api_key = runtime.get("api_key", "")
-    if not api_key:
-        raise ValueError(
-            f"Delegation provider '{configured_provider}' resolved but has no API key. "
-            f"Set the appropriate environment variable or run 'marlow auth'."
-        )
-
-    return {
-        "model": configured_model or runtime.get("model") or None,
-        "provider": configured_provider if runtime.get("provider") == _RUNTIME_PROVIDER_CUSTOM else runtime.get("provider"),
-        "base_url": runtime.get("base_url"),
-        "api_key": api_key,
-        "api_mode": runtime.get("api_mode"),
-    }
+def _resolve_delegation_credentials(cfg, parent_agent):
+    if any(cfg.get(k) for k in ('provider', 'base_url', 'api_key', 'api_mode', 'model')):
+        raise ValueError('Delegated model routing is retired; configure the Profile Codex provider')
+    return dict(model=None, provider=None, base_url=None, api_key=None, api_mode=None)
 
 
 def _load_config() -> dict:

@@ -37,12 +37,16 @@ _LEGACY_DIGESTS = {
 }
 
 
-def iter_on_demand_skills(name: str | None = None) -> Iterator[Path]:
+def iter_on_demand_skills(name: str | None = None, *, trusted_runtime: bool = False) -> Iterator[Path]:
     """Yield shipped skill files on explicit lookup, without reading Profile skills."""
     if (get_marlow_home() / NO_BUNDLED_SKILLS_MARKER).exists():
         return
 
-    root = get_bundled_skills_dir(Path(__file__).resolve().parent.parent / "skills")
+    if trusted_runtime:
+        from marlow_constants import _get_packaged_data_dir
+        root = _get_packaged_data_dir('skills') or Path(__file__).resolve().parent.parent / 'skills'
+    else:
+        root = get_bundled_skills_dir(Path(__file__).resolve().parent.parent / 'skills')
     for relative in _ON_DEMAND_PATHS:
         if name is not None and name not in {relative.name, relative.as_posix()}:
             continue

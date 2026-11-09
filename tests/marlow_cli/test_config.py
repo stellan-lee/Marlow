@@ -11,7 +11,6 @@ from marlow_cli.config import (
     DEFAULT_CONFIG,
     get_marlow_home,
     ensure_marlow_home,
-    load_custom_provider_entries,
     load_config,
     load_env,
     migrate_config,
@@ -311,54 +310,6 @@ class TestSaveConfigAtomicity:
             assert raw["agent"]["max_turns"] == 77
 
 
-class TestCanonicalCustomProviders:
-    def test_loads_canonical_provider_entry(self, tmp_path):
-        config_path = tmp_path / "config.yaml"
-        config_path.write_text(
-            yaml.safe_dump({
-                "providers": {
-                    "local-vllm": {
-                        "name": "Local vLLM",
-                        "base_url": "http://127.0.0.1:8000/v1",
-                        "api_key": "test-key",
-                        "api_mode": "chat_completions",
-                        "model": "local-model",
-                    }
-                }
-            }),
-            encoding="utf-8",
-        )
-
-        with patch.dict(os.environ, {"MARLOW_HOME": str(tmp_path)}):
-            entries = load_custom_provider_entries()
-
-        assert entries == [{
-            "name": "Local vLLM",
-            "base_url": "http://127.0.0.1:8000/v1",
-            "provider_key": "local-vllm",
-            "api_key": "test-key",
-            "api_mode": "chat_completions",
-            "model": "local-model",
-        }]
-
-    def test_ignores_removed_legacy_provider_fields(self, tmp_path, caplog):
-        config_path = tmp_path / "config.yaml"
-        config_path.write_text(
-            yaml.safe_dump({
-                "providers": {
-                    "legacy": {
-                        "api": "https://example.com/v1",
-                        "default_model": "old-model",
-                        "transport": "openai_chat",
-                    }
-                }
-            }),
-            encoding="utf-8",
-        )
-
-        with patch.dict(os.environ, {"MARLOW_HOME": str(tmp_path)}):
-            assert load_custom_provider_entries() == []
-        assert "unknown config keys ignored" in caplog.text
 
 
 class TestCurrentConfigMigration:

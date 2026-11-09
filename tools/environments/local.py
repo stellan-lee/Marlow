@@ -47,15 +47,6 @@ def _build_provider_env_blocklist() -> frozenset:
     blocked: set[str] = set()
 
     try:
-        from marlow_cli.auth import PROVIDER_REGISTRY
-        for pconfig in PROVIDER_REGISTRY.values():
-            blocked.update(pconfig.api_key_env_vars)
-            if pconfig.base_url_env_var:
-                blocked.add(pconfig.base_url_env_var)
-    except ImportError:
-        pass
-
-    try:
         from marlow_cli.config import OPTIONAL_ENV_VARS
         for name, metadata in OPTIONAL_ENV_VARS.items():
             category = metadata.get("category")

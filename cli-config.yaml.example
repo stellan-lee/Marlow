@@ -1,179 +1,28 @@
-# Marlow Lite configuration example
-# Copy to ~/.marlow/config.yaml. Secrets may use ${ENV_VAR} references and
-# should live in ~/.marlow/.env.
+# Copy to ~/.marlow/config.yaml (or the selected Marlow profile).
+# Model/provider configuration is native Codex TOML in:
+#   <profile>/runtime/codex/config.toml
+# Install Codex 0.159.2 and run `marlow login` for independent profile auth.
+runtime:
+  codex:
+    binary: ""                 # absolute path, or discover codex on host PATH
+    turn_timeout: 600
+    max_concurrent: 4
+    pass_env: []                # explicit provider env_key / proxy / CA opt-ins
+    projects: []                # [{path: /absolute/project, writable: true}]
+    skills: []                  # explicitly authorized extra skill directories
 
-model:
-  # Codex is the default retained hosted runtime. Run `marlow auth` first.
-  provider: openai-codex
-  default: gpt-5.4
-
-  # For an OpenAI-compatible local/custom endpoint, use instead:
-  # provider: custom
-  # default: your-model-id
-  # base_url: http://127.0.0.1:1234/v1
-  # api_key: ${CUSTOM_API_KEY}
-  # api_mode: chat_completions
-
-# Named compatible endpoints are optional. They work with Ollama, vLLM,
-# LM Studio, llama.cpp, and compatible remote services.
-providers: {}
-# providers:
-#   local-vllm:
-#     base_url: http://127.0.0.1:8000/v1
-#     model: your-model-id
-#     api_key: ${CUSTOM_API_KEY}
-#     api_mode: chat_completions
-
-fallback_providers: []
 toolsets: [marlow-cli]
-
 agent:
-  max_turns: 90
-  api_max_retries: 3
+  max_turns: 90                 # maximum completed tool operations per Codex turn
   gateway_timeout: 1800
   restart_drain_timeout: 180
   clarify_timeout: 600
   disabled_toolsets: []
-
 terminal:
-  backend: local       # local | docker | ssh
-  cwd: .
-  timeout: 180
-  env_passthrough: []
-  docker_image: nikolaik/python-nodejs:python3.11-nodejs20
-  docker_volumes: []
-  docker_mount_cwd_to_workspace: false
-
-compression:
-  enabled: true
-  threshold: 0.50
-  target_ratio: 0.20
-  protect_first_n: 3
-  protect_last_n: 20
-
-auxiliary:
-  vision: {provider: auto, model: "", base_url: "", api_key: "", timeout: 120}
-  web_extract: {provider: auto, model: "", base_url: "", api_key: "", timeout: 360}
-  compression: {provider: auto, model: "", base_url: "", api_key: "", timeout: 120}
-  approval: {provider: auto, model: "", base_url: "", api_key: "", timeout: 30}
-  mcp: {provider: auto, model: "", base_url: "", api_key: "", timeout: 30}
-  title_generation: {provider: auto, model: "", base_url: "", api_key: "", timeout: 30}
-
-display:
-  compact: false
-  language: en
-  streaming: false
-  show_reasoning: false
-  tool_progress_command: false
-
+  backend: local               # Codex command/exec sandbox; no SSH/Docker fallback
 memory:
   memory_enabled: true
   user_profile_enabled: true
-  provider: ""         # "" | honcho
-
-delegation:
-  model: ""            # empty = inherit parent
-  provider: ""
-  base_url: ""
-  api_key: ""
-  api_mode: ""
-  max_iterations: 50
-  max_concurrent_children: 3
-  max_async_children: 3
-  max_spawn_depth: 1
-  orchestrator_enabled: true
-
-goals:
-  max_turns: 20
-
-skills:
-  external_dirs: []
-  template_vars: true
-  inline_shell: false
-
-experience:
-  mode: off  # off | capture | shadow | assist
-  decisions:
-    enabled: true
-    explicit_capture_enabled: true
-  telegram_digital_twin:
-    enabled: false
-    system_prompt: >-
-      Represent the profile owner's established working style for guests.
-      Be transparent that you are an AI assistant, not the human.
-
-checkpoints:
-  enabled: false
-  max_snapshots: 20
-  auto_prune: true
-
-approvals:
-  mode: manual
-  timeout: 60
-  cron_mode: deny
-  admin:
-    enabled: false
-    conversation_mode: approval_only  # Set to super_admin for the exact route below
-    platform: ""
-    user_id: ""
-    chat_id: ""
-    thread_id: null
-  mcp_reload_confirm: true
-  destructive_slash_confirm: true
-
-cron:
-  wrap_response: true
-  max_parallel_jobs: null
-
-web:
-  backend: ""
-  search_backend: ""   # brave_free | ddgs
-  extract_backend: ""  # native
-
-browser:
-  inactivity_timeout: 120
-  command_timeout: 30
-  cdp_url: ""
-
-plugins:
-  enabled: []
-
-mcp_servers: {}
-# mcp_servers:
-#   example:
-#     command: npx
-#     args: ["-y", "@example/mcp-server"]
-#     env: {EXAMPLE_TOKEN: "${EXAMPLE_TOKEN}"}
-
-# Marlow's gateway-managed MCP Streamable HTTP endpoint. Set the matching
-# bearer token or OAuth owner password in ~/.marlow/.env before restarting.
-mcp_serve:
-  enabled: false
-  transport: streamable_http
-  host: 127.0.0.1
-  port: 8765
-  auth: bearer  # bearer | oauth
-  public_url: null  # Required HTTPS origin when auth is oauth.
-
-gateway:
-  strict: false
-  media_delivery_allow_dirs: []
-  trust_recent_files: true
-
-telegram:
-  reactions: false
-  allowed_chats: ""
-
-discord:
-  require_mention: true
-  auto_thread: true
-  reactions: true
-
-slack:
-  require_mention: true
-  allowed_channels: ""
-
-logging:
-  level: INFO
-  max_size_mb: 5
-  backup_count: 3
+  provider: ""                 # opt in to Honcho separately
+streaming:
+  enabled: true

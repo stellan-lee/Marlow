@@ -51,7 +51,7 @@ def test_result_unchanged_when_no_hook_registered(monkeypatch):
     # Real invoke_hook with no plugins loaded returns [].
     monkeypatch.setenv("MARLOW_HOME", "/tmp/marlow_no_plugins")
     # Force a fresh plugin manager so no stale plugins pollute state.
-    plugins_mod._plugin_manager = plugins_mod.PluginManager()
+    plugins_mod._plugin_managers = {str(__import__("marlow_constants").get_marlow_home().absolute()): plugins_mod.PluginManager()}
 
     out = _run_handle_function_call(monkeypatch)
     assert out == '{"output": "original"}'
@@ -180,7 +180,7 @@ def test_transform_tool_result_integration_with_real_plugin(monkeypatch, tmp_pat
     )
 
     # Force a fresh plugin manager so the new config is picked up.
-    plugins_mod._plugin_manager = plugins_mod.PluginManager()
+    plugins_mod._plugin_managers = {str(__import__("marlow_constants").get_marlow_home().absolute()): plugins_mod.PluginManager()}
     plugins_mod.discover_plugins()
 
     out = _run_handle_function_call(

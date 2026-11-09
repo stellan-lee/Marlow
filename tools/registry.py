@@ -80,13 +80,14 @@ class ToolEntry:
     __slots__ = (
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
-        "max_result_size_chars", "dynamic_schema_overrides", "action_intent",
+        "max_result_size_chars", "dynamic_schema_overrides", "action_intent", "profile_scope",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
                  max_result_size_chars=None, dynamic_schema_overrides=None,
                  action_intent=None):
+        self.profile_scope = None
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -157,7 +158,8 @@ class ToolRegistry:
     """Singleton registry that collects tool schemas + handlers from tool files."""
 
     def __init__(self):
-        self._tools: Dict[str, ToolEntry] = {}
+        from agent.profile_scope import ScopedToolMap
+        self._tools = ScopedToolMap()
         self._toolset_checks: Dict[str, Callable] = {}
         self._toolset_aliases: Dict[str, str] = {}
         # MCP dynamic refresh can mutate the registry while other threads are
@@ -174,7 +176,12 @@ class ToolRegistry:
     def _snapshot_state(self) -> tuple[List[ToolEntry], Dict[str, Callable]]:
         """Return a coherent snapshot of registry entries and toolset checks."""
         with self._lock:
-            return list(self._tools.values()), dict(self._toolset_checks)
+            entries = list(self._tools.values())
+            checks = dict(self._toolset_checks)
+            for entry in entries:
+                if entry.profile_scope and entry.check_fn:
+                    checks[entry.toolset] = entry.check_fn
+            return entries, checks
 
     def _snapshot_entries(self) -> List[ToolEntry]:
         """Return a stable snapshot of registered tool entries."""
@@ -250,6 +257,7 @@ class ToolRegistry:
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Optional[Callable] = None,
         override: bool = False,
+        profile_scope: str | None = None,
         action_intent: (
             Callable[[dict[str, Any]], Mapping[str, Any] | None]
             | Mapping[str, Any]
@@ -301,7 +309,7 @@ class ToolRegistry:
                         name, toolset, existing.toolset,
                     )
                     return
-            self._tools[name] = ToolEntry(
+            entry = ToolEntry(
                 name=name,
                 toolset=toolset,
                 schema=schema,
@@ -315,6 +323,10 @@ class ToolRegistry:
                 dynamic_schema_overrides=dynamic_schema_overrides,
                 action_intent=action_intent,
             )
+            if profile_scope or toolset.startswith('mcp-'):
+                from agent.profile_scope import profile_key
+                entry.profile_scope = profile_scope or profile_key()
+            self._tools[name] = entry
             if check_fn and toolset not in self._toolset_checks:
                 self._toolset_checks[toolset] = check_fn
             self._generation += 1

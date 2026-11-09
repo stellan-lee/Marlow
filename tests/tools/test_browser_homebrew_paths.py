@@ -393,3 +393,12 @@ class TestRunBrowserCommandPathConstruction:
         result_path = captured_env.get("PATH", "")
         assert "/opt/homebrew/bin" in result_path
         assert "/opt/homebrew/sbin" in result_path
+
+
+@pytest.fixture(autouse=True)
+def _managed_runtime_env_for_browser_unit_tests(tmp_path, monkeypatch):
+    # os.open/Popen are mocked by these tests; do not mock runtime config I/O.
+    from types import SimpleNamespace
+    environment = SimpleNamespace(workspace=tmp_path,
+        overrides=lambda: {'shell_environment_policy':{'set':{'PATH':os.defpath,'HOME':str(tmp_path)}}})
+    monkeypatch.setattr('agent.codex_environment.managed_environment', lambda: environment)

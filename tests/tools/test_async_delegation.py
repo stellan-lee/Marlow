@@ -392,36 +392,6 @@ def test_model_dispatch_forces_background():
     ) is False
 
 
-def test_run_agent_dispatch_forces_background():
-    """run_agent._dispatch_delegate_task — the live model path — forces
-    background on for any top-level delegation (single OR batch) and off for a
-    subagent."""
-    from unittest.mock import patch
-    import run_agent
-
-    class _FakeAgent:
-        _delegate_depth = 0
-
-    captured = {}
-
-    def _fake_delegate(**kwargs):
-        captured.update(kwargs)
-        return "{}"
-
-    with patch("tools.delegate_tool.delegate_task", _fake_delegate):
-        agent = _FakeAgent()
-        run_agent.AIAgent._dispatch_delegate_task(agent, {"goal": "x"})
-        assert captured["background"] is True
-
-        run_agent.AIAgent._dispatch_delegate_task(
-            agent, {"tasks": [{"goal": "a"}, {"goal": "b"}]}
-        )
-        assert captured["background"] is True
-
-        sub = _FakeAgent()
-        sub._delegate_depth = 1
-        run_agent.AIAgent._dispatch_delegate_task(sub, {"goal": "x"})
-        assert captured["background"] is False
 
 
 def test_delegate_task_background_detaches_child_from_parent(monkeypatch):

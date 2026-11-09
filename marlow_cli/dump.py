@@ -140,23 +140,15 @@ def _memory_provider(config: dict) -> str:
 
 
 def _get_model_and_provider(config: dict) -> tuple[str, str]:
-    """Extract model and provider from config."""
-    model_cfg = config.get("model", "")
-    if isinstance(model_cfg, dict):
-        model = model_cfg.get("default") or model_cfg.get("model") or model_cfg.get("name") or "(not set)"
-        provider = model_cfg.get("provider") or "(auto)"
-    elif isinstance(model_cfg, str):
-        model = model_cfg or "(not set)"
-        provider = "(auto)"
-    else:
-        model = "(not set)"
-        provider = "(auto)"
-    return model, provider
+    """Read canonical profile model settings without network requests."""
+    from agent.codex_environment import managed_environment
+    e = managed_environment()
+    return e.config.get('model') or '(Codex default)', e.config.get('model_provider', 'openai')
 
 
 def _config_overrides(config: dict) -> dict[str, str]:
     """Find non-default config values worth reporting.
-    
+
     Returns a flat dict of dotpath -> value for interesting overrides.
     """
     from marlow_cli.config import DEFAULT_CONFIG
@@ -243,13 +235,6 @@ def run_dump(args):
     terminal_cfg = config.get("terminal", {})
     backend = terminal_cfg.get("backend", "local")
 
-    # OpenAI SDK version
-    try:
-        import openai
-        openai_ver = openai.__version__
-    except ImportError:
-        openai_ver = "not installed"
-
     # OS info
     os_info = f"{platform.system()} {platform.release()} {platform.machine()}"
 
@@ -262,7 +247,7 @@ def run_dump(args):
     lines.append(f"version:          {ver_str}")
     lines.append(f"os:               {os_info}")
     lines.append(f"python:           {sys.version.split()[0]}")
-    lines.append(f"openai_sdk:       {openai_ver}")
+    lines.append("runtime:          Codex app-server 0.159.2")
     lines.append(f"profile:          {profile}")
     lines.append(f"marlow_home:      {display_marlow_home()}")
     lines.append(f"model:            {model}")

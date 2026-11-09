@@ -265,7 +265,7 @@ def _hermetic_environment(tmp_path, monkeypatch):
     #    singleton might still be cached from a previous test).
     try:
         import marlow_cli.plugins as _plugins_mod
-        monkeypatch.setattr(_plugins_mod, "_plugin_manager", None)
+        monkeypatch.setattr(_plugins_mod, "_plugin_managers", {})
     except Exception:
         pass
     # Explicitly clear provider-specific base URL overrides that don't match

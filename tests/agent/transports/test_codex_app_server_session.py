@@ -16,9 +16,8 @@ import pytest
 import agent.transports.codex_app_server_session as session_mod
 from agent.transports.codex_app_server_session import (
     CodexAppServerSession,
-    _ServerRequestRouting,
     _approval_choice_to_codex_decision,
-    _coerce_turn_input_text,
+    _coerce_turn_input,
 )
 
 
@@ -26,7 +25,7 @@ class FakeClient:
     """Stand-in for CodexAppServerClient that records calls and lets the test
     drive the notification / server-request streams synchronously."""
 
-    def __init__(self, *, codex_bin: str = "codex", codex_home=None) -> None:
+    def __init__(self, *, codex_bin: str = "codex", codex_home=None, environment=None, mcp_servers=None) -> None:
         self.codex_bin = codex_bin
         self.codex_home = codex_home
         self.requests: list[tuple[str, dict]] = []
@@ -42,11 +41,17 @@ class FakeClient:
     # API matching CodexAppServerClient
     def initialize(self, **kwargs):
         self._initialized = True
-        return {"userAgent": "fake/0.0.0", "codexHome": "/tmp",
+        return {"userAgent": "fake/0.0.0", "codexHome": str(__import__("agent.codex_environment", fromlist=["CodexEnvironment"]).CodexEnvironment.build().codex_home),
                 "platformOs": "linux", "platformFamily": "unix"}
 
     def request(self, method: str, params: Optional[dict] = None, timeout: float = 30.0):
         self.requests.append((method, params or {}))
+        if method == 'config/read':
+            return {'config': {'allow_login_shell':False,'cli_auth_credentials_store':'file','mcp_oauth_credentials_store':'file','project_doc_max_bytes':0,'shell_environment_policy':{'inherit':'none'}}}
+        if method == 'account/read':
+            return {'requiresOpenaiAuth':False}
+        if method == 'skills/list':
+            return {'data':[]}
         if self._request_handler is not None:
             return self._request_handler(method, params or {})
         # Sensible defaults for protocol methods used by the session
@@ -107,7 +112,6 @@ class FakeClient:
 
 def make_session(client: FakeClient, **kwargs) -> CodexAppServerSession:
     return CodexAppServerSession(
-        cwd="/tmp",
         client_factory=lambda **kw: client,
         **kwargs,
     )
@@ -118,8 +122,8 @@ def make_session(client: FakeClient, **kwargs) -> CodexAppServerSession:
 class TestApprovalChoiceMapping:
     @pytest.mark.parametrize("choice,expected", [
         ("once", "accept"),
-        ("session", "acceptForSession"),
-        ("always", "acceptForSession"),
+        ("session", "decline"),
+        ("always", "decline"),
         ("deny", "decline"),
         ("anything-else", "decline"),
     ])
@@ -129,11 +133,11 @@ class TestApprovalChoiceMapping:
 
 class TestTurnInputCoercion:
     def test_list_content_keeps_text_and_marks_images(self):
-        text = _coerce_turn_input_text([
+        text = _coerce_turn_input([
             {"type": "text", "text": "caption"},
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
         ])
-        assert text == "caption\n\n[image attached]"
+        assert text == [{'type':'text','text':'caption'}, {'type':'image','url':'data:image/png;base64,abc'}]
 
 
 # ---- lifecycle ----
@@ -150,16 +154,13 @@ class TestLifecycle:
         assert len(method_calls) == 1
 
     def test_thread_start_passes_cwd_only(self):
-        """thread/start carries cwd. We intentionally do NOT pass `permissions`
-        on this codex version (experimentalApi-gated + requires matching
-        config.toml [permissions] table). Letting codex use its default
-        (read-only unless user configures otherwise) is the documented path."""
+        """The thread uses its managed workspace and named sandbox profile."""
         client = FakeClient()
-        s = make_session(client, permission_profile="workspace-write")
+        s = make_session(client)
         s.ensure_started()
         method, params = next(r for r in client.requests if r[0] == "thread/start")
-        assert params["cwd"] == "/tmp"
-        assert "permissions" not in params  # see session.ensure_started() comment
+        assert params["cwd"] == str(s.environment.workspace)
+        assert params["permissions"] == "marlow"  # see session.ensure_started() comment
 
     def test_close_idempotent(self):
         client = FakeClient()
@@ -175,16 +176,16 @@ class TestLifecycle:
 class TestRunTurn:
     def test_simple_text_turn_returns_final_message(self):
         client = FakeClient()
-        client.queue_notification("turn/started", threadId="t", turn={"id": "tu1"})
+        client.queue_notification("turn/started", threadId="thread-fake-001", turn={"id": "turn-fake-001"})
         client.queue_notification(
             "item/completed",
             item={"type": "agentMessage", "id": "m1", "text": "hello world"},
-            threadId="t", turnId="tu1",
+            threadId="thread-fake-001", turnId="turn-fake-001",
         )
         client.queue_notification(
             "turn/completed",
-            threadId="t",
-            turn={"id": "tu1", "status": "completed", "error": None},
+            threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
         )
         s = make_session(client)
         r = s.run_turn("hi", turn_timeout=2.0)
@@ -200,8 +201,8 @@ class TestRunTurn:
         client = FakeClient()
         client.queue_notification(
             "turn/completed",
-            threadId="t",
-            turn={"id": "tu1", "status": "completed", "error": None},
+            threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
         )
         s = make_session(client)
         r = s.run_turn(
@@ -223,7 +224,7 @@ class TestRunTurn:
         text = params["input"][0]["text"]
         assert isinstance(text, str)
         assert "[Image attached at: /tmp/a.png]" in text
-        assert "[image attached]" in text
+        assert params["input"][1] == {"type":"image","url":"data:image/png;base64,abc"}
 
     def test_tool_iteration_counter_ticks(self):
         client = FakeClient()
@@ -237,16 +238,16 @@ class TestRunTurn:
                     "status": "completed", "aggregatedOutput": "ok",
                     "exitCode": 0, "commandActions": [],
                 },
-                threadId="t", turnId="tu1",
+                threadId="thread-fake-001", turnId="turn-fake-001",
             )
         client.queue_notification(
             "item/completed",
             item={"type": "agentMessage", "id": "m1", "text": "done"},
-            threadId="t", turnId="tu1",
+            threadId="thread-fake-001", turnId="turn-fake-001",
         )
         client.queue_notification(
-            "turn/completed", threadId="t",
-            turn={"id": "tu1", "status": "completed", "error": None},
+            "turn/completed", threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
         )
         s = make_session(client)
         r = s.run_turn("do stuff", turn_timeout=2.0)
@@ -359,7 +360,7 @@ class TestRunTurn:
                   "cwd": "/", "status": "inProgress",
                   "aggregatedOutput": None, "exitCode": None,
                   "commandActions": []},
-            threadId="t", turnId="tu1",
+            threadId="thread-fake-001", turnId="turn-fake-001",
         )
         s = make_session(client)
         s.ensure_started()
@@ -368,11 +369,9 @@ class TestRunTurn:
         s.request_interrupt()
         r = s.run_turn("loop forever", turn_timeout=2.0)
         assert r.interrupted is True
-        # turn/interrupt was requested with the right turnId
-        assert any(
-            method == "turn/interrupt" and params.get("turnId") == "turn-fake-001"
-            for (method, params) in client.requests
-        )
+        # Stop before dispatch consumes no model request.
+        assert not any(method == 'turn/start' for method, _ in client.requests)
+
 
     def test_deadline_exceeded_records_error(self):
         client = FakeClient()
@@ -403,8 +402,8 @@ class TestRunTurn:
     def test_failed_turn_records_error_from_turn_completed(self):
         client = FakeClient()
         client.queue_notification(
-            "turn/completed", threadId="t",
-            turn={"id": "tu1", "status": "failed",
+            "turn/completed", threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "failed",
                   "error": {"message": "model error"}},
         )
         s = make_session(client)
@@ -422,8 +421,8 @@ class TestServerRequestRouting:
             command="ls /tmp", cwd="/tmp",
         )
         client.queue_notification(
-            "turn/completed", threadId="t",
-            turn={"id": "tu1", "status": "completed", "error": None},
+            "turn/completed", threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
         )
 
         captured: dict = {}
@@ -444,8 +443,8 @@ class TestServerRequestRouting:
         client.queue_server_request("item/commandExecution/requestApproval", request_id="req-1",
                                     command="rm -rf /", cwd="/")
         client.queue_notification(
-            "turn/completed", threadId="t",
-            turn={"id": "tu1", "status": "completed", "error": None},
+            "turn/completed", threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
         )
         s = make_session(client)  # no approval_callback wired
         s.run_turn("hi", turn_timeout=1.0)
@@ -456,14 +455,14 @@ class TestServerRequestRouting:
         client.queue_server_request(
             "item/fileChange/requestApproval", request_id="req-2",
             itemId="fc-1",
-            turnId="t1",
-            threadId="th",
+            turnId="turn-fake-001",
+            threadId="thread-fake-001",
             startedAtMs=1234567890,
             reason="create new file with hello() function",
         )
         client.queue_notification(
-            "turn/completed", threadId="t",
-            turn={"id": "tu1", "status": "completed", "error": None},
+            "turn/completed", threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
         )
 
         def cb(command, description, *, allow_permanent=True):
@@ -471,14 +470,14 @@ class TestServerRequestRouting:
 
         s = make_session(client, approval_callback=cb)
         s.run_turn("hi", turn_timeout=1.0)
-        assert ("req-2", {"decision": "acceptForSession"}) in client.responses
+        assert ("req-2", {"decision": "decline"}) in client.responses
 
     def test_unknown_server_request_replied_with_error(self):
         client = FakeClient()
         client.queue_server_request("totally/unknown", request_id="req-3")
         client.queue_notification(
-            "turn/completed", threadId="t",
-            turn={"id": "tu1", "status": "completed", "error": None},
+            "turn/completed", threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
         )
         s = make_session(client)
         s.run_turn("hi", turn_timeout=1.0)
@@ -494,19 +493,19 @@ class TestServerRequestRouting:
         client = FakeClient()
         client.queue_server_request(
             "mcpServer/elicitation/request", request_id="elic-1",
-            threadId="t", turnId="tu1",
+            threadId="thread-fake-001", turnId="turn-fake-001",
             serverName="marlow-tools",
             mode="form",
             message="confirm",
             requestedSchema={"type": "object", "properties": {}},
         )
         client.queue_notification(
-            "turn/completed", threadId="t",
-            turn={"id": "tu1", "status": "completed", "error": None},
+            "turn/completed", threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
         )
         s = make_session(client)
         s.run_turn("hi", turn_timeout=1.0)
-        assert ("elic-1", {"action": "accept", "content": None, "_meta": None}) in client.responses
+        assert ("elic-1", {"action": "decline", "content": None, "_meta": None}) in client.responses
 
     def test_mcp_elicitation_for_other_servers_declines(self):
         """For third-party MCP servers we decline by default so users
@@ -514,41 +513,27 @@ class TestServerRequestRouting:
         client = FakeClient()
         client.queue_server_request(
             "mcpServer/elicitation/request", request_id="elic-2",
-            threadId="t", turnId="tu1",
+            threadId="thread-fake-001", turnId="turn-fake-001",
             serverName="some-third-party",
             mode="url",
             message="please log in",
             url="https://example.com/oauth",
         )
         client.queue_notification(
-            "turn/completed", threadId="t",
-            turn={"id": "tu1", "status": "completed", "error": None},
+            "turn/completed", threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
         )
         s = make_session(client)
         s.run_turn("hi", turn_timeout=1.0)
         assert ("elic-2", {"action": "decline", "content": None, "_meta": None}) in client.responses
-
-    def test_routing_auto_approve_bypass(self):
-        client = FakeClient()
-        client.queue_server_request("item/commandExecution/requestApproval", request_id="r1",
-                                    command="ls", cwd="/")
-        client.queue_notification(
-            "turn/completed", threadId="t",
-            turn={"id": "tu1", "status": "completed", "error": None},
-        )
-        # No callback, but routing says auto-approve. Should approve.
-        s = make_session(client, request_routing=_ServerRequestRouting(
-            auto_approve_exec=True))
-        s.run_turn("hi", turn_timeout=1.0)
-        assert ("r1", {"decision": "accept"}) in client.responses
 
     def test_callback_raises_falls_back_to_decline(self):
         client = FakeClient()
         client.queue_server_request("item/commandExecution/requestApproval", request_id="r1",
                                     command="ls", cwd="/")
         client.queue_notification(
-            "turn/completed", threadId="t",
-            turn={"id": "tu1", "status": "completed", "error": None},
+            "turn/completed", threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
         )
 
         def boom(*a, **kw):
@@ -575,8 +560,8 @@ class TestApprovalPromptEnrichment:
             command="ls",  # no cwd
         )
         client.queue_notification(
-            "turn/completed", threadId="t",
-            turn={"id": "tu1", "status": "completed", "error": None},
+            "turn/completed", threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
         )
         captured = {}
         def cb(command, description, *, allow_permanent=True):
@@ -600,17 +585,17 @@ class TestApprovalPromptEnrichment:
                       {"kind": {"type": "add"}, "path": "/tmp/new.py"},
                       {"kind": {"type": "update"}, "path": "/tmp/old.py"},
                   ]},
-            threadId="t", turnId="tu1",
+            threadId="thread-fake-001", turnId="turn-fake-001",
         )
         client.queue_server_request(
             "item/fileChange/requestApproval", request_id="req-2",
-            itemId="fc-1", turnId="tu1", threadId="t",
+            itemId="fc-1", turnId="turn-fake-001", threadId="thread-fake-001",
             startedAtMs=1234567890,
             reason="add and update files",
         )
         client.queue_notification(
-            "turn/completed", threadId="t",
-            turn={"id": "tu1", "status": "completed", "error": None},
+            "turn/completed", threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
         )
         captured = {}
         def cb(command, description, *, allow_permanent=True):
@@ -632,13 +617,13 @@ class TestApprovalPromptEnrichment:
         client = FakeClient()
         client.queue_server_request(
             "item/fileChange/requestApproval", request_id="req-2",
-            itemId="fc-orphan", turnId="tu1", threadId="t",
+            itemId="fc-orphan", turnId="turn-fake-001", threadId="thread-fake-001",
             startedAtMs=1234567890,
             reason="apply some changes",
         )
         client.queue_notification(
-            "turn/completed", threadId="t",
-            turn={"id": "tu1", "status": "completed", "error": None},
+            "turn/completed", threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
         )
         captured = {}
         def cb(command, description, *, allow_permanent=True):
@@ -684,11 +669,11 @@ class TestSessionRetirement:
         client.queue_notification(
             "item/completed",
             item={"type": "agentMessage", "id": "m1", "text": "hi"},
-            threadId="t", turnId="tu1",
+            threadId="thread-fake-001", turnId="turn-fake-001",
         )
         client.queue_notification(
-            "turn/completed", threadId="t",
-            turn={"id": "tu1", "status": "completed", "error": None},
+            "turn/completed", threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
         )
         s = make_session(client)
         r = s.run_turn("hi", turn_timeout=1.0)
@@ -707,7 +692,7 @@ class TestSessionRetirement:
                 "status": "completed", "aggregatedOutput": "hi",
                 "exitCode": 0, "commandActions": [],
             },
-            threadId="t", turnId="tu1",
+            threadId="thread-fake-001", turnId="turn-fake-001",
         )
         s = make_session(client)
         r = s.run_turn(
@@ -732,7 +717,7 @@ class TestSessionRetirement:
                 "status": "completed", "aggregatedOutput": "hi",
                 "exitCode": 0, "commandActions": [],
             },
-            threadId="t", turnId="tu1",
+            threadId="thread-fake-001", turnId="turn-fake-001",
         )
         s = make_session(client)
         monotonic_values = iter([1000.0, 999.0, 999.0, 999.0, 1000.2])
@@ -763,17 +748,17 @@ class TestSessionRetirement:
                 "status": "completed", "aggregatedOutput": "hi",
                 "exitCode": 0, "commandActions": [],
             },
-            threadId="t", turnId="tu1",
+            threadId="thread-fake-001", turnId="turn-fake-001",
         )
         # Non-tool activity immediately after — resets watchdog.
         client.queue_notification(
             "item/completed",
             item={"type": "agentMessage", "id": "m1", "text": "tool finished"},
-            threadId="t", turnId="tu1",
+            threadId="thread-fake-001", turnId="turn-fake-001",
         )
         client.queue_notification(
-            "turn/completed", threadId="t",
-            turn={"id": "tu1", "status": "completed", "error": None},
+            "turn/completed", threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
         )
         s = make_session(client)
         r = s.run_turn(
@@ -799,7 +784,7 @@ class TestSessionRetirement:
                 "type": "agentMessage", "id": "m1",
                 "text": "partial output... <turn_aborted>",
             },
-            threadId="t", turnId="tu1",
+            threadId="thread-fake-001", turnId="turn-fake-001",
         )
         # Deliberately NO turn/completed notification queued.
         s = make_session(client)
@@ -820,7 +805,7 @@ class TestSessionRetirement:
             "item/completed",
             item={"type": "agentMessage", "id": "m1",
                   "text": "<turn_aborted/>"},
-            threadId="t", turnId="tu1",
+            threadId="thread-fake-001", turnId="turn-fake-001",
         )
         s = make_session(client)
         r = s.run_turn("x", turn_timeout=2.0,
@@ -846,7 +831,7 @@ class TestSessionRetirement:
         s = make_session(client)
         r = s.run_turn("hi", turn_timeout=1.0)
         assert r.error is not None
-        assert "codex login" in r.error
+        assert "marlow login" in r.error
         assert r.should_retire is True
 
     def test_oauth_failure_from_stderr_on_turn_start_failure(self):
@@ -870,7 +855,7 @@ class TestSessionRetirement:
         s = make_session(client)
         r = s.run_turn("hi", turn_timeout=1.0)
         assert r.error is not None
-        assert "codex login" in r.error
+        assert "marlow login" in r.error
         assert r.should_retire is True
 
     def test_oauth_failure_in_turn_completed_error(self):
@@ -878,9 +863,9 @@ class TestSessionRetirement:
         triggers the re-auth hint + retirement."""
         client = FakeClient()
         client.queue_notification(
-            "turn/completed", threadId="t",
+            "turn/completed", threadId="thread-fake-001",
             turn={
-                "id": "tu1", "status": "failed",
+                "id": "turn-fake-001", "status": "failed",
                 "error": {"message": "401 Unauthorized: please reauthenticate"},
             },
         )
@@ -888,7 +873,7 @@ class TestSessionRetirement:
         r = s.run_turn("x", turn_timeout=1.0,
                        notification_poll_timeout=0.01)
         assert r.error is not None
-        assert "codex login" in r.error
+        assert "marlow login" in r.error
         assert r.should_retire is True
 
     def test_generic_turn_failure_does_not_trigger_oauth_hint(self):
@@ -896,9 +881,9 @@ class TestSessionRetirement:
         re-auth hint. Conservative classifier."""
         client = FakeClient()
         client.queue_notification(
-            "turn/completed", threadId="t",
+            "turn/completed", threadId="thread-fake-001",
             turn={
-                "id": "tu1", "status": "failed",
+                "id": "turn-fake-001", "status": "failed",
                 "error": {"message": "rate limit exceeded"},
             },
         )
@@ -928,7 +913,7 @@ class TestSessionRetirement:
                        notification_poll_timeout=0.01)
         assert r.should_retire is True
         # Stderr-derived auth hint takes precedence over generic message
-        assert r.error and "codex login" in r.error
+        assert r.error and "marlow login" in r.error
 
 
 # ---- thread/start cross-fill ----
@@ -948,7 +933,7 @@ class TestThreadStartCrossFill:
             {"thread": {"sessionId": "alias-1"},
              "activePermissionProfile": {"id": "x"}}
             if method == "thread/start" else
-            {"turn": {"id": "tu1"}} if method == "turn/start" else {}
+            {"turn": {"id": "turn-fake-001"}} if method == "turn/start" else {}
         )
         s = make_session(client)
         tid = s.ensure_started()
@@ -958,7 +943,7 @@ class TestThreadStartCrossFill:
         client = FakeClient()
         client._request_handler = lambda method, params: (
             {"sessionId": "top-1"} if method == "thread/start" else
-            {"turn": {"id": "tu1"}} if method == "turn/start" else {}
+            {"turn": {"id": "turn-fake-001"}} if method == "turn/start" else {}
         )
         s = make_session(client)
         tid = s.ensure_started()
@@ -971,7 +956,7 @@ class TestThreadStartCrossFill:
         client._request_handler = lambda method, params: (
             {"thread": {}, "activePermissionProfile": {"id": "x"}}
             if method == "thread/start" else
-            {"turn": {"id": "tu1"}}
+            {"turn": {"id": "turn-fake-001"}}
         )
         s = make_session(client)
         with pytest.raises(CodexAppServerError, match="no thread id"):
@@ -1016,7 +1001,7 @@ class TestClassifyOAuthFailure:
         )
         hint = _classify_oauth_failure("error: invalid_grant returned by server")
         assert hint is not None
-        assert "codex login" in hint
+        assert "marlow login" in hint
 
     def test_token_refresh_classified(self):
         from agent.transports.codex_app_server_session import (
@@ -1024,7 +1009,7 @@ class TestClassifyOAuthFailure:
         )
         hint = _classify_oauth_failure("token refresh failed: network error")
         assert hint is not None
-        assert "codex login" in hint
+        assert "marlow login" in hint
 
     def test_401_classified(self):
         from agent.transports.codex_app_server_session import (

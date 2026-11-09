@@ -42,6 +42,16 @@ import pytest
 
 pytest.importorskip("mcp.client.auth.oauth2", reason="MCP SDK 1.26.0+ required")
 
+@pytest.fixture(autouse=True)
+def no_external_discovery_for_state_tests(monkeypatch, request):
+    """Discovery has its own fixtures; these contracts inspect stored state."""
+    if "prefetches_oauth_metadata" in request.node.name:
+        return  # This test already uses a deterministic HTTP fixture.
+    from unittest.mock import AsyncMock
+    from tools.mcp_oauth_manager import _MARLOW_PROVIDER_CLS
+    monkeypatch.setattr(_MARLOW_PROVIDER_CLS, "_prefetch_oauth_metadata", AsyncMock())
+
+
 
 # ---------------------------------------------------------------------------
 # MarlowTokenStorage — absolute expiry persistence

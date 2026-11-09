@@ -118,10 +118,10 @@ def test_run_agent_prefers_session_override_over_global_runtime(monkeypatch):
     assert result["final_response"] == "ok"
     assert _CapturingAgent.last_init is not None
     assert _CapturingAgent.last_init["model"] == "gpt-5.4"
-    assert _CapturingAgent.last_init["provider"] == "openai-codex"
-    assert _CapturingAgent.last_init["api_mode"] == "codex_responses"
-    assert _CapturingAgent.last_init["base_url"] == "https://chatgpt.com/backend-api/codex"
-    assert _CapturingAgent.last_init["api_key"] == "***"
+    assert _CapturingAgent.last_init["provider"] == "openai"
+    assert _CapturingAgent.last_init["api_mode"] == "codex_app_server"
+    assert _CapturingAgent.last_init["base_url"] is None
+    assert _CapturingAgent.last_init["api_key"] is None
     assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "high"}
 
 
@@ -157,108 +157,8 @@ async def test_background_task_prefers_session_override_over_global_runtime(monk
 
     assert _CapturingAgent.last_init is not None
     assert _CapturingAgent.last_init["model"] == "gpt-5.4"
-    assert _CapturingAgent.last_init["provider"] == "openai-codex"
-    assert _CapturingAgent.last_init["api_mode"] == "codex_responses"
-    assert _CapturingAgent.last_init["base_url"] == "https://chatgpt.com/backend-api/codex"
-    assert _CapturingAgent.last_init["api_key"] == "***"
+    assert _CapturingAgent.last_init["provider"] == "openai"
+    assert _CapturingAgent.last_init["api_mode"] == "codex_app_server"
+    assert _CapturingAgent.last_init["base_url"] is None
+    assert _CapturingAgent.last_init["api_key"] is None
     assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "high"}
-
-def test_gateway_auth_fallback_uses_fallback_provider_model(tmp_path, monkeypatch):
-    """Regression: fallback provider must not inherit the primary model.
-
-    If primary openai-codex auth fails and fallback_providers selects a custom
-    endpoint, the gateway must instantiate AIAgent with the fallback
-    model, not the primary config model (e.g. gpt-5.5). Otherwise OpenRouter
-    receives an unintended GPT request.
-    """
-    config = tmp_path / "config.yaml"
-    config.write_text(
-        """
-model:
-  default: gpt-5.5
-  provider: openai-codex
-fallback_providers:
-  - provider: custom
-    model: local-backup
-    base_url: http://localhost:11434/v1
-""".lstrip(),
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(gateway_run, "_marlow_home", tmp_path)
-
-    def fake_resolve_runtime_provider(*, requested=None, explicit_base_url=None, explicit_api_key=None):
-        if requested in {None, "", "openai-codex"}:
-            from marlow_cli.auth import AuthError
-            raise AuthError("No Codex credentials stored. Run `marlow auth` to authenticate.")
-        assert requested == "custom"
-        return {
-            "api_key": "local-key",
-            "base_url": explicit_base_url,
-            "provider": "custom",
-            "api_mode": "chat_completions",
-            "command": None,
-            "args": [],
-        }
-
-    import marlow_cli.runtime_provider as runtime_provider
-
-    monkeypatch.setattr(runtime_provider, "resolve_runtime_provider", fake_resolve_runtime_provider)
-
-    runner = _make_runner()
-    model, runtime_kwargs = runner._resolve_session_agent_runtime(
-        session_key="agent:main:telegram:group:-1003715515980:63",
-        user_config={
-            "model": {"default": "gpt-5.5", "provider": "openai-codex"},
-            "fallback_providers": [{
-                "provider": "custom",
-                "model": "local-backup",
-                "base_url": "http://localhost:11434/v1",
-            }],
-        },
-    )
-
-    assert model == "local-backup"
-    assert runtime_kwargs["provider"] == "custom"
-    assert runtime_kwargs["api_key"] == "local-key"
-
-
-def test_gateway_auth_fallback_resolves_key_env_for_custom_provider(tmp_path, monkeypatch):
-    """Auth-failure fallback should honor key_env/api_key_env custom-endpoint hints."""
-    config = tmp_path / "config.yaml"
-    config.write_text(
-        """
-fallback_providers:
-  - provider: custom
-    model: fallback-model
-    base_url: https://fallback.example/v1
-    key_env: MY_FALLBACK_KEY
-""".lstrip(),
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(gateway_run, "_marlow_home", tmp_path)
-    monkeypatch.setenv("MY_FALLBACK_KEY", "env-secret")
-
-    def fake_resolve_runtime_provider(*, requested=None, explicit_base_url=None, explicit_api_key=None):
-        assert requested == "custom"
-        assert explicit_base_url == "https://fallback.example/v1"
-        assert explicit_api_key == "env-secret"
-        return {
-            "api_key": explicit_api_key,
-            "base_url": explicit_base_url,
-            "provider": "custom",
-            "api_mode": "chat_completions",
-            "command": None,
-            "args": [],
-        }
-
-    import marlow_cli.runtime_provider as runtime_provider
-
-    monkeypatch.setattr(runtime_provider, "resolve_runtime_provider", fake_resolve_runtime_provider)
-
-    runtime_kwargs = gateway_run._try_resolve_fallback_provider()
-
-    assert runtime_kwargs is not None
-    assert runtime_kwargs["provider"] == "custom"
-    assert runtime_kwargs["api_key"] == "env-secret"
-    assert runtime_kwargs["base_url"] == "https://fallback.example/v1"
-    assert runtime_kwargs["model"] == "fallback-model"

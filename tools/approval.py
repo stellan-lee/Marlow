@@ -1192,50 +1192,8 @@ def _get_cron_approval_mode() -> str:
 
 
 def _smart_approve(command: str, description: str) -> str:
-    """Use the auxiliary LLM to assess risk and decide approval.
-
-    Returns 'approve' if the LLM determines the command is safe,
-    'deny' if genuinely dangerous, or 'escalate' if uncertain.
-
-    Inspired by OpenAI Codex's Smart Approvals guardian subagent
-    (openai/codex#13860).
-    """
-    try:
-        from agent.auxiliary_client import call_llm
-
-        prompt = f"""You are a security reviewer for an AI coding agent. A terminal command was flagged by pattern matching as potentially dangerous.
-
-Command: {command}
-Flagged reason: {description}
-
-Assess the ACTUAL risk of this command. Many flagged commands are false positives — for example, `python -c "print('hello')"` is flagged as "script execution via -c flag" but is completely harmless.
-
-Rules:
-- APPROVE if the command is clearly safe (benign script execution, safe file operations, development tools, package installs, git operations, etc.)
-- DENY if the command could genuinely damage the system (recursive delete of important paths, overwriting system files, fork bombs, wiping disks, dropping databases, etc.)
-- ESCALATE if you're uncertain
-
-Respond with exactly one word: APPROVE, DENY, or ESCALATE"""
-
-        response = call_llm(
-            task="approval",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-            max_tokens=16,
-        )
-
-        answer = (response.choices[0].message.content or "").strip().upper()
-
-        if answer == "APPROVE":
-            return "approve"
-        elif answer == "DENY":
-            return "deny"
-        else:
-            return "escalate"
-
-    except Exception as e:
-        logger.debug("Smart approvals: LLM call failed (%s), escalating", e)
-        return "escalate"
+    """An uncertain operation requires a human approval channel."""
+    return "escalate"
 
 
 def check_dangerous_command(command: str, env_type: str,

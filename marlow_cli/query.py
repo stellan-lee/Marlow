@@ -254,33 +254,14 @@ def _collect_query_images(query: str | None, image: str | None) -> tuple[str, li
     return message or "Describe this image.", images
 
 
-def _image_input(query: str, images: list[Path], model: str, provider: str, cfg: dict):
+def _image_input(query, images, model, provider, cfg):
     if not images:
         return query
-
-    from agent.image_routing import build_native_content_parts, decide_image_input_mode
-    from tools.vision_tools import vision_analyze_tool
-
-    if decide_image_input_mode(provider, model, cfg) == "native":
-        parts, _skipped = build_native_content_parts(query, [str(path) for path in images])
-        if any(part.get("type") == "image_url" for part in parts):
-            return parts
-
-    annotations = []
-    for path in images:
-        try:
-            result = json.loads(asyncio.run(vision_analyze_tool(
-                image_url=str(path),
-                user_prompt="Describe the image in detail, including any readable text.",
-            )))
-        except Exception:
-            logger.debug("Attached image analysis failed", exc_info=True)
-            result = {}
-        if result.get("success") and result.get("analysis"):
-            annotations.append(f"[Attached image description for {path}: {result['analysis']}]")
-        else:
-            annotations.append(f"[Attached image at {path}. Use vision_analyze to inspect it.]")
-    return "\n\n".join([*annotations, query])
+    from agent.image_routing import build_native_content_parts
+    parts, skipped = build_native_content_parts(query, [str(p) for p in images])
+    if skipped:
+        raise ValueError('An attached image could not be read')
+    return parts
 
 
 def _expand_context_references(text: str, agent) -> str:
@@ -291,7 +272,7 @@ def _expand_context_references(text: str, agent) -> str:
     result = preprocess_context_references(
         text,
         cwd=Path.cwd(),
-        context_length=agent.context_compressor.context_length,
+        context_length=agent.context_length or 32000,
     )
     for warning in result.warnings:
         print(warning, file=sys.stderr)
@@ -347,7 +328,6 @@ def _finalize_query(agent, db, result, source):
 def run_query(args) -> int:
     """Execute a single query, retaining session history and approval policy."""
     from marlow_cli.config import load_config, read_raw_config
-    from marlow_cli.fallback_config import get_fallback_chain
     from marlow_cli.mcp_startup import wait_for_mcp_discovery
     from marlow_cli.oneshot import _normalize_toolsets, _oneshot_clarify_callback, _resolve_query_runtime
     from marlow_cli.tools_config import _get_platform_tools
@@ -398,6 +378,8 @@ def run_query(args) -> int:
                 ignore_rules = args.ignore_rules or os.environ.get("MARLOW_IGNORE_RULES") == "1"
                 agent = AIAgent(
                     model=model,
+                    project_path=(worktree or {}).get('path'),
+                    authorized_projects=[{'path': worktree['path'], 'writable': True}] if worktree else None,
                     api_key=runtime.get("api_key"),
                     base_url=runtime.get("base_url"),
                     provider=runtime.get("provider"),
@@ -413,7 +395,6 @@ def run_query(args) -> int:
                     platform=source,
                     session_db=db,
                     clarify_callback=_oneshot_clarify_callback,
-                    fallback_providers=get_fallback_chain(cfg) or None,
                     checkpoints_enabled=args.checkpoints or bool(checkpoint.get("enabled")),
                     checkpoint_max_snapshots=checkpoint.get("max_snapshots", 20),
                     checkpoint_max_total_size_mb=checkpoint.get("max_total_size_mb", 500),

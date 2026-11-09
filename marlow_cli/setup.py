@@ -32,15 +32,6 @@ PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 _PROJECT_GUIDE = f"{MARLOW_REPOSITORY_URL}#readme"
 
 
-def _model_config_dict(config: Dict[str, Any]) -> Dict[str, Any]:
-    current_model = config.get("model")
-    if isinstance(current_model, dict):
-        return dict(current_model)
-    if isinstance(current_model, str) and current_model.strip():
-        return {"default": current_model.strip()}
-    return {}
-
-
 
 def _current_reasoning_effort(config: Dict[str, Any]) -> str:
     agent_cfg = config.get("agent")
@@ -291,13 +282,8 @@ def _print_setup_summary(config: dict, marlow_home):
     print_header("Tool Availability Summary")
 
     tool_status = []
-    # Vision — use the same runtime resolver as the actual vision tools
-    try:
-        from agent.auxiliary_client import get_available_vision_backends
-
-        _vision_backends = get_available_vision_backends()
-    except Exception:
-        _vision_backends = []
+    # Images are passed directly to the configured Codex model.
+    _vision_backends = ["codex"]
 
     if _vision_backends:
         tool_status.append(("Vision (image analysis)", True, None))
@@ -521,13 +507,9 @@ def setup_terminal_backend(config: dict):
 
     current_backend = cfg_get(config, "terminal", "backend", default="local")
 
-    # Marlow Lite retains only local, Docker, and SSH execution.
-    terminal_choices = [
-        "Local - run directly on this machine (default)",
-        "Docker - isolated container with configurable resources",
-        "SSH - run on a remote machine",
-    ]
-    idx_to_backend = {0: "local", 1: "docker", 2: "ssh"}
+    print_info("Agent execution uses the Codex local sandbox. SSH/Docker backends are not migrated.")
+    terminal_choices = ["Local - managed Codex sandbox"]
+    idx_to_backend = {0: "local"}
 
     # Add keep current option
     keep_current_idx = len(terminal_choices)
@@ -642,8 +624,6 @@ def _apply_default_agent_settings(config: dict):
 
     config.setdefault("display", {})["tool_progress"] = "all"
 
-    config.setdefault("compression", {})["enabled"] = True
-    config["compression"]["threshold"] = 0.50
 
     # Default to never auto-resetting sessions. The gateway treats absent
     # session_reset as "both", so we must write "none" explicitly to make
@@ -654,7 +634,7 @@ def _apply_default_agent_settings(config: dict):
     print_success("Applied recommended defaults:")
     print_info("  Max iterations: 150")
     print_info("  Tool progress: all")
-    print_info("  Compression threshold: 0.50")
+    print_info("  Context compaction: managed by Codex")
     print_info("  Session reset: never (use /reset or compression)")
     print_info("  Run `marlow setup agent` later to customize.")
 
@@ -712,27 +692,7 @@ def setup_agent_settings(config: dict):
     else:
         print_warning(f"Unknown mode '{mode}', keeping '{current_mode}'")
 
-    # ── Context Compression ──
-    print_header("Context Compression")
-    print_info("Automatically summarizes old messages when context gets too long.")
-    print_info(
-        "Higher threshold = compress later (use more context). Lower = compress sooner."
-    )
-
-    config.setdefault("compression", {})["enabled"] = True
-
-    current_threshold = cfg_get(config, "compression", "threshold", default=0.50)
-    threshold_str = prompt("Compression threshold (0.5-0.95)", str(current_threshold))
-    try:
-        threshold = float(threshold_str)
-        if 0.5 <= threshold <= 0.95:
-            config["compression"]["threshold"] = threshold
-    except ValueError:
-        pass
-
-    print_success(
-        f"Context compression threshold set to {config['compression'].get('threshold', 0.50)}"
-    )
+    print_info("Codex manages context compaction. Configure its native model settings in runtime/codex/config.toml.")
 
     # ── Session Reset Policy ──
     print_header("Session Reset Policy")
@@ -1298,25 +1258,8 @@ def setup_tools(config: dict, first_install: bool = False):
 
 
 def _model_section_has_credentials(config: dict) -> bool:
-    """Return whether Codex or a compatible endpoint is configured."""
-    try:
-        from marlow_cli.auth import get_active_provider
-        if get_active_provider() == "openai-codex":
-            return True
-    except Exception:
-        pass
-    model_cfg = config.get("model") if isinstance(config, dict) else None
-    if isinstance(model_cfg, dict):
-        provider_id = str(model_cfg.get("provider") or "").strip().lower()
-        if provider_id == "openai-codex":
-            return True
-        if model_cfg.get("base_url"):
-            return True
-        providers = config.get("providers")
-        if isinstance(providers, dict) and provider_id in providers:
-            entry = providers[provider_id]
-            return isinstance(entry, dict) and bool(entry.get("base_url"))
-    return False
+    from agent.codex_environment import managed_environment
+    return bool(managed_environment().config.get("model_provider"))
 
 
 

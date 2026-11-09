@@ -17,14 +17,10 @@ def check_mark(ok: bool) -> str:
 
 
 def _configured_model(config: dict) -> tuple[str, str, str]:
-    model_cfg = config.get("model", {})
-    if not isinstance(model_cfg, dict):
-        return "", "auto", ""
-    return (
-        str(model_cfg.get("default") or "").strip(),
-        str(model_cfg.get("provider") or "auto").strip(),
-        str(model_cfg.get("base_url") or "").strip(),
-    )
+    from agent.codex_environment import managed_environment
+    e = managed_environment()
+    provider = e.config.get('model_provider', 'openai')
+    return e.config.get('model', ''), provider, ''
 
 
 def _configured_platforms(config: dict) -> list[str]:

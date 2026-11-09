@@ -207,23 +207,7 @@ def describe_profile(
     except Exception:
         model, provider = None, None
 
-    try:
-        from agent.auxiliary_client import (  # type: ignore
-            get_auxiliary_extra_body,
-            get_text_auxiliary_client,
-        )
-    except Exception as exc:
-        logger.debug("describe: auxiliary client import failed: %s", exc)
-        return DescribeOutcome(canon, False, "auxiliary client unavailable")
-
-    try:
-        client, aux_model = get_text_auxiliary_client("profile_describer")
-    except Exception as exc:
-        logger.debug("describe: get_text_auxiliary_client failed: %s", exc)
-        return DescribeOutcome(canon, False, "auxiliary client unavailable")
-
-    if client is None or not aux_model:
-        return DescribeOutcome(canon, False, "no auxiliary client configured")
+    from agent.codex_tasks import call_llm
 
     user_msg = _USER_TEMPLATE.format(
         name=canon,
@@ -235,8 +219,8 @@ def describe_profile(
     )
 
     try:
-        resp = client.chat.completions.create(
-            model=aux_model,
+        resp = call_llm(
+            task="profile_describer",
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg},
@@ -244,7 +228,6 @@ def describe_profile(
             temperature=0.3,
             max_tokens=400,
             timeout=timeout or 60,
-            extra_body=get_auxiliary_extra_body() or None,
         )
     except Exception as exc:
         logger.info("describe: API call failed for %s (%s)", canon, exc)

@@ -317,7 +317,7 @@ class TestCallbackSubprocess:
         monkeypatch.setenv("MARLOW_ACCEPT_HOOKS", "1")
 
         # Fresh manager
-        plugins._plugin_manager = plugins.PluginManager()
+        plugins._plugin_managers = {str(__import__("marlow_constants").get_marlow_home().absolute()): plugins.PluginManager()}
 
         cfg = {
             "hooks": {
@@ -518,7 +518,7 @@ class TestIdempotentRegistration:
         monkeypatch.setenv("MARLOW_HOME", str(tmp_path / "home"))
         monkeypatch.setenv("MARLOW_ACCEPT_HOOKS", "1")
 
-        plugins._plugin_manager = plugins.PluginManager()
+        plugins._plugin_managers = {str(__import__("marlow_constants").get_marlow_home().absolute()): plugins.PluginManager()}
 
         cfg = {"hooks": {"on_session_start": [{"command": str(script)}]}}
 
@@ -542,7 +542,7 @@ class TestIdempotentRegistration:
         monkeypatch.setenv("MARLOW_HOME", str(tmp_path / "home"))
         monkeypatch.setenv("MARLOW_ACCEPT_HOOKS", "1")
 
-        plugins._plugin_manager = plugins.PluginManager()
+        plugins._plugin_managers = {str(__import__("marlow_constants").get_marlow_home().absolute()): plugins.PluginManager()}
 
         cfg = {
             "hooks": {

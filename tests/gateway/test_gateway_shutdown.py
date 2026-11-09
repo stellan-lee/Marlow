@@ -37,16 +37,6 @@ async def test_cancel_background_tasks_cancels_inflight_message_processing():
     assert adapter._pending_messages == {}
 
 
-def test_cleanup_agent_resources_reaps_stale_aux_clients():
-    runner, _adapter = make_restart_runner()
-    agent = MagicMock()
-
-    with patch("agent.auxiliary_client.cleanup_stale_async_clients") as cleanup_mock:
-        runner._cleanup_agent_resources(agent)
-
-    agent.shutdown_memory_provider.assert_called_once()
-    agent.close.assert_called_once()
-    cleanup_mock.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -77,13 +67,11 @@ async def test_gateway_stop_interrupts_running_agents_and_cancels_adapter_tasks(
     with (
         patch("gateway.status.remove_pid_file"),
         patch("gateway.status.write_runtime_status"),
-        patch("agent.auxiliary_client.shutdown_cached_clients") as shutdown_cached_clients,
     ):
         await runner.stop()
 
     running_agent.interrupt.assert_called_once_with("Gateway shutting down")
     disconnect_mock.assert_awaited_once()
-    shutdown_cached_clients.assert_called_once()
     assert runner.adapters == {}
     assert runner._running_agents == {}
     assert runner._pending_messages == {}

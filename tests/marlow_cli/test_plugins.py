@@ -244,7 +244,7 @@ class TestPluginLoading:
         mgr = PluginManager()
         mgr.discover_and_load()
 
-        assert "marlow_plugins.ns_plugin" in sys.modules
+        assert any(name.startswith("marlow_plugins.ns_plugin_") for name in sys.modules)
 
     def test_user_memory_plugin_auto_coerced_to_exclusive(self, tmp_path, monkeypatch):
         """User-installed memory plugins must NOT be loaded by the general
@@ -812,7 +812,7 @@ class TestPluginToolVisibility:
 
         mgr = PluginManager()
         mgr.discover_and_load()
-        monkeypatch.setattr(plugins_mod, "_plugin_manager", mgr)
+        monkeypatch.setitem(plugins_mod._plugin_managers, str(__import__("marlow_constants").get_marlow_home().absolute()), mgr)
 
         from model_tools import get_tool_definitions
 
@@ -1103,14 +1103,14 @@ class TestPluginCommands:
         handler = lambda args: f"result: {args}"
         ctx.register_command("mycmd", handler, description="test")
 
-        with patch("marlow_cli.plugins._plugin_manager", mgr):
+        with patch.dict("marlow_cli.plugins._plugin_managers", {str(__import__("marlow_constants").get_marlow_home().absolute()):mgr}):
             result = get_plugin_command_handler("mycmd")
             assert result is handler
 
     def test_get_plugin_command_handler_not_found(self):
         """get_plugin_command_handler() returns None for unregistered commands."""
         mgr = PluginManager()
-        with patch("marlow_cli.plugins._plugin_manager", mgr):
+        with patch.dict("marlow_cli.plugins._plugin_managers", {str(__import__("marlow_constants").get_marlow_home().absolute()):mgr}):
             assert get_plugin_command_handler("nonexistent") is None
 
     def test_get_plugin_commands_returns_dict(self):
@@ -1121,7 +1121,7 @@ class TestPluginCommands:
         ctx.register_command("cmd-a", lambda a: a, description="A")
         ctx.register_command("cmd-b", lambda a: a, description="B")
 
-        with patch("marlow_cli.plugins._plugin_manager", mgr):
+        with patch.dict("marlow_cli.plugins._plugin_managers", {str(__import__("marlow_constants").get_marlow_home().absolute()):mgr}):
             cmds = get_plugin_commands()
             assert "cmd-a" in cmds
             assert "cmd-b" in cmds
@@ -1139,7 +1139,7 @@ class TestPluginCommands:
 
         import marlow_cli.plugins as plugins_mod
 
-        with patch.object(plugins_mod, "_plugin_manager", None):
+        with patch.dict(plugins_mod._plugin_managers, {}, clear=True):
             handler = get_plugin_command_handler("lazycmd")
             assert handler is not None
             assert handler("x") == "ok:x"
@@ -1156,51 +1156,11 @@ class TestPluginCommands:
 
         import marlow_cli.plugins as plugins_mod
 
-        with patch.object(plugins_mod, "_plugin_manager", None):
+        with patch.dict(plugins_mod._plugin_managers, {}, clear=True):
             cmds = get_plugin_commands()
             assert "lazycmd" in cmds
             assert cmds["lazycmd"]["description"] == "Lazy"
 
-    def test_get_plugin_context_engine_discovers_plugins_lazily(self, tmp_path, monkeypatch):
-        """Context engine lookup should work before any explicit discover_plugins() call."""
-        marlow_home = tmp_path / "marlow_test"
-        plugins_dir = marlow_home / "plugins"
-        plugin_dir = plugins_dir / "engine-plugin"
-        plugin_dir.mkdir(parents=True, exist_ok=True)
-        (plugin_dir / "plugin.yaml").write_text(
-            yaml.dump({
-                "name": "engine-plugin",
-                "version": "0.1.0",
-                "description": "Test engine plugin",
-            })
-        )
-        (plugin_dir / "__init__.py").write_text(
-            "from agent.context_engine import ContextEngine\n\n"
-            "class StubEngine(ContextEngine):\n"
-            "    @property\n"
-            "    def name(self):\n"
-            "        return 'stub-engine'\n\n"
-            "    def update_from_response(self, usage):\n"
-            "        return None\n\n"
-            "    def should_compress(self, prompt_tokens):\n"
-            "        return False\n\n"
-            "    def compress(self, messages, current_tokens):\n"
-            "        return messages\n\n"
-            "def register(ctx):\n"
-            "    ctx.register_context_engine(StubEngine())\n"
-        )
-        # Opt-in: plugins are opt-in by default, so enable in config.yaml
-        (marlow_home / "config.yaml").write_text(
-            yaml.safe_dump({"plugins": {"enabled": ["engine-plugin"]}})
-        )
-        monkeypatch.setenv("MARLOW_HOME", str(marlow_home))
-
-        import marlow_cli.plugins as plugins_mod
-
-        with patch.object(plugins_mod, "_plugin_manager", None):
-            engine = plugins_mod.get_plugin_context_engine()
-            assert engine is not None
-            assert engine.name == "stub-engine"
 
     def test_commands_tracked_on_loaded_plugin(self, tmp_path, monkeypatch):
         """Commands registered during discover_and_load() are tracked on LoadedPlugin."""

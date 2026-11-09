@@ -136,7 +136,7 @@ def _install_stub_server(name: str = "wpcom"):
     return server, reconnect_flag
 
 
-def test_call_tool_handler_reconnects_on_session_expired(monkeypatch, tmp_path):
+def test_call_tool_handler_does_not_replay_uncertain_operation(monkeypatch, tmp_path):
     """Reporter's exact repro: call_tool raises "Invalid or expired
     session", handler triggers reconnect, retries once, and returns
     the retry's successful JSON (not the generic error)."""
@@ -170,19 +170,10 @@ def test_call_tool_handler_reconnects_on_session_expired(monkeypatch, tmp_path):
         handler = _make_tool_handler("wpcom", "wpcom-mcp-content-authoring", 10.0)
         out = handler({"slug": "hello"})
         parsed = json.loads(out)
-        # Retry succeeded — no error surfaced to caller.
-        assert "error" not in parsed, (
-            f"Expected retry to succeed after reconnect; got: {parsed}"
-        )
-        # _reconnect_event was signalled exactly once.
-        assert reconnect_flag.is_set(), (
-            "Handler did not trigger transport reconnect on session-expired "
-            "error — the reconnect flow is the whole point of this fix."
-        )
-        # Exactly 2 call attempts (original + one retry).
-        assert call_count["n"] == 2, (
-            f"Expected 1 original + 1 retry = 2 calls; got {call_count['n']}"
-        )
+        assert "error" in parsed
+        assert parsed["operation_state"] == "needs_verification"
+        assert not reconnect_flag.is_set()
+        assert call_count["n"] == 1
     finally:
         mcp_tool._servers.pop("wpcom", None)
         mcp_tool._server_error_counts.pop("wpcom", None)

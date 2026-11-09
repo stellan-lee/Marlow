@@ -351,7 +351,7 @@ def run_doctor(args):
     except Exception as e:
         # Never let a bug in the advisory check block the rest of doctor.
         check_warn(f"Security advisory check failed: {e}")
-    
+
     _section("Python Environment")
     py_version = sys.version_info
     if py_version >= (3, 11):
@@ -368,7 +368,7 @@ def run_doctor(args):
             "Upgrade Python to 3.10+",
             issues,
         )
-    
+
     # Check if in virtual environment
     in_venv = sys.prefix != sys.base_prefix
     if in_venv:
@@ -379,7 +379,7 @@ def run_doctor(args):
     # Detect drift between pyproject.toml and marlow_cli/__init__.py versions
     # (a git conflict resolution can silently revert one but not the other).
     _check_version_consistency(issues)
-    
+
     _section("Required Packages")
     required_packages = [
         ("openai", "OpenAI SDK"),
@@ -388,33 +388,33 @@ def run_doctor(args):
         ("yaml", "PyYAML"),
         ("httpx", "HTTPX"),
     ]
-    
+
     optional_packages = [
         ("croniter", "Croniter (cron expressions)"),
         ("telegram", "python-telegram-bot"),
         ("discord", "discord.py"),
     ]
-    
+
     for module, name in required_packages:
         try:
             __import__(module)
             check_ok(name)
         except ImportError:
             _fail_and_issue(name, "(missing)", f"Install {name}: {_python_install_cmd()} {module}", issues)
-    
+
     for module, name in optional_packages:
         try:
             __import__(module)
             check_ok(name, "(optional)")
         except ImportError:
             check_warn(name, "(optional, not installed)")
-    
+
     _section("Configuration Files")
     # Check ~/.marlow/.env (primary location for user config)
     env_path = MARLOW_HOME / '.env'
     if env_path.exists():
         check_ok(f"{_DHH}/.env file exists")
-        
+
         # Check for common issues. Pin encoding to UTF-8 because .env files are
         # written as UTF-8 everywhere in the codebase, while Path.read_text()
         # defaults to the system locale — which crashes on non-UTF-8 Windows
@@ -448,46 +448,20 @@ def run_doctor(args):
             else:
                 check_info("Run 'marlow setup' to create one")
                 issues.append("Run 'marlow setup' to create .env")
-    
+
     # Check ~/.marlow/config.yaml (primary) or project cli-config.yaml (fallback)
     config_path = MARLOW_HOME / 'config.yaml'
     if config_path.exists():
         check_ok(f"{_DHH}/config.yaml exists")
 
-        # Validate the retained Codex and compatible-endpoint provider ids.
         try:
-            import yaml as _yaml
-
-            cfg = _yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-            model_section = cfg.get("model") or {}
-            if isinstance(model_section, str):
-                model_section = {"default": model_section}
-            provider_raw = str(model_section.get("provider") or "").strip()
-            provider = provider_raw.lower()
-            known_providers = {
-                "auto", "custom", "local", "lmstudio", "openai-codex",
-            }
-            user_providers = cfg.get("providers")
-            if isinstance(user_providers, dict):
-                known_providers.update(
-                    str(name).strip().lower() for name in user_providers
-                )
-            from marlow_cli.config import load_custom_provider_entries
-
-            for entry in load_custom_provider_entries(cfg):
-                if isinstance(entry, dict) and entry.get("name"):
-                    slug = str(entry["name"]).strip().lower().replace(" ", "-")
-                    known_providers.add(f"custom:{slug}")
-            if provider and provider not in known_providers:
-                known_list = ", ".join(sorted(known_providers))
-                _fail_and_issue(
-                    f"model.provider '{provider_raw}' is not a recognised provider",
-                    f"(known: {known_list})",
-                    "Set model.provider to Codex or a configured compatible endpoint.",
-                    issues,
-                )
+            from marlow_cli.runtime_provider import resolve_runtime_provider
+            resolve_runtime_provider()
+            check_ok("Profile Codex configuration is valid")
         except Exception as exc:
-            check_warn("Could not validate model/provider config", f"({exc})")
+            _fail_and_issue("Invalid Codex configuration", f"({exc})",
+                "Move retired model/provider settings to runtime/codex/config.toml; run marlow login for this profile.", issues)
+
     else:
         fallback_config = PROJECT_ROOT / 'cli-config.yaml'
         if fallback_config.exists():
@@ -544,30 +518,7 @@ def run_doctor(args):
                     f"Stale root-level config keys: {', '.join(stale_root_keys)}",
                     "(should be under 'model:' section)"
                 )
-                if should_fix:
-                    # Coerce scalar/None ``model:`` into a dict before mutation —
-                    # ``setdefault("model", {})`` would return an existing scalar
-                    # and then ``model_section[k] = ...`` would raise TypeError.
-                    raw_model = raw_config.get("model")
-                    if isinstance(raw_model, dict):
-                        model_section = raw_model
-                    elif isinstance(raw_model, str) and raw_model.strip():
-                        model_section = {"default": raw_model.strip()}
-                        raw_config["model"] = model_section
-                    else:
-                        model_section = {}
-                        raw_config["model"] = model_section
-                    for k in stale_root_keys:
-                        if not model_section.get(k):
-                            model_section[k] = raw_config.pop(k)
-                        else:
-                            raw_config.pop(k)
-                    from utils import atomic_yaml_write
-                    atomic_yaml_write(config_path, raw_config)
-                    check_ok("Migrated stale root-level keys into model section")
-                    fixed_count += 1
-                else:
-                    issues.append("Stale root-level provider/base_url in config.yaml — run 'marlow doctor --fix'")
+                issues.append('Retired root-level inference settings need manual migration to runtime/codex/config.toml; historical data was left intact.')
         except Exception:
             pass
 
@@ -615,7 +566,7 @@ def run_doctor(args):
         fixed_count += 1
     else:
         check_warn(f"{_DHH} not found", "(will be created on first use)")
-    
+
     # Check expected subdirectories
     expected_subdirs = ["cron", "sessions", "logs", "skills", "memories"]
     for subdir_name in expected_subdirs:
@@ -628,7 +579,7 @@ def run_doctor(args):
             fixed_count += 1
         else:
             check_warn(f"{_DHH}/{subdir_name}/ not found", "(will be created on first use)")
-    
+
     # Check for SOUL.md persona file
     soul_path = marlow_home / "SOUL.md"
     if soul_path.exists():
@@ -651,7 +602,7 @@ def run_doctor(args):
             )
             check_ok(f"Created {_DHH}/SOUL.md with basic template")
             fixed_count += 1
-    
+
     # Check memory directory
     memories_dir = marlow_home / "memories"
     if memories_dir.exists():
@@ -674,7 +625,7 @@ def run_doctor(args):
             memories_dir.mkdir(parents=True, exist_ok=True)
             check_ok(f"Created {_DHH}/memories/")
             fixed_count += 1
-    
+
     # Check SQLite session store
     state_db_path = marlow_home / "state.db"
     if state_db_path.exists():
@@ -793,14 +744,14 @@ def run_doctor(args):
         check_ok("git")
     else:
         check_warn("git not found", "(optional)")
-    
+
     # ripgrep (optional, for faster file search)
     if _safe_which("rg"):
         check_ok("ripgrep (rg)", "(faster file search)")
     else:
         check_warn("ripgrep (rg) not found", "(file search uses grep fallback)")
         check_info(f"Install for faster search: {_system_package_install_cmd('ripgrep')}")
-    
+
     # Docker (optional)
     terminal_env = os.getenv("TERMINAL_ENV", "local")
     try:
@@ -847,7 +798,7 @@ def run_doctor(args):
         pass  # already explained above
     else:
         check_warn("docker not found", "(optional)")
-    
+
     # SSH (if using ssh backend)
     if terminal_env == "ssh":
         ssh_host = os.getenv("TERMINAL_SSH_HOST")
@@ -883,7 +834,7 @@ def run_doctor(args):
                 "Set TERMINAL_SSH_HOST in .env",
                 issues,
             )
-    
+
     # Node.js + agent-browser (for browser automation tools)
     if _safe_which("node"):
         check_ok("Node.js")
@@ -937,7 +888,7 @@ def run_doctor(args):
                         )
     else:
         check_warn("Node.js not found", "(optional, needed for browser tools)")
-    
+
     # npm audit for all Node.js packages
     _npm_bin = _safe_which("npm")
     if _npm_bin:
@@ -983,14 +934,14 @@ def run_doctor(args):
         # Add project root to path for imports
         sys.path.insert(0, str(PROJECT_ROOT))
         from model_tools import check_tool_availability, TOOLSET_REQUIREMENTS
-        
+
         available, unavailable = check_tool_availability()
         available, unavailable = _apply_doctor_tool_availability_overrides(available, unavailable)
-        
+
         for tid in available:
             info = TOOLSET_REQUIREMENTS.get(tid, {})
             check_ok(info.get("name", tid), _doctor_tool_availability_detail(tid))
-        
+
         for item in unavailable:
             env_vars = item.get("missing_vars") or item.get("env_vars") or []
             if env_vars:
@@ -1005,7 +956,7 @@ def run_doctor(args):
             issues.append("Run 'marlow setup' to configure missing API keys for full tool access")
     except Exception as e:
         check_warn("Could not check tool availability", f"({e})")
-    
+
     _section("Memory Provider")
     from plugins.memory import RETIRED_MEMORY_PROVIDER, RETIRED_MEMORY_PROVIDER_MESSAGE
 
@@ -1136,5 +1087,5 @@ def run_doctor(args):
     else:
         print(color("─" * 60, Colors.GREEN))
         print(color("  All checks passed! 🎉", Colors.GREEN, Colors.BOLD))
-    
+
     print()

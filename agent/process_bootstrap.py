@@ -1,11 +1,6 @@
 """Process-level bootstrap helpers for ``run_agent``.
 
-Three concerns, all tied to ``AIAgent`` boot-time / runtime IO setup:
-
-1. **Lazy OpenAI SDK import** — ``_load_openai_cls`` + ``_OpenAIProxy``
-   defer the 240ms-ish ``from openai import OpenAI`` cost until first use,
-   while preserving ``isinstance(client, OpenAI)`` checks and
-   ``patch("run_agent.OpenAI", ...)`` test patterns.
+Process IO helpers, tied to ``AIAgent`` boot-time / runtime IO setup:
 
 2. **Crash-resistant stdio** — ``_SafeWriter`` wraps stdout/stderr so
    ``OSError: Input/output error`` from broken pipes (systemd, Docker,
@@ -29,35 +24,6 @@ import urllib.request
 from typing import Optional
 
 from utils import base_url_hostname, normalize_proxy_url
-
-
-# Cached at module level so we only pay the OpenAI SDK import cost once
-# per process (after the first lazy load).
-_OPENAI_CLS_CACHE = None
-
-
-def _load_openai_cls() -> type:
-    """Import and cache ``openai.OpenAI``."""
-    global _OPENAI_CLS_CACHE
-    if _OPENAI_CLS_CACHE is None:
-        from openai import OpenAI as _cls
-        _OPENAI_CLS_CACHE = _cls
-    return _OPENAI_CLS_CACHE
-
-
-class _OpenAIProxy:
-    """Module-level proxy that looks like ``openai.OpenAI`` but imports lazily."""
-
-    __slots__ = ()
-
-    def __call__(self, *args, **kwargs):
-        return _load_openai_cls()(*args, **kwargs)
-
-    def __instancecheck__(self, obj):
-        return isinstance(obj, _load_openai_cls())
-
-    def __repr__(self):
-        return "<lazy openai.OpenAI proxy>"
 
 
 class _SafeWriter:
@@ -148,20 +114,3 @@ def _install_safe_stdio() -> None:
         stream = getattr(sys, stream_name, None)
         if stream is not None and not isinstance(stream, _SafeWriter):
             setattr(sys, stream_name, _SafeWriter(stream))
-
-
-# Module-level proxy instance — drops in for ``openai.OpenAI``.  Imported as
-# ``from agent.process_bootstrap import OpenAI`` (or re-exported via
-# ``run_agent`` for legacy tests).
-OpenAI = _OpenAIProxy()
-
-
-__all__ = [
-    "OpenAI",
-    "_OpenAIProxy",
-    "_load_openai_cls",
-    "_SafeWriter",
-    "_install_safe_stdio",
-    "_get_proxy_from_env",
-    "_get_proxy_for_base_url",
-]

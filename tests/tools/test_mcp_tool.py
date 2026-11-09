@@ -1327,89 +1327,19 @@ class TestShutdown:
 # ---------------------------------------------------------------------------
 
 class TestBuildSafeEnv:
-    """Tests for _build_safe_env() environment filtering."""
-
-    def test_only_safe_vars_passed(self):
-        """Only safe baseline vars and XDG_* from os.environ are included."""
+    def test_controlled_home_and_explicit_env(self, tmp_path):
         from tools.mcp_tool import _build_safe_env
-
-        fake_env = {
-            "PATH": "/usr/bin",
-            "HOME": "/home/test",
-            "USER": "test",
-            "LANG": "en_US.UTF-8",
-            "LC_ALL": "C",
-            "TERM": "xterm",
-            "SHELL": "/bin/bash",
-            "TMPDIR": "/tmp",
-            "XDG_DATA_HOME": "/home/test/.local/share",
-            "SECRET_KEY": "should_not_appear",
-            "AWS_ACCESS_KEY_ID": "AKIAIOSFODNN7EXAMPLE",
-        }
-        with patch.dict("os.environ", fake_env, clear=True):
-            result = _build_safe_env(None)
-
-        # Safe vars present
-        assert result["PATH"] == "/usr/bin"
-        assert result["HOME"] == "/home/test"
-        assert result["USER"] == "test"
-        assert result["LANG"] == "en_US.UTF-8"
-        assert result["XDG_DATA_HOME"] == "/home/test/.local/share"
-        # Unsafe vars excluded
-        assert "SECRET_KEY" not in result
-        assert "AWS_ACCESS_KEY_ID" not in result
-
-    def test_user_env_merged(self):
-        """User-specified env vars are merged into the safe env."""
-        from tools.mcp_tool import _build_safe_env
-
-        with patch.dict("os.environ", {"PATH": "/usr/bin"}, clear=True):
-            result = _build_safe_env({"MY_CUSTOM_VAR": "hello"})
-
-        assert result["PATH"] == "/usr/bin"
-        assert result["MY_CUSTOM_VAR"] == "hello"
-
-    def test_user_env_overrides_safe(self):
-        """User env can override safe defaults."""
-        from tools.mcp_tool import _build_safe_env
-
-        with patch.dict("os.environ", {"PATH": "/usr/bin"}, clear=True):
-            result = _build_safe_env({"PATH": "/custom/bin"})
-
-        assert result["PATH"] == "/custom/bin"
-
-    def test_none_user_env(self):
-        """None user_env still returns safe vars from os.environ."""
-        from tools.mcp_tool import _build_safe_env
-
-        with patch.dict("os.environ", {"PATH": "/usr/bin", "HOME": "/root"}, clear=True):
-            result = _build_safe_env(None)
-
-        assert isinstance(result, dict)
-        assert result["PATH"] == "/usr/bin"
-        assert result["HOME"] == "/root"
-
-    def test_secret_vars_excluded(self):
-        """Sensitive env vars from os.environ are NOT passed through."""
-        from tools.mcp_tool import _build_safe_env
-
-        fake_env = {
-            "PATH": "/usr/bin",
-            "AWS_SECRET_ACCESS_KEY": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-            "GITHUB_TOKEN": "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-            "OPENAI_API_KEY": "sk-proj-abc123",
-            "DATABASE_URL": "postgres://user:pass@localhost/db",
-            "API_SECRET": "supersecret",
-        }
-        with patch.dict("os.environ", fake_env, clear=True):
-            result = _build_safe_env(None)
-
-        assert "PATH" in result
-        assert "AWS_SECRET_ACCESS_KEY" not in result
-        assert "GITHUB_TOKEN" not in result
-        assert "OPENAI_API_KEY" not in result
-        assert "DATABASE_URL" not in result
-        assert "API_SECRET" not in result
+        from marlow_constants import set_marlow_home_override, reset_marlow_home_override
+        token = set_marlow_home_override(tmp_path / 'profile')
+        try:
+            with patch.dict('os.environ', {'HOME':'/personal','SECRET_KEY':'private'}, clear=True):
+                result = _build_safe_env({'CUSTOM_TOOL_VALUE':'explicit'})
+            assert result['HOME'] == str(tmp_path / 'profile/runtime/home')
+            assert result['CUSTOM_TOOL_VALUE'] == 'explicit'
+            assert 'SECRET_KEY' not in result
+            with pytest.raises(ValueError): _build_safe_env({'HOME':'/personal'})
+        finally:
+            reset_marlow_home_override(token)
 
 
 # ---------------------------------------------------------------------------
@@ -2421,7 +2351,6 @@ class TestSamplingHandlerInit:
         assert h.max_rpm == 10
         assert h.timeout == 30
         assert h.max_tokens_cap == 4096
-        assert h.max_tool_rounds == 5
         assert h.model_override is None
         assert h.allowed_models == []
         assert h.metrics == {"requests": 0, "errors": 0, "tokens_used": 0, "tool_use_count": 0}
@@ -2440,7 +2369,6 @@ class TestSamplingHandlerInit:
         assert h.max_rpm == 20
         assert h.timeout == 60.0
         assert h.max_tokens_cap == 2048
-        assert h.max_tool_rounds == 3
         assert h.model_override == "gpt-4o"
         assert h.allowed_models == ["gpt-4o", "gpt-3.5-turbo"]
 
@@ -2617,7 +2545,7 @@ class TestSamplingCallbackText:
         )
 
         with patch(
-            "agent.auxiliary_client.call_llm",
+            "agent.codex_tasks.call_llm",
             return_value=fake_client.chat.completions.create.return_value,
         ):
             params = _make_sampling_params()
@@ -2636,7 +2564,7 @@ class TestSamplingCallbackText:
         fake_client.chat.completions.create.return_value = _make_llm_response()
 
         with patch(
-            "agent.auxiliary_client.call_llm",
+            "agent.codex_tasks.call_llm",
             return_value=fake_client.chat.completions.create.return_value,
         ) as mock_call:
             params = _make_sampling_params(system_prompt="Be helpful")
@@ -2646,32 +2574,6 @@ class TestSamplingCallbackText:
         messages = call_args.kwargs["messages"]
         assert messages[0] == {"role": "system", "content": "Be helpful"}
 
-    def test_server_tools_with_object_schema_are_normalized(self):
-        """Server-provided tools should gain empty properties for object schemas."""
-        fake_client = MagicMock()
-        fake_client.chat.completions.create.return_value = _make_llm_response()
-        server_tool = SimpleNamespace(
-            name="ask",
-            description="Ask Crawl4AI",
-            inputSchema={"type": "object"},
-        )
-
-        with patch(
-            "agent.auxiliary_client.call_llm",
-            return_value=fake_client.chat.completions.create.return_value,
-        ) as mock_call:
-            params = _make_sampling_params(tools=[server_tool])
-            asyncio.run(self.handler(None, params))
-
-        tools = mock_call.call_args.kwargs["tools"]
-        assert tools == [{
-            "type": "function",
-            "function": {
-                "name": "ask",
-                "description": "Ask Crawl4AI",
-                "parameters": {"type": "object", "properties": {}},
-            },
-        }]
 
     def test_length_stop_reason(self):
         """finish_reason='length' maps to stopReason='maxTokens'."""
@@ -2681,7 +2583,7 @@ class TestSamplingCallbackText:
         )
 
         with patch(
-            "agent.auxiliary_client.call_llm",
+            "agent.codex_tasks.call_llm",
             return_value=fake_client.chat.completions.create.return_value,
         ):
             params = _make_sampling_params()
@@ -2695,119 +2597,12 @@ class TestSamplingCallbackText:
 # 7. Tool use sampling callback
 # ---------------------------------------------------------------------------
 
-class TestSamplingCallbackToolUse:
-    def setup_method(self):
-        self.handler = SamplingHandler("tu", {})
-
-    def test_tool_use_response(self):
-        """LLM tool_calls response returns CreateMessageResultWithTools."""
-        fake_client = MagicMock()
-        fake_client.chat.completions.create.return_value = _make_llm_tool_response()
-
-        with patch(
-            "agent.auxiliary_client.call_llm",
-            return_value=fake_client.chat.completions.create.return_value,
-        ):
-            params = _make_sampling_params()
-            result = asyncio.run(self.handler(None, params))
-
-        assert isinstance(result, CreateMessageResultWithTools)
-        assert result.stopReason == "toolUse"
-        assert result.model == "test-model"
-        assert len(result.content) == 1
-        tc = result.content[0]
-        assert isinstance(tc, ToolUseContent)
-        assert tc.name == "get_weather"
-        assert tc.id == "call_1"
-        assert tc.input == {"city": "London"}
-
-    def test_multiple_tool_calls(self):
-        """Multiple tool_calls in a single response."""
-        fake_client = MagicMock()
-        fake_client.chat.completions.create.return_value = _make_llm_tool_response(
-            tool_calls_data=[
-                ("call_a", "func_a", '{"x": 1}'),
-                ("call_b", "func_b", '{"y": 2}'),
-            ]
-        )
-
-        with patch(
-            "agent.auxiliary_client.call_llm",
-            return_value=fake_client.chat.completions.create.return_value,
-        ):
-            result = asyncio.run(self.handler(None, _make_sampling_params()))
-
-        assert isinstance(result, CreateMessageResultWithTools)
-        assert len(result.content) == 2
-        assert result.content[0].name == "func_a"
-        assert result.content[1].name == "func_b"
 
 
 # ---------------------------------------------------------------------------
 # 8. Tool loop governance
 # ---------------------------------------------------------------------------
 
-class TestToolLoopGovernance:
-    def test_max_tool_rounds_enforcement(self):
-        """After max_tool_rounds consecutive tool responses, an error is returned."""
-        handler = SamplingHandler("tl", {"max_tool_rounds": 2})
-        fake_client = MagicMock()
-        fake_client.chat.completions.create.return_value = _make_llm_tool_response()
-
-        with patch(
-            "agent.auxiliary_client.call_llm",
-            return_value=fake_client.chat.completions.create.return_value,
-        ):
-            params = _make_sampling_params()
-            # Round 1, 2: allowed
-            r1 = asyncio.run(handler(None, params))
-            assert isinstance(r1, CreateMessageResultWithTools)
-            r2 = asyncio.run(handler(None, params))
-            assert isinstance(r2, CreateMessageResultWithTools)
-            # Round 3: exceeds limit
-            r3 = asyncio.run(handler(None, params))
-            assert isinstance(r3, ErrorData)
-            assert "Tool loop limit exceeded" in r3.message
-
-    def test_text_response_resets_counter(self):
-        """A text response resets the tool loop counter."""
-        handler = SamplingHandler("tl2", {"max_tool_rounds": 1})
-
-        # Use a list to hold the current response, so the side_effect can
-        # pick up changes between calls.
-        responses = [_make_llm_tool_response()]
-
-        with patch(
-            "agent.auxiliary_client.call_llm",
-            side_effect=lambda **kw: responses[0],
-        ):
-            # Tool response (round 1 of 1 allowed)
-            r1 = asyncio.run(handler(None, _make_sampling_params()))
-            assert isinstance(r1, CreateMessageResultWithTools)
-
-            # Text response resets counter
-            responses[0] = _make_llm_response()
-            r2 = asyncio.run(handler(None, _make_sampling_params()))
-            assert isinstance(r2, CreateMessageResult)
-
-            # Tool response again (should succeed since counter was reset)
-            responses[0] = _make_llm_tool_response()
-            r3 = asyncio.run(handler(None, _make_sampling_params()))
-            assert isinstance(r3, CreateMessageResultWithTools)
-
-    def test_max_tool_rounds_zero_disables(self):
-        """max_tool_rounds=0 means tool loops are disabled entirely."""
-        handler = SamplingHandler("tl3", {"max_tool_rounds": 0})
-        fake_client = MagicMock()
-        fake_client.chat.completions.create.return_value = _make_llm_tool_response()
-
-        with patch(
-            "agent.auxiliary_client.call_llm",
-            return_value=fake_client.chat.completions.create.return_value,
-        ):
-            result = asyncio.run(handler(None, _make_sampling_params()))
-            assert isinstance(result, ErrorData)
-            assert "Tool loops disabled" in result.message
 
 
 # ---------------------------------------------------------------------------
@@ -2821,7 +2616,7 @@ class TestSamplingErrors:
         fake_client.chat.completions.create.return_value = _make_llm_response()
 
         with patch(
-            "agent.auxiliary_client.call_llm",
+            "agent.codex_tasks.call_llm",
             return_value=fake_client.chat.completions.create.return_value,
         ):
             # First call succeeds
@@ -2843,7 +2638,7 @@ class TestSamplingErrors:
             return _make_llm_response()
 
         with patch(
-            "agent.auxiliary_client.call_llm",
+            "agent.codex_tasks.call_llm",
             side_effect=slow_call,
         ):
             result = asyncio.run(handler(None, _make_sampling_params()))
@@ -2855,7 +2650,7 @@ class TestSamplingErrors:
         handler = SamplingHandler("np", {})
 
         with patch(
-            "agent.auxiliary_client.call_llm",
+            "agent.codex_tasks.call_llm",
             side_effect=RuntimeError("No LLM provider configured"),
         ):
             result = asyncio.run(handler(None, _make_sampling_params()))
@@ -2873,7 +2668,7 @@ class TestSamplingErrors:
         )
 
         with patch(
-            "agent.auxiliary_client.call_llm",
+            "agent.codex_tasks.call_llm",
             return_value=fake_client.chat.completions.create.return_value,
         ):
             result = asyncio.run(handler(None, _make_sampling_params()))
@@ -2893,7 +2688,7 @@ class TestSamplingErrors:
         )
 
         with patch(
-            "agent.auxiliary_client.call_llm",
+            "agent.codex_tasks.call_llm",
             return_value=fake_client.chat.completions.create.return_value,
         ):
             result = asyncio.run(handler(None, _make_sampling_params()))
@@ -2912,7 +2707,7 @@ class TestSamplingErrors:
         )
 
         with patch(
-            "agent.auxiliary_client.call_llm",
+            "agent.codex_tasks.call_llm",
             return_value=fake_client.chat.completions.create.return_value,
         ):
             result = asyncio.run(handler(None, _make_sampling_params()))
@@ -2933,7 +2728,7 @@ class TestModelWhitelist:
         fake_client.chat.completions.create.return_value = _make_llm_response()
 
         with patch(
-            "agent.auxiliary_client.call_llm",
+            "agent.codex_tasks.call_llm",
             return_value=fake_client.chat.completions.create.return_value,
         ):
             result = asyncio.run(handler(None, _make_sampling_params()))
@@ -2944,7 +2739,7 @@ class TestModelWhitelist:
         fake_client = MagicMock()
 
         with patch(
-            "agent.auxiliary_client.call_llm",
+            "agent.codex_tasks.call_llm",
             return_value=fake_client.chat.completions.create.return_value,
         ):
             result = asyncio.run(handler(None, _make_sampling_params()))
@@ -2958,7 +2753,7 @@ class TestModelWhitelist:
         fake_client.chat.completions.create.return_value = _make_llm_response()
 
         with patch(
-            "agent.auxiliary_client.call_llm",
+            "agent.codex_tasks.call_llm",
             return_value=fake_client.chat.completions.create.return_value,
         ):
             result = asyncio.run(handler(None, _make_sampling_params()))
@@ -2969,51 +2764,6 @@ class TestModelWhitelist:
 # 11. Malformed tool_call arguments
 # ---------------------------------------------------------------------------
 
-class TestMalformedToolCallArgs:
-    def test_invalid_json_wrapped_as_raw(self):
-        """Malformed JSON arguments get wrapped in {"_raw": ...}."""
-        handler = SamplingHandler("mf", {})
-        fake_client = MagicMock()
-        fake_client.chat.completions.create.return_value = _make_llm_tool_response(
-            tool_calls_data=[("call_x", "some_tool", "not valid json {{{")]
-        )
-
-        with patch(
-            "agent.auxiliary_client.call_llm",
-            return_value=fake_client.chat.completions.create.return_value,
-        ):
-            result = asyncio.run(handler(None, _make_sampling_params()))
-
-        assert isinstance(result, CreateMessageResultWithTools)
-        tc = result.content[0]
-        assert isinstance(tc, ToolUseContent)
-        assert tc.input == {"_raw": "not valid json {{{"}
-
-    def test_dict_args_pass_through(self):
-        """When arguments are already a dict, they pass through directly."""
-        handler = SamplingHandler("mf2", {})
-
-        # Build a tool call where arguments is already a dict
-        tc_obj = SimpleNamespace(
-            id="call_d",
-            function=SimpleNamespace(name="do_stuff", arguments={"key": "val"}),
-        )
-        message = SimpleNamespace(content=None, tool_calls=[tc_obj])
-        choice = SimpleNamespace(finish_reason="tool_calls", message=message)
-        usage = SimpleNamespace(total_tokens=10)
-        response = SimpleNamespace(choices=[choice], model="m", usage=usage)
-
-        fake_client = MagicMock()
-        fake_client.chat.completions.create.return_value = response
-
-        with patch(
-            "agent.auxiliary_client.call_llm",
-            return_value=fake_client.chat.completions.create.return_value,
-        ):
-            result = asyncio.run(handler(None, _make_sampling_params()))
-
-        assert isinstance(result, CreateMessageResultWithTools)
-        assert result.content[0].input == {"key": "val"}
 
 
 # ---------------------------------------------------------------------------
@@ -3027,7 +2777,7 @@ class TestMetricsTracking:
         fake_client.chat.completions.create.return_value = _make_llm_response()
 
         with patch(
-            "agent.auxiliary_client.call_llm",
+            "agent.codex_tasks.call_llm",
             return_value=fake_client.chat.completions.create.return_value,
         ):
             asyncio.run(handler(None, _make_sampling_params()))
@@ -3036,25 +2786,12 @@ class TestMetricsTracking:
         assert handler.metrics["tokens_used"] == 42
         assert handler.metrics["errors"] == 0
 
-    def test_tool_use_count_metric(self):
-        handler = SamplingHandler("met2", {})
-        fake_client = MagicMock()
-        fake_client.chat.completions.create.return_value = _make_llm_tool_response()
-
-        with patch(
-            "agent.auxiliary_client.call_llm",
-            return_value=fake_client.chat.completions.create.return_value,
-        ):
-            asyncio.run(handler(None, _make_sampling_params()))
-
-        assert handler.metrics["tool_use_count"] == 1
-        assert handler.metrics["requests"] == 1
 
     def test_error_metric_incremented(self):
         handler = SamplingHandler("met3", {})
 
         with patch(
-            "agent.auxiliary_client.call_llm",
+            "agent.codex_tasks.call_llm",
             side_effect=RuntimeError("No LLM provider configured"),
         ):
             asyncio.run(handler(None, _make_sampling_params()))
@@ -3080,7 +2817,7 @@ class TestSessionKwargs:
         kwargs = handler.session_kwargs()
         cap = kwargs["sampling_capabilities"]
         assert isinstance(cap, SamplingCapability)
-        assert isinstance(cap.tools, SamplingToolsCapability)
+        assert cap.tools is None
 
 
 # ---------------------------------------------------------------------------
@@ -4018,3 +3755,16 @@ class TestMcpParallelToolCalls:
             register_mcp_servers(config_off)
         with _lock:
             assert sanitize_mcp_name_component("toggle_srv") not in _parallel_safe_servers
+
+
+@pytest.fixture(autouse=True)
+def _sampling_unit_authorization(monkeypatch):
+    from contextlib import nullcontext
+    original = SamplingHandler.__init__
+    def initialize(handler, *args, **kwargs):
+        original(handler, *args, **kwargs)
+        handler._authorization = SimpleNamespace(_interrupt_requested=False,_closed=False,
+            _sampling_budget_lock=threading.Lock(),_sampling_remaining=1000,
+            _profile_context=nullcontext,session_id='unit',_workspace_scope=None,_conversation_shared=False,
+            _user_id=None,_chat_id=None,_thread_id=None)
+    monkeypatch.setattr(SamplingHandler, '__init__', initialize)

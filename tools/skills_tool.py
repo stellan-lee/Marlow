@@ -450,9 +450,9 @@ def _get_category_from_path(skill_path: Path) -> Optional[str]:
     For paths like: ~/.marlow/skills/mlops/axolotl/SKILL.md -> "mlops"
     Also works for external skill dirs configured via skills.external_dirs.
     """
-    # Try the module-level SKILLS_DIR first (respects monkeypatching in tests),
+    # Try the module-level _skills_path() first (respects monkeypatching in tests),
     # then fall back to external dirs from config.
-    dirs_to_check = [SKILLS_DIR]
+    dirs_to_check = [_skills_path()]
     try:
         from agent.skill_utils import get_external_skills_dirs
         dirs_to_check.extend(get_external_skills_dirs())
@@ -571,8 +571,8 @@ def _find_all_skills(
 
     # Scan local dir first, then external dirs (local takes precedence)
     dirs_to_scan = []
-    if SKILLS_DIR.exists():
-        dirs_to_scan.append(SKILLS_DIR)
+    if _skills_path().exists():
+        dirs_to_scan.append(_skills_path())
     dirs_to_scan.extend(get_external_skills_dirs())
 
     indexes = [
@@ -654,7 +654,7 @@ def skills_list(category: str = None, task_id: str = None) -> str:
         JSON string with minimal skill info: name, description, category
     """
     try:
-        SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+        _skills_path().mkdir(parents=True, exist_ok=True)
         all_skills = _find_all_skills(include_on_demand=True)
 
         if not all_skills:
@@ -901,8 +901,8 @@ def skill_view(
 
         # Build list of all skill directories to search
         all_dirs = []
-        if SKILLS_DIR.exists():
-            all_dirs.append(SKILLS_DIR)
+        if _skills_path().exists():
+            all_dirs.append(_skills_path())
         all_dirs.extend(get_external_skills_dirs())
 
         skill_dir = None
@@ -1268,7 +1268,7 @@ def skill_view(
             linked_files["scripts"] = script_files
 
         try:
-            rel_path = str(skill_md.relative_to(SKILLS_DIR))
+            rel_path = str(skill_md.relative_to(_skills_path()))
         except ValueError:
             # External skill — use path relative to the skill's own parent dir
             rel_path = str(skill_md.relative_to(skill_md.parent.parent)) if skill_md.parent.parent else skill_md.name
@@ -1542,3 +1542,9 @@ registry.register(
     check_fn=check_skills_requirements,
     emoji="📚",
 )
+
+
+_INITIAL_SKILLS_DIR = SKILLS_DIR
+
+def _skills_path():
+    return SKILLS_DIR if SKILLS_DIR != _INITIAL_SKILLS_DIR else get_marlow_home() / "skills"

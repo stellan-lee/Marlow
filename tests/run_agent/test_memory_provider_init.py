@@ -39,15 +39,11 @@ def test_blank_memory_provider_does_not_auto_enable_honcho():
         ) as from_global_config,
         patch("plugins.memory.load_memory_provider") as load_memory_provider,
         patch("agent.model_metadata.get_model_context_length", return_value=204_800),
-        patch("run_agent.get_tool_definitions", return_value=[]),
-        patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("run_agent.OpenAI"),
+        patch("model_tools.get_tool_definitions", return_value=[]),
     ):
         from run_agent import AIAgent
 
         agent = AIAgent(
-            api_key="test-key-1234567890",
-            base_url="https://openrouter.ai/api/v1",
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=False,
@@ -69,17 +65,12 @@ def test_gateway_agent_keeps_local_memory_with_retired_provider(tmp_path, monkey
         patch("marlow_cli.config.load_config", return_value=cfg),
         patch("marlow_cli.config.save_config") as save_config,
         patch("agent.model_metadata.get_model_context_length", return_value=204_800),
-        patch("run_agent.get_tool_definitions", return_value=[]),
-        patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("run_agent.OpenAI"),
+        patch("model_tools.get_tool_definitions", return_value=[]),
     ):
         from run_agent import AIAgent
 
         agent = AIAgent(
-            provider="custom",
             model="test",
-            api_key="test-key-1234567890",
-            base_url="http://localhost:1234/v1",
             quiet_mode=True,
             skip_context_files=True,
             platform="telegram",
@@ -101,15 +92,11 @@ def test_aiagent_forwards_user_id_alt_to_memory_provider():
         patch("marlow_cli.config.load_config", return_value=cfg),
         patch("plugins.memory.load_memory_provider", return_value=provider),
         patch("agent.model_metadata.get_model_context_length", return_value=204_800),
-        patch("run_agent.get_tool_definitions", return_value=[]),
-        patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("run_agent.OpenAI"),
+        patch("model_tools.get_tool_definitions", return_value=[]),
     ):
         from run_agent import AIAgent
 
         agent = AIAgent(
-            api_key="test-key-1234567890",
-            base_url="https://openrouter.ai/api/v1",
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=False,

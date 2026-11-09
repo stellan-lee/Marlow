@@ -2,6 +2,7 @@
 
 import json
 import logging
+from pathlib import Path
 import os
 from unittest.mock import AsyncMock, patch, MagicMock
 
@@ -553,6 +554,7 @@ class TestDeliverResultWrapping:
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}):
             job = {
                 "id": "voice-job",
+                "execution_scope": {"projects": [{"path": str(media_path.parent)}]},
                 "deliver": "origin",
                 "origin": {"platform": "telegram", "chat_id": "123"},
             }
@@ -564,7 +566,11 @@ class TestDeliverResultWrapping:
         assert "MEDIA:" not in args[3]
         assert "Title" in args[3]
         # Media files should be forwarded separately
-        assert kwargs["media_files"] == [(str(media_path), False)]
+        assert len(kwargs["media_files"]) == 1
+        frozen, voice = kwargs["media_files"][0]
+        assert not voice
+        assert Path(frozen).name == media_path.name
+        assert Path(frozen).read_bytes() == media_path.read_bytes()
 
     def test_live_adapter_sends_media_as_attachments(self, tmp_path, monkeypatch):
         """A MEDIA audio file is sent as a regular document attachment."""
@@ -593,6 +599,7 @@ class TestDeliverResultWrapping:
 
         job = {
             "id": "audio-job",
+                "execution_scope": {"projects": [{"path": str(media_path.parent)}]},
             "deliver": "origin",
             "origin": {"platform": "discord", "chat_id": "9876"},
         }
@@ -614,7 +621,8 @@ class TestDeliverResultWrapping:
         assert "Recording attached" in text_sent
 
         adapter.send_document.assert_called_once()
-        assert adapter.send_document.call_args.kwargs["file_path"] == str(media_path)
+        frozen = Path(adapter.send_document.call_args.kwargs["file_path"])
+        assert frozen.name == media_path.name and frozen.read_bytes() == media_path.read_bytes()
 
     def test_live_adapter_routes_image_to_send_image_file(self, tmp_path, monkeypatch):
         """Image MEDIA files go through the platform image API."""
@@ -642,6 +650,7 @@ class TestDeliverResultWrapping:
 
         job = {
             "id": "img-job",
+                "execution_scope": {"projects": [{"path": str(media_path.parent)}]},
             "deliver": "origin",
             "origin": {"platform": "discord", "chat_id": "1234"},
         }
@@ -657,7 +666,8 @@ class TestDeliverResultWrapping:
             )
 
         adapter.send_image_file.assert_called_once()
-        assert adapter.send_image_file.call_args[1]["image_path"] == str(media_path)
+        frozen = Path(adapter.send_image_file.call_args.kwargs["image_path"])
+        assert frozen.name == media_path.name and frozen.read_bytes() == media_path.read_bytes()
         adapter.send_document.assert_not_called()
 
     def test_live_adapter_media_only_no_text(self, tmp_path, monkeypatch):
@@ -685,6 +695,7 @@ class TestDeliverResultWrapping:
 
         job = {
             "id": "audio-only",
+                "execution_scope": {"projects": [{"path": str(media_path.parent)}]},
             "deliver": "origin",
             "origin": {"platform": "telegram", "chat_id": "999"},
         }
@@ -702,7 +713,8 @@ class TestDeliverResultWrapping:
         # Text send should NOT be called (no text after stripping MEDIA tag)
         adapter.send.assert_not_called()
         adapter.send_document.assert_called_once()
-        assert adapter.send_document.call_args.kwargs["file_path"] == str(media_path)
+        frozen = Path(adapter.send_document.call_args.kwargs["file_path"])
+        assert frozen.name == media_path.name and frozen.read_bytes() == media_path.read_bytes()
 
     def test_live_adapter_sends_cleaned_text_not_raw(self):
         """The live adapter path must send cleaned text (MEDIA tags stripped),
@@ -907,41 +919,6 @@ class TestRunJobSessionPersistence:
         assert "RuntimeError: boom" in error
         mock_agent.close.assert_called_once()
 
-    def test_run_job_reaps_stale_auxiliary_clients_per_tick(self, tmp_path):
-        # Regression: auxiliary clients bound to the cron worker's dead
-        # event loop must be reaped each tick. Without this, ``_client_cache``
-        # holds onto transports whose underlying sockets can no longer be
-        # closed (their loop is gone), leaking one fd batch per cron run.
-        job = {
-            "id": "aux-clean-job",
-            "name": "aux-clean",
-            "prompt": "hello",
-        }
-        fake_db = MagicMock()
-
-        with patch("cron.scheduler._marlow_home", tmp_path), \
-             patch("cron.scheduler._resolve_origin", return_value=None), \
-             patch("dotenv.load_dotenv"), \
-             patch("marlow_state.SessionDB", return_value=fake_db), \
-             patch(
-                 "marlow_cli.runtime_provider.resolve_runtime_provider",
-                 return_value={
-                     "api_key": "***",
-                     "base_url": "https://example.invalid/v1",
-                     "provider": "openrouter",
-                     "api_mode": "chat_completions",
-                 },
-             ), \
-             patch("run_agent.AIAgent") as mock_agent_cls, \
-             patch("agent.auxiliary_client.cleanup_stale_async_clients") as cleanup_mock:
-            mock_agent = MagicMock()
-            mock_agent.run_conversation.return_value = {"final_response": "ok"}
-            mock_agent_cls.return_value = mock_agent
-
-            success, _output, _final_response, _error = run_job(job)
-
-        assert success is True
-        cleanup_mock.assert_called_once()
 
     def _make_run_job_patches(self, tmp_path):
         """Common patches for run_job tests."""
@@ -1477,91 +1454,8 @@ class TestRunJobConfigEnvVarExpansion:
         "api_mode": "chat_completions",
     }
 
-    def test_model_env_ref_in_config_yaml_is_expanded(self, tmp_path, monkeypatch):
-        """${VAR} in config.yaml model: is expanded using env after .env is loaded."""
-        (tmp_path / "config.yaml").write_text("model: ${_MARLOW_TEST_CRON_MODEL}\n")
-        monkeypatch.setenv("_MARLOW_TEST_CRON_MODEL", "gpt-4o-mini-cron-test")
 
-        job = {"id": "env-job", "name": "env test", "prompt": "hi"}
-        fake_db = MagicMock()
 
-        with patch("cron.scheduler._marlow_home", tmp_path), \
-             patch("cron.scheduler._resolve_origin", return_value=None), \
-             patch("dotenv.load_dotenv"), \
-             patch("marlow_state.SessionDB", return_value=fake_db), \
-             patch("marlow_cli.runtime_provider.resolve_runtime_provider",
-                   return_value=self._RUNTIME), \
-             patch("run_agent.AIAgent") as mock_agent_cls:
-            mock_agent = MagicMock()
-            mock_agent.run_conversation.return_value = {"final_response": "ok"}
-            mock_agent_cls.return_value = mock_agent
-            success, _, _, error = run_job(job)
-
-        assert success is True
-        assert error is None
-        kwargs = mock_agent_cls.call_args.kwargs
-        assert kwargs["model"] == "gpt-4o-mini-cron-test", (
-            f"Expected model='gpt-4o-mini-cron-test', got {kwargs['model']!r}. "
-            "config.yaml ${VAR} was not expanded in the cron execution path."
-        )
-
-    def test_fallback_provider_env_ref_in_config_yaml_is_expanded(self, tmp_path, monkeypatch):
-        """${VAR} in config.yaml fallback_providers model: is expanded."""
-        (tmp_path / "config.yaml").write_text(
-            "fallback_providers:\n"
-            "  - provider: openrouter\n"
-            "    model: ${_MARLOW_TEST_CRON_FALLBACK}\n"
-        )
-        monkeypatch.setenv("_MARLOW_TEST_CRON_FALLBACK", "gpt-4o-fallback-test")
-
-        job = {"id": "fb-job", "name": "fallback test", "prompt": "hi"}
-        fake_db = MagicMock()
-
-        with patch("cron.scheduler._marlow_home", tmp_path), \
-             patch("cron.scheduler._resolve_origin", return_value=None), \
-             patch("dotenv.load_dotenv"), \
-             patch("marlow_state.SessionDB", return_value=fake_db), \
-             patch("marlow_cli.runtime_provider.resolve_runtime_provider",
-                   return_value=self._RUNTIME), \
-             patch("run_agent.AIAgent") as mock_agent_cls:
-            mock_agent = MagicMock()
-            mock_agent.run_conversation.return_value = {"final_response": "ok"}
-            mock_agent_cls.return_value = mock_agent
-            run_job(job)
-
-        kwargs = mock_agent_cls.call_args.kwargs
-        fb = kwargs.get("fallback_providers") or []
-        fb_list = fb if isinstance(fb, list) else [fb]
-        expanded = [e.get("model") for e in fb_list if isinstance(e, dict)]
-        assert "gpt-4o-fallback-test" in expanded, (
-            f"Expected expanded fallback model in {expanded!r}. "
-            "config.yaml ${VAR} in fallback_providers was not expanded."
-        )
-
-    def test_unexpanded_ref_passthrough_when_var_unset(self, tmp_path, monkeypatch):
-        """When the env var is not set, the literal ${VAR} is kept verbatim (not crashed)."""
-        (tmp_path / "config.yaml").write_text("model: ${_MARLOW_TEST_CRON_UNSET_VAR}\n")
-        monkeypatch.delenv("_MARLOW_TEST_CRON_UNSET_VAR", raising=False)
-
-        job = {"id": "unset-job", "name": "unset var test", "prompt": "hi"}
-        fake_db = MagicMock()
-
-        with patch("cron.scheduler._marlow_home", tmp_path), \
-             patch("cron.scheduler._resolve_origin", return_value=None), \
-             patch("dotenv.load_dotenv"), \
-             patch("marlow_state.SessionDB", return_value=fake_db), \
-             patch("marlow_cli.runtime_provider.resolve_runtime_provider",
-                   return_value=self._RUNTIME), \
-             patch("run_agent.AIAgent") as mock_agent_cls:
-            mock_agent = MagicMock()
-            mock_agent.run_conversation.return_value = {"final_response": "ok"}
-            mock_agent_cls.return_value = mock_agent
-            success, _, _, error = run_job(job)
-
-        assert success is True
-        kwargs = mock_agent_cls.call_args.kwargs
-        # Unresolved refs are kept verbatim — _expand_env_vars contract
-        assert kwargs["model"] == "${_MARLOW_TEST_CRON_UNSET_VAR}"
 
 
 

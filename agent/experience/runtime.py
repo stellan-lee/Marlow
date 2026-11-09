@@ -224,8 +224,6 @@ def prepare_decision_capture_turn(
     origin = normalize_turn_origin(turn_origin)
     if origin not in {TurnOrigin.CLASSIC_CLI, TurnOrigin.TELEGRAM}:
         return None
-    if getattr(agent, "api_mode", None) == "codex_app_server":
-        return None
     if not isinstance(raw_user_message, str) or not raw_user_message.strip():
         return None
     try:
@@ -384,8 +382,6 @@ def prepare_experience_turn(
 
     origin = normalize_turn_origin(turn_origin)
     if not origin.experience_eligible:
-        return None
-    if getattr(agent, "api_mode", None) == "codex_app_server":
         return None
     if not isinstance(raw_user_message, str) or not raw_user_message.strip():
         return None
