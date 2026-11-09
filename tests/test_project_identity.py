@@ -50,7 +50,7 @@ def test_removed_project_endpoints_do_not_return():
         REPO_ROOT / "marlow_cli" / "banner.py",
         REPO_ROOT / "marlow_cli" / "config.py",
         REPO_ROOT / "agent" / "prompt_builder.py",
-        REPO_ROOT / "skills" / "autonomous-ai-agents" / "marlow-agent" / "SKILL.md",
+        REPO_ROOT / ".agents" / "skills" / "marlow-agent" / "SKILL.md",
     )
 
     for path in checked:

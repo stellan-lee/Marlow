@@ -1,7 +1,6 @@
 """Shared slash command helpers for skills.
 
-Shared between CLI (cli.py) and gateway (gateway/run.py) so both surfaces
-can invoke skills via /skill-name commands.
+Shared by Gateway slash commands and explicit skill invocation.
 """
 
 import json
@@ -57,6 +56,7 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
         return None
 
     try:
+        from agent.bundled_skills import iter_on_demand_skills
         from tools.skills_tool import SKILLS_DIR, skill_view
         from agent.skill_utils import get_external_skills_dirs
 
@@ -87,6 +87,10 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
                     normalized = str(identifier_path.resolve().relative_to(SKILLS_DIR.resolve()))
                 except Exception:
                     normalized = raw_identifier
+            if "/" not in normalized and next(iter_on_demand_skills(normalized), None):
+                # Preserve an explicitly selected top-level installed path
+                # when its directory name overlaps a bare catalog name.
+                normalized = f"./{normalized}"
         else:
             normalized = raw_identifier.lstrip("/")
 
@@ -341,6 +345,27 @@ def get_skill_commands() -> Dict[str, Dict[str, Any]]:
     return _skill_commands
 
 
+def get_skill_command(cmd_key: str) -> Optional[Dict[str, Any]]:
+    """Resolve an explicit command, falling back to the on-demand catalog."""
+    installed = get_skill_commands().get(cmd_key)
+    if installed is not None:
+        return installed
+
+    from agent.bundled_skills import iter_on_demand_skills
+    from agent.skill_utils import parse_frontmatter, skill_matches_platform
+
+    skill_file = next(iter_on_demand_skills(cmd_key.lstrip("/")), None)
+    if skill_file is None:
+        return None
+    try:
+        frontmatter, _ = parse_frontmatter(skill_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError):
+        return None
+    if not skill_matches_platform(frontmatter):
+        return None
+    return {"name": skill_file.parent.name}
+
+
 def reload_skills() -> Dict[str, Any]:
     """Re-scan the skills directory and return a diff of what changed.
 
@@ -413,16 +438,15 @@ def resolve_skill_command_key(command: str) -> Optional[str]:
     spaces and underscores to hyphens when building the key. Hyphens and
     underscores are treated interchangeably in user input: this matches
     ``_check_unavailable_skill`` and accommodates Telegram bot-command names
-    (which disallow hyphens, so ``/claude-code`` is registered as
-    ``/claude_code`` and comes back in the underscored form).
+    (which disallow hyphens and return the underscored form).
 
-    Returns the matching ``/slug`` key from ``get_skill_commands()`` or
+    Returns the matching installed or on-demand ``/slug`` key or
     ``None`` if no match.
     """
     if not command:
         return None
     cmd_key = f"/{command.replace('_', '-')}"
-    return cmd_key if cmd_key in get_skill_commands() else None
+    return cmd_key if get_skill_command(cmd_key) is not None else None
 
 
 def build_skill_invocation_message(
@@ -441,18 +465,19 @@ def build_skill_invocation_message(
     Returns:
         The formatted message string, or None if the skill wasn't found.
     """
-    commands = get_skill_commands()
-    skill_info = commands.get(cmd_key)
+    skill_info = get_skill_command(cmd_key)
     if not skill_info:
         return None
 
-    loaded = _load_skill_payload(skill_info["skill_dir"], task_id=task_id)
+    loaded = _load_skill_payload(
+        skill_info.get("skill_dir") or skill_info["name"], task_id=task_id
+    )
     if not loaded:
         return None
 
     loaded_skill, skill_dir, skill_name = loaded
 
-    # Track active usage for Curator lifecycle management (#17782)
+    # Track explicit skill use.
     try:
         from tools.skill_usage import bump_use
         bump_use(skill_name)

@@ -96,7 +96,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
-    # Pointer to the marlow-agent skill + docs for user questions about Marlow itself.
+    # Product documentation for questions about Marlow itself.
     stable_parts.append(MARLOW_AGENT_HELP_GUIDANCE)
 
     # Universal task-completion / no-fabrication guidance.  Applied to ALL

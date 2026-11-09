@@ -50,10 +50,10 @@ def save_disabled_skills(config: dict, disabled: Set[str], platform: Optional[st
 # ─── Skill Discovery ─────────────────────────────────────────────────────────
 
 def _list_all_skills() -> List[dict]:
-    """Return all installed skills (ignoring disabled state)."""
+    """Return installed and on-demand skills for explicit configuration."""
     try:
         from tools.skills_tool import _find_all_skills
-        return _find_all_skills(skip_disabled=True)
+        return _find_all_skills(skip_disabled=True, include_on_demand=True)
     except Exception:
         return []
 
@@ -130,7 +130,7 @@ def skills_command(args=None):
     skills = _list_all_skills()
 
     if not skills:
-        print(color("  No skills installed.", Colors.DIM))
+        print(color("  No skills available.", Colors.DIM))
         return
 
     # Step 1: Select platform

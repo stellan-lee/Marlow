@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from agent.bundled_skills import is_unchanged_legacy_skill
 from marlow_constants import get_config_path, get_skills_dir
 
 logger = logging.getLogger(__name__)
@@ -42,29 +43,34 @@ EXCLUDED_SKILL_DIRS = frozenset(
 )
 
 
-def is_excluded_skill_path(path) -> bool:
-    """True if any component of *path* is in EXCLUDED_SKILL_DIRS.
+def is_excluded_skill_path(
+    path, *, skills_dir: Path | None = None, explicit: bool = False
+) -> bool:
+    """True for excluded directories and unmodified legacy bundled copies.
 
     Use this on every SKILL.md path produced by ``rglob`` to prune
     dependency, virtualenv, VCS, and cache directories. Centralising the
     check here keeps every skill-scanning site in sync with the shared
     exclusion set.
 
-    Accepts a Path or string.
+    Explicit path lookup allows custom skills in directories such as
+    .archive while still hiding verified legacy bundled copies.
     """
     try:
         parts = path.parts  # Path
     except AttributeError:
         from pathlib import PurePath
         parts = PurePath(str(path)).parts
-    if any(part in EXCLUDED_SKILL_DIRS for part in parts):
+    if not explicit and any(part in EXCLUDED_SKILL_DIRS for part in parts):
         return True
+    profile_skills = skills_dir if skills_dir is not None else get_skills_dir()
     if "macos-computer-use" in parts:
         # Older releases copied this bundled skill into the profile. Retire
         # that location from discovery while leaving its files on disk.
-        retired = get_skills_dir() / "apple" / "macos-computer-use"
-        return Path(path).is_relative_to(retired)
-    return False
+        retired = profile_skills / "apple" / "macos-computer-use"
+        if Path(path).is_relative_to(retired):
+            return True
+    return is_unchanged_legacy_skill(Path(path), profile_skills)
 
 
 # ── Lazy YAML loader ─────────────────────────────────────────────────────

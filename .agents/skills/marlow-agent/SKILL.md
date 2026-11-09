@@ -1,18 +1,15 @@
 ---
 name: marlow-agent
-description: "Configure, extend, or contribute to Marlow Agent."
-version: 2.1.0
-author: Marlow Agent + Teknium
+description: "Develop and troubleshoot the Marlow Agent checkout."
 license: MIT
-platforms: [linux, macos]
 metadata:
-  marlow:
-    tags: [marlow, setup, configuration, multi-agent, spawning, cli, gateway, development]
-    homepage: https://github.com/stellan-lee/Marlow
-    related_skills: [claude-code, codex, opencode]
+  author: Teknium and Marlow Agent
+  version: "2.1.0"
 ---
 
 # Marlow Agent
+
+This skill is for developers working in the Marlow source checkout.
 
 Marlow Agent is an open-source AI agent framework that runs in your terminal and messaging platforms. It provides autonomous coding and task execution through tool calling, using Codex OAuth or a custom/local OpenAI-compatible endpoint on Linux and macOS.
 
@@ -36,9 +33,6 @@ People use Marlow for software development, research, system administration, dat
 ```bash
 # Install
 curl -fsSL https://raw.githubusercontent.com/stellan-lee/Marlow/main/scripts/install.sh | bash
-
-# Interactive chat (default)
-marlow
 
 # Single query
 marlow chat -q "What is the capital of France?"
@@ -242,7 +236,8 @@ The registry of record is `marlow_cli/commands.py` — every consumer
 
 ### Tools & Skills
 ```
-/skill <name>        Load a skill into session
+/<skill-name>       Load a skill into session
+/learn              Request creation of a skill
 /reload-skills       Re-scan ~/.marlow/skills/ for added/removed skills
 /reload-mcp          Reload MCP servers
 ```
@@ -523,7 +518,7 @@ Run `marlow cron --help` for current usage.
 ### Skills not showing
 1. `marlow skills` — verify local skill configuration
 2. `marlow skills config` — check platform enablement
-3. Load explicitly: `/skill name` or `marlow -s name`
+3. Load explicitly by name with `skill_view` or a Gateway `/<skill-name>` command
 
 ### Gateway issues
 Check logs first:
@@ -664,9 +659,6 @@ Factual guidance about the host OS, user home, cwd, terminal backend, and shell 
 - **Local terminal backend** → emit host info (OS, `$HOME`, cwd).
 - **Remote terminal backend** (`docker` or `ssh`) → **suppress** host info entirely and describe only the backend. A live `uname`/`whoami`/`pwd` probe runs inside the backend via `tools.environments.get_environment(...).execute(...)`, cached per process in `_BACKEND_PROBE_CACHE`, with a static fallback if the probe times out.
 - **Key fact for prompt authoring:** when `TERMINAL_ENV != "local"`, *every* file tool (`read_file`, `write_file`, `patch`, `search_files`) runs inside the backend container, not on the host. The system prompt must never describe the host in that case — the agent can't touch it.
-
-Full design notes, the exact emitted strings, and testing pitfalls:
-`references/prompt-builder-environment-hints.md`.
 
 ### Commit Conventions
 

@@ -9,6 +9,7 @@ import json
 import io
 import tarfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -30,8 +31,6 @@ from marlow_cli.profiles import (
     import_profile,
     _get_profiles_root,
     _get_default_marlow_home,
-    seed_profile_skills,
-    has_bundled_skills_opt_out,
     NO_BUNDLED_SKILLS_MARKER,
 )
 
@@ -157,6 +156,17 @@ class TestCreateProfile:
         for subdir in ["memories", "sessions", "skills", "logs",
                         "plans", "workspace", "cron"]:
             assert (profile_dir / subdir).is_dir(), f"Missing subdir: {subdir}"
+
+    def test_cli_creates_profile_with_empty_skills_directory(self, profile_env):
+        from marlow_cli.main import cmd_profile
+
+        cmd_profile(
+            SimpleNamespace(profile_action="create", profile_name="coder", no_alias=True)
+        )
+
+        profile_dir = get_profile_dir("coder")
+        assert list((profile_dir / "skills").iterdir()) == []
+        assert not (profile_dir / NO_BUNDLED_SKILLS_MARKER).exists()
 
     def test_duplicate_raises_file_exists(self, profile_env):
         create_profile("coder", no_alias=True)
@@ -316,7 +326,7 @@ class TestCreateProfile:
 class TestNoSkillsOptOut:
     """Tests for `marlow profile create --no-skills` and the opt-out marker."""
 
-    def test_no_skills_writes_marker_and_skips_seeding(self, profile_env):
+    def test_no_skills_writes_marker_and_leaves_directory_empty(self, profile_env):
         profile_dir = create_profile("orchestrator", no_alias=True, no_skills=True)
 
         # Marker file is present
@@ -324,12 +334,6 @@ class TestNoSkillsOptOut:
         assert marker.is_file(), "expected .no-bundled-skills marker in profile root"
         assert "--no-skills" in marker.read_text()
 
-        # has_bundled_skills_opt_out() agrees
-        assert has_bundled_skills_opt_out(profile_dir) is True
-
-        # skills/ dir exists (profile bootstrapping still creates the dir) but
-        # contains nothing yet because create_profile itself doesn't seed.
-        assert (profile_dir / "skills").is_dir()
         assert list((profile_dir / "skills").iterdir()) == []
 
     def test_no_skills_conflicts_with_clone(self, profile_env):
@@ -349,74 +353,6 @@ class TestNoSkillsOptOut:
                 no_skills=True,
                 clone_all=True,
             )
-
-    def test_seed_profile_skills_respects_marker(self, profile_env):
-        """seed_profile_skills() must no-op on opted-out profiles even when
-        called directly (e.g. by `marlow update`'s all-profile sync loop)."""
-        profile_dir = create_profile("orchestrator", no_alias=True, no_skills=True)
-
-        # Call seed_profile_skills() directly — it should NOT invoke subprocess,
-        # NOT modify the skills/ dir, and return a dict with skipped_opt_out=True.
-        result = seed_profile_skills(profile_dir, quiet=True)
-
-        assert result is not None
-        assert result.get("skipped_opt_out") is True
-        assert result.get("copied") == []
-        # skills/ stays empty — no subprocess ran
-        assert list((profile_dir / "skills").iterdir()) == []
-
-    def test_default_profile_gets_skills_seeded(self, profile_env, monkeypatch):
-        """Sanity: without --no-skills, seed_profile_skills() runs the real
-        subprocess path. Mock the subprocess so the test is hermetic, and
-        just confirm the marker is NOT checked in the non-opt-out case."""
-        import subprocess as _sp
-
-        profile_dir = create_profile("coder", no_alias=True)
-        # No marker — not opted out
-        assert not (profile_dir / NO_BUNDLED_SKILLS_MARKER).exists()
-        assert has_bundled_skills_opt_out(profile_dir) is False
-
-        # Mock subprocess.run to avoid actually running skill sync in tests
-        calls = []
-
-        def fake_run(*args, **kwargs):
-            calls.append(args)
-            return _sp.CompletedProcess(
-                args=args, returncode=0, stdout='{"copied": ["x"]}', stderr=""
-            )
-
-        monkeypatch.setattr("subprocess.run", fake_run)
-        result = seed_profile_skills(profile_dir, quiet=True)
-
-        # Subprocess was invoked (the opt-out branch did NOT short-circuit)
-        assert len(calls) == 1
-        assert result == {"copied": ["x"]}
-
-    def test_delete_marker_re_enables_seeding(self, profile_env, monkeypatch):
-        """Deleting .no-bundled-skills opts the profile back in."""
-        import subprocess as _sp
-
-        profile_dir = create_profile("orchestrator", no_alias=True, no_skills=True)
-        assert has_bundled_skills_opt_out(profile_dir) is True
-
-        # First call: opted out, returns skipped dict without touching subprocess
-        called = []
-        monkeypatch.setattr(
-            "subprocess.run",
-            lambda *a, **kw: (called.append(a), _sp.CompletedProcess(
-                args=a, returncode=0, stdout='{"copied": []}', stderr=""
-            ))[1],
-        )
-        r1 = seed_profile_skills(profile_dir, quiet=True)
-        assert r1.get("skipped_opt_out") is True
-        assert called == []
-
-        # Delete marker → next call runs the real path
-        (profile_dir / NO_BUNDLED_SKILLS_MARKER).unlink()
-        assert has_bundled_skills_opt_out(profile_dir) is False
-        r2 = seed_profile_skills(profile_dir, quiet=True)
-        assert r2 == {"copied": []}
-        assert len(called) == 1
 
 
 # ===================================================================

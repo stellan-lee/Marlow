@@ -222,15 +222,14 @@ def test_usage_report_covers_retained_provenance(skills_home):
 
 
 def test_legacy_pin_and_suppression_survive_tracking(skills_home):
-    from tools.skill_usage import bump_view, get_record, read_suppressed_names, save_usage
+    from tools.skill_usage import bump_view, get_record, save_usage
 
     save_usage({"custom": {"pinned": True, "state": "stale"}})
-    (skills_home / "skills" / ".curator_suppressed").write_text(
-        "retired-bundled-skill\n", encoding="utf-8"
-    )
+    suppression_file = skills_home / "skills" / ".curator_suppressed"
+    suppression_file.write_text("retired-bundled-skill\n", encoding="utf-8")
 
     bump_view("custom")
 
     assert get_record("custom")["pinned"] is True
     assert get_record("custom")["state"] == "stale"
-    assert read_suppressed_names() == {"retired-bundled-skill"}
+    assert suppression_file.read_text(encoding="utf-8") == "retired-bundled-skill\n"

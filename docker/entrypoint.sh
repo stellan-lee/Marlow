@@ -9,7 +9,7 @@
 # orchestration script that invokes it inside the container), forward to
 # the stage2 hook for parity with the pre-s6 entrypoint behavior. The
 # stage2 hook only handles cont-init bootstrap (UID remap, chown, config
-# seed, skills sync); it does NOT exec the CMD. Callers that depended
+# seed); it does NOT exec the CMD. Callers that depended
 # on the pre-s6 contract "entrypoint.sh sets up state then execs marlow"
 # will see the bootstrap happen but the CMD will not run from this shim.
 #

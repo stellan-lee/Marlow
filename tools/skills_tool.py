@@ -84,7 +84,7 @@ from agent.skill_utils import EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS
 logger = logging.getLogger(__name__)
 
 
-# All skills live in ~/.marlow/skills/ (seeded from bundled skills/ on install).
+# Profile-owned skills live in ~/.marlow/skills/.
 # This is the single source of truth -- agent edits, hub installs, and bundled
 # skills all coexist here without polluting the git repo.
 MARLOW_HOME = get_marlow_home()
@@ -546,17 +546,21 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
         return False
 
 
-def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
+def _find_all_skills(
+    *, skip_disabled: bool = False, include_on_demand: bool = False
+) -> List[Dict[str, Any]]:
     """Recursively find all skills in ~/.marlow/skills/ and external dirs.
 
     Args:
         skip_disabled: If True, return ALL skills regardless of disabled
             state (used by ``marlow skills`` config UI). Default False
             filters out disabled skills.
+        include_on_demand: Include the shipped catalog in explicit lookups.
 
     Returns:
         List of skill metadata dicts (name, description, category).
     """
+    from agent.bundled_skills import iter_on_demand_skills
     from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
 
     skills = []
@@ -571,8 +575,15 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
         dirs_to_scan.append(SKILLS_DIR)
     dirs_to_scan.extend(get_external_skills_dirs())
 
-    for scan_dir in dirs_to_scan:
-        for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
+    indexes = [
+        (iter_skill_index_files(scan_dir, "SKILL.md"), False)
+        for scan_dir in dirs_to_scan
+    ]
+    if include_on_demand:
+        indexes.append((iter_on_demand_skills(), True))
+
+    for skill_files, on_demand in indexes:
+        for skill_md in skill_files:
             if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
                 continue
 
@@ -602,7 +613,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                 if len(description) > MAX_DESCRIPTION_LENGTH:
                     description = description[:MAX_DESCRIPTION_LENGTH - 3] + "..."
 
-                category = _get_category_from_path(skill_md)
+                category = skill_dir.parent.name if on_demand else _get_category_from_path(skill_md)
 
                 seen_names.add(name)
                 skills.append({
@@ -643,20 +654,8 @@ def skills_list(category: str = None, task_id: str = None) -> str:
         JSON string with minimal skill info: name, description, category
     """
     try:
-        if not SKILLS_DIR.exists():
-            SKILLS_DIR.mkdir(parents=True, exist_ok=True)
-            return json.dumps(
-                {
-                    "success": True,
-                    "skills": [],
-                    "categories": [],
-                    "message": f"No skills found. Skills directory created at {display_marlow_home()}/skills/",
-                },
-                ensure_ascii=False,
-            )
-
-        # Find all skills
-        all_skills = _find_all_skills()
+        SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+        all_skills = _find_all_skills(include_on_demand=True)
 
         if not all_skills:
             return json.dumps(
@@ -893,7 +892,12 @@ def skill_view(
             if bare:
                 local_category_name = f"{namespace}/{bare}"
 
-        from agent.skill_utils import get_external_skills_dirs
+        from agent.bundled_skills import iter_on_demand_skills
+        from agent.skill_utils import (
+            get_external_skills_dirs,
+            is_excluded_skill_path,
+            iter_skill_index_files,
+        )
 
         # Build list of all skill directories to search
         all_dirs = []
@@ -901,17 +905,10 @@ def skill_view(
             all_dirs.append(SKILLS_DIR)
         all_dirs.extend(get_external_skills_dirs())
 
-        if not all_dirs:
-            return json.dumps(
-                {
-                    "success": False,
-                    "error": "Skills directory does not exist yet. It will be created on first install.",
-                },
-                ensure_ascii=False,
-            )
-
         skill_dir = None
         skill_md = None
+        on_demand = next(iter_on_demand_skills(local_category_name or name), None)
+        match_declared_name = on_demand is not None and name == on_demand.parent.name
 
         # Collision detection: collect ALL candidates across every dir using
         # every lookup strategy (direct path, recursive by parent dir name,
@@ -919,12 +916,27 @@ def skill_view(
         # the caller — silent shadowing of a local skill by a same-named
         # external skill is a real bug class (`/skills` shows one, agent
         # loaded the other) so we surface it loudly instead of guessing.
-        from agent.skill_utils import iter_skill_index_files
-
         candidates: List[Tuple[Optional[Path], Path]] = []  # (skill_dir, skill_md)
         seen_md: set = set()
 
         def _record(sd: Optional[Path], smd: Path) -> None:
+            if is_excluded_skill_path(smd, explicit=True):
+                return
+            if match_declared_name:
+                # The catalog uses declared names. Match installed candidates
+                # by the same identity and platform used by the skill index.
+                fallback_name = sd.name if sd is not None else smd.stem
+                try:
+                    raw = smd.read_text(encoding="utf-8")[:4000]
+                except (OSError, UnicodeError):
+                    if fallback_name != name:
+                        return
+                else:
+                    frontmatter, _ = _parse_frontmatter(raw)
+                    if not skill_matches_platform(frontmatter):
+                        return
+                    if frontmatter.get("name", fallback_name) != name:
+                        return
             try:
                 key = smd.resolve()
             except Exception:
@@ -956,7 +968,8 @@ def skill_view(
             # Strategy 2: recursive by directory name (catches nested skills
             # like "foundations/runtime/explore-codebase" called by bare name).
             for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
-                if found_skill_md.parent.name == name:
+                same_folder = found_skill_md.parent.name == name
+                if same_folder or match_declared_name:
                     _record(found_skill_md.parent, found_skill_md)
 
             # Strategy 3: legacy flat <name>.md files anywhere under the dir.
@@ -988,11 +1001,17 @@ def skill_view(
                 ensure_ascii=False,
             )
 
+        packaged_skill = on_demand if not candidates else None
         if candidates:
             skill_dir, skill_md = candidates[0]
+        elif packaged_skill is not None:
+            skill_dir, skill_md = packaged_skill.parent, packaged_skill
 
         if not skill_md or not skill_md.exists():
-            available = [s["name"] for s in _sort_skills(_find_all_skills())[:20]]
+            available = [
+                s["name"]
+                for s in _sort_skills(_find_all_skills(include_on_demand=True))[:20]
+            ]
             return json.dumps(
                 {
                     "success": False,
@@ -1018,9 +1037,11 @@ def skill_view(
         # Security: warn if skill is loaded from outside trusted directories
         # (local skills dir + configured external_dirs are all trusted)
         _outside_skills_dir = True
-        _trusted_dirs = [SKILLS_DIR.resolve()]
+        _trusted_dirs = []
         try:
-            _trusted_dirs.extend(d.resolve() for d in all_dirs[1:])
+            _trusted_dirs.extend(d.resolve() for d in all_dirs)
+            if packaged_skill is not None:
+                _trusted_dirs.append(packaged_skill.parent.resolve())
         except Exception:
             pass
         for _td in _trusted_dirs:

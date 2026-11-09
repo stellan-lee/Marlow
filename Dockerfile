@@ -200,9 +200,8 @@ RUN find /etc/s6-overlay/s6-rc.d \
         -exec rm -rf {} +
 COPY docker/s6-rc.d/ /etc/s6-overlay/s6-rc.d/
 
-# stage2-hook handles UID/GID remap, volume chown, config seeding,
-# skills sync — all the work the old entrypoint.sh did before
-# `exec marlow`. Wired in as cont-init.d/01- so it
+# stage2-hook handles UID/GID remap, volume chown, and config seeding.
+# Wired in as cont-init.d/01- so it
 # runs before user services start.
 #
 # 02-reconcile-profiles re-creates per-profile gateway s6 service

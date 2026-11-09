@@ -100,7 +100,6 @@ def test_query_keeps_raw_text_session_and_checkpoint(tmp_path, monkeypatch, caps
     monkeypatch.setattr("marlow_state.SessionDB", lambda: db)
     monkeypatch.setattr("marlow_cli.config.load_config", lambda: {"agent": {}, "memory": {}})
     monkeypatch.setattr("marlow_cli.config.read_raw_config", lambda: {})
-    monkeypatch.setattr("tools.skills_sync.sync_skills", lambda **_kwargs: None)
     wait_for_mcp = MagicMock()
     monkeypatch.setattr("marlow_cli.mcp_startup.wait_for_mcp_discovery", wait_for_mcp)
     monkeypatch.setattr("marlow_cli.tools_config._get_platform_tools", lambda *_args: {"file"})
