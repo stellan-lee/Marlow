@@ -1211,7 +1211,7 @@ class TestAdapterBehavior(unittest.TestCase):
         )
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_extract_audio_message_downloads_and_caches(self):
+    def test_extract_voice_note_without_downloading_audio(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
@@ -1228,9 +1228,10 @@ class TestAdapterBehavior(unittest.TestCase):
         text, msg_type, media_urls, media_types, _mentions = asyncio.run(adapter._extract_message_content(message))
 
         self.assertEqual(text, "")
-        self.assertEqual(msg_type.value, "audio")
-        self.assertEqual(media_urls, ["/tmp/feishu-audio.ogg"])
-        self.assertEqual(media_types, ["audio/ogg"])
+        self.assertEqual(msg_type.value, "voice")
+        self.assertEqual(media_urls, [])
+        self.assertEqual(media_types, [])
+        adapter._download_feishu_message_resource.assert_not_awaited()
 
     @patch.dict(os.environ, {}, clear=True)
     def test_extract_file_message_downloads_and_caches(self):
@@ -2284,7 +2285,7 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(captured["message_request"].request_body.content, '{"file_key": "file_video_123"}')
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_send_voice_uploads_opus_and_sends_audio_message(self):
+    def test_send_document_uploads_opus_as_ordinary_file(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
@@ -2325,13 +2326,13 @@ class TestAdapterBehavior(unittest.TestCase):
 
         try:
             with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
-                result = asyncio.run(adapter.send_voice(chat_id="oc_chat", audio_path=audio_path))
+                result = asyncio.run(adapter.send_document(chat_id="oc_chat", file_path=audio_path))
         finally:
             os.unlink(audio_path)
 
         self.assertTrue(result.success)
-        self.assertEqual(captured["upload_request"].request_body.file_type, "opus")
-        self.assertEqual(captured["message_request"].request_body.msg_type, "audio")
+        self.assertEqual(captured["upload_request"].request_body.file_type, "stream")
+        self.assertEqual(captured["message_request"].request_body.msg_type, "file")
         self.assertEqual(captured["message_request"].request_body.content, '{"file_key": "file_audio_123"}')
 
     @patch.dict(os.environ, {}, clear=True)

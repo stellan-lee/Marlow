@@ -24,14 +24,12 @@ logger = logging.getLogger(__name__)
 
 _ANSI_RESET = "\033[0m"
 
-# Diff colors — resolved lazily from the skin engine so they adapt
-# to light/dark themes.  Falls back to sensible defaults on import
-# failure.  We cache after first resolution for performance.
+# Fixed ANSI colors for inline diffs.
 _diff_colors_cached: dict[str, str] | None = None
 
 
 def _diff_ansi() -> dict[str, str]:
-    """Return ANSI escapes for diff display, resolved from the active skin."""
+    """Return ANSI escapes for diff display, used by the CLI."""
     global _diff_colors_cached
     if _diff_colors_cached is not None:
         return _diff_colors_cached
@@ -43,34 +41,6 @@ def _diff_ansi() -> dict[str, str]:
     minus = "\033[38;2;255;255;255;48;2;120;20;20m"
     plus = "\033[38;2;255;255;255;48;2;20;90;20m"
 
-    try:
-        from marlow_cli.skin_engine import get_active_skin
-        skin = get_active_skin()
-
-        def _hex_fg(key: str, fallback_rgb: tuple[int, int, int]) -> str:
-            h = skin.get_color(key, "")
-            if h and len(h) == 7 and h[0] == "#":
-                r, g, b = int(h[1:3], 16), int(h[3:5], 16), int(h[5:7], 16)
-                return f"\033[38;2;{r};{g};{b}m"
-            r, g, b = fallback_rgb
-            return f"\033[38;2;{r};{g};{b}m"
-
-        dim = _hex_fg("banner_dim", (150, 150, 150))
-        file_c = _hex_fg("session_label", (180, 160, 255))
-        hunk = _hex_fg("session_border", (120, 120, 140))
-        # minus/plus use background colors — derive from ui_error/ui_ok
-        err_h = skin.get_color("ui_error", "#ef5350")
-        ok_h = skin.get_color("ui_ok", "#4caf50")
-        if err_h and len(err_h) == 7:
-            er, eg, eb = int(err_h[1:3], 16), int(err_h[3:5], 16), int(err_h[5:7], 16)
-            # Use a dark tinted version as background
-            minus = f"\033[38;2;255;255;255;48;2;{max(er//2,20)};{max(eg//4,10)};{max(eb//4,10)}m"
-        if ok_h and len(ok_h) == 7:
-            or_, og, ob = int(ok_h[1:3], 16), int(ok_h[3:5], 16), int(ok_h[5:7], 16)
-            plus = f"\033[38;2;255;255;255;48;2;{max(or_//4,10)};{max(og//2,20)};{max(ob//4,10)}m"
-    except Exception:
-        pass
-
     _diff_colors_cached = {
         "dim": dim, "file": file_c, "hunk": hunk,
         "minus": minus, "plus": plus,
@@ -78,7 +48,7 @@ def _diff_ansi() -> dict[str, str]:
     return _diff_colors_cached
 
 
-# Module-level helpers — each call resolves from the active skin lazily.
+
 def _diff_dim():   return _diff_ansi()["dim"]
 def _diff_file():  return _diff_ansi()["file"]
 def _diff_hunk():  return _diff_ansi()["hunk"]
@@ -113,41 +83,8 @@ def get_tool_preview_max_len() -> int:
 
 
 # =========================================================================
-# Skin-aware helpers (lazy import to avoid circular deps)
-# =========================================================================
-
-def _get_skin():
-    """Get the active skin config, or None if not available."""
-    try:
-        from marlow_cli.skin_engine import get_active_skin
-        return get_active_skin()
-    except Exception:
-        return None
-
-
-def get_skin_tool_prefix() -> str:
-    """Get tool output prefix character from active skin."""
-    skin = _get_skin()
-    if skin:
-        return skin.tool_prefix
-    return "┊"
-
-
 def get_tool_emoji(tool_name: str, default: str = "⚡") -> str:
-    """Get the display emoji for a tool.
-
-    Resolution order:
-    1. Active skin's ``tool_emojis`` overrides (if a skin is loaded)
-    2. Tool registry's per-tool ``emoji`` field
-    3. *default* fallback
-    """
-    # 1. Skin override
-    skin = _get_skin()
-    if skin and skin.tool_emojis:
-        override = skin.tool_emojis.get(tool_name)
-        if override:
-            return override
-    # 2. Registry default
+    """Return the registered display emoji or the supplied default."""
     try:
         from tools.registry import registry
         emoji = registry.get_emoji(tool_name, default="")
@@ -155,7 +92,6 @@ def get_tool_emoji(tool_name: str, default: str = "⚡") -> str:
             return emoji
     except Exception:
         pass
-    # 3. Hardcoded fallback
     return default
 
 
@@ -183,7 +119,6 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
         "read_file": "path", "write_file": "path", "patch": "path",
         "search_files": "pattern", "browser_navigate": "url",
         "browser_click": "ref", "browser_type": "text",
-        "image_generate": "prompt", "text_to_speech": "text",
         "vision_analyze": "question", "mixture_of_agents": "user_prompt",
         "skill_view": "name", "skills_list": "category",
         "cronjob": "action",
@@ -590,41 +525,14 @@ class KawaiiSpinner:
 
     @classmethod
     def get_waiting_faces(cls) -> list:
-        """Return waiting faces from the active skin, falling back to KAWAII_WAITING."""
-        try:
-            skin = _get_skin()
-            if skin:
-                faces = skin.spinner.get("waiting_faces", [])
-                if faces:
-                    return faces
-        except Exception:
-            pass
         return cls.KAWAII_WAITING
 
     @classmethod
     def get_thinking_faces(cls) -> list:
-        """Return thinking faces from the active skin, falling back to KAWAII_THINKING."""
-        try:
-            skin = _get_skin()
-            if skin:
-                faces = skin.spinner.get("thinking_faces", [])
-                if faces:
-                    return faces
-        except Exception:
-            pass
         return cls.KAWAII_THINKING
 
     @classmethod
     def get_thinking_verbs(cls) -> list:
-        """Return thinking verbs from the active skin, falling back to THINKING_VERBS."""
-        try:
-            skin = _get_skin()
-            if skin:
-                verbs = skin.spinner.get("thinking_verbs", [])
-                if verbs:
-                    return verbs
-        except Exception:
-            pass
         return cls.THINKING_VERBS
 
     def __init__(self, message: str = "", spinner_type: str = 'dots', print_fn=None):
@@ -706,21 +614,13 @@ class KawaiiSpinner:
                 time.sleep(0.1)
             return
 
-        # Cache skin wings at start (avoid per-frame imports)
-        skin = _get_skin()
-        wings = skin.get_spinner_wings() if skin else []
-
         while self.running:
             if os.getenv("MARLOW_SPINNER_PAUSE"):
                 time.sleep(0.1)
                 continue
             frame = self.spinner_frames[self.frame_idx % len(self.spinner_frames)]
             elapsed = time.time() - self.start_time
-            if wings:
-                left, right = wings[self.frame_idx % len(wings)]
-                line = f"  {left} {frame} {self.message} {right} ({elapsed:.1f}s)"
-            else:
-                line = f"  {frame} {self.message} ({elapsed:.1f}s)"
+            line = f"  {frame} {self.message} ({elapsed:.1f}s)"
             pad = max(self.last_line_len - len(line), 0)
             self._write(f"\r{line}{' ' * pad}", end='', flush=True)
             self.last_line_len = len(line)
@@ -870,7 +770,6 @@ def get_cute_tool_message(
     """
     dur = f"{duration:.1f}s"
     is_failure, failure_suffix = _detect_tool_failure(tool_name, result)
-    skin_prefix = get_skin_tool_prefix()
 
     def _trunc(s, n=40):
         s = str(s)
@@ -887,9 +786,6 @@ def get_cute_tool_message(
         return ("..." + p[-(limit-3):]) if len(p) > limit else p
 
     def _wrap(line: str) -> str:
-        """Apply skin tool prefix and failure suffix."""
-        if skin_prefix != "┊":
-            line = line.replace("┊", skin_prefix, 1)
         if not is_failure:
             return line
         return f"{line}{failure_suffix}"
@@ -993,10 +889,6 @@ def get_cute_tool_message(
         return _wrap(f"┊ 📚 skills    list {args.get('category', 'all')}  {dur}")
     if tool_name == "skill_view":
         return _wrap(f"┊ 📚 skill     {_trunc(args.get('name', ''), 30)}  {dur}")
-    if tool_name == "image_generate":
-        return _wrap(f"┊ 🎨 create    {_trunc(args.get('prompt', ''), 35)}  {dur}")
-    if tool_name == "text_to_speech":
-        return _wrap(f"┊ 🔊 speak     {_trunc(args.get('text', ''), 30)}  {dur}")
     if tool_name == "vision_analyze":
         return _wrap(f"┊ 👁️  vision    {_trunc(args.get('question', ''), 30)}  {dur}")
     if tool_name == "mixture_of_agents":

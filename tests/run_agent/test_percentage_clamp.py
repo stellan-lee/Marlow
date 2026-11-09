@@ -31,27 +31,6 @@ class TestMemoryToolPercentClamp:
         assert pct == 0
 
 
-class TestCLIStatsPercentClamp:
-    """cli.py — /stats command percentage"""
-
-    def test_over_context_clamped_at_100(self):
-        """Tokens exceeding context_length should show max 100%."""
-        last_prompt = 210_000
-        ctx_len = 200_000
-        pct = min(100, (last_prompt / ctx_len * 100)) if ctx_len else 0
-        assert pct == 100
-
-    def test_normal_context(self):
-        last_prompt = 100_000
-        ctx_len = 200_000
-        pct = min(100, (last_prompt / ctx_len * 100)) if ctx_len else 0
-        assert pct == 50.0
-
-    def test_zero_context_length(self):
-        last_prompt = 1000
-        ctx_len = 0
-        pct = min(100, (last_prompt / ctx_len * 100)) if ctx_len else 0
-        assert pct == 0
 
 
 class TestGatewayStatsPercentClamp:
@@ -87,11 +66,6 @@ class TestSourceLinesAreClamped:
             "gateway/run.py stats pct is not clamped with min(100, ...)"
         )
 
-    def test_cli_clamped(self):
-        src = self._read_file("cli.py")
-        assert "min(100, (last_prompt" in src, (
-            "cli.py /stats pct is not clamped with min(100, ...)"
-        )
 
     def test_memory_tool_clamped(self):
         src = self._read_file("tools/memory_tool.py")

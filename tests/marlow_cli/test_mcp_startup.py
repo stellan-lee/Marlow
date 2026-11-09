@@ -10,7 +10,6 @@ import types
 
 import pytest
 
-import cli as cli_mod
 from marlow_cli import main as main_mod
 from marlow_cli import mcp_startup
 
@@ -38,7 +37,6 @@ def _agent_args(**overrides) -> Namespace:
         "cron_command": None,
         "gateway_command": None,
         "mcp_action": None,
-        "tui": False,
     }
     base.update(overrides)
     return Namespace(**base)
@@ -86,81 +84,3 @@ def test_prepare_agent_startup_backgrounds_blocking_mcp_for_chat(monkeypatch):
         assert mcp_startup._mcp_discovery_thread.is_alive()
     finally:
         stop.set()
-
-
-def test_prepare_agent_startup_skips_mcp_bootstrap_for_tui_chat(monkeypatch):
-    calls = {"mcp": 0}
-
-    monkeypatch.setitem(
-        sys.modules,
-        "marlow_cli.plugins",
-        types.SimpleNamespace(discover_plugins=lambda: None),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "marlow_cli.config",
-        types.SimpleNamespace(load_config=lambda: {}),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "agent.shell_hooks",
-        types.SimpleNamespace(register_from_config=lambda *_a, **_k: None),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "tools.mcp_tool",
-        types.SimpleNamespace(
-            discover_mcp_tools=lambda: calls.__setitem__("mcp", calls["mcp"] + 1)
-        ),
-    )
-
-    main_mod._prepare_agent_startup(_agent_args(tui=True))
-
-    assert calls["mcp"] == 0
-    assert mcp_startup._mcp_discovery_thread is None
-
-
-def test_cli_get_tool_definitions_briefly_waits_for_fast_mcp_thread(monkeypatch):
-    thread = threading.Thread(target=lambda: time.sleep(0.05), daemon=True)
-    thread.start()
-    mcp_startup._mcp_discovery_thread = thread
-
-    monkeypatch.setitem(
-        sys.modules,
-        "model_tools",
-        types.SimpleNamespace(get_tool_definitions=lambda *_a, **_k: ["ok"]),
-    )
-
-    start = time.monotonic()
-    result = cli_mod.get_tool_definitions(enabled_toolsets=["web"], quiet_mode=True)
-    elapsed = time.monotonic() - start
-
-    assert result == ["ok"]
-    assert elapsed >= 0.04
-    assert not thread.is_alive()
-
-
-def test_init_agent_waits_for_mcp_discovery_before_agent_build(monkeypatch):
-    waited = {"done": False}
-
-    cli = cli_mod.MarlowCLI(compact=True)
-    cli._session_db = object()
-    cli._resumed = False
-    cli.conversation_history = []
-    cli._install_tool_callbacks = lambda: None
-    cli._ensure_tirith_security = lambda: None
-    cli._ensure_runtime_credentials = lambda: True
-
-    monkeypatch.setattr(
-        mcp_startup,
-        "wait_for_mcp_discovery",
-        lambda timeout=0.75: waited.__setitem__("done", True),
-    )
-
-    def _fake_agent(*_a, **_k):
-        assert waited["done"] is True
-        return types.SimpleNamespace()
-
-    monkeypatch.setattr(cli_mod, "AIAgent", _fake_agent)
-
-    assert cli._init_agent() is True

@@ -182,16 +182,13 @@ authorization model, but the rules below apply uniformly.
   analogous adapters shipped as plugins.
 - **Plugin network surfaces.** Any installed plugin that binds a
   listening socket or calls an external service.
-- **The TUI gateway (`tui_gateway/`).** JSON-RPC backend for the
-  Ink terminal UI, reached over local IPC.
 
 **Uniform rules:**
 
 1. **Authorization is required at every surface that crosses a
    trust boundary.** For messaging and network HTTP surfaces, the
    boundary is the network: authorization means an operator-
-   configured caller allowlist. For editor and local-IPC surfaces
-   (such as the TUI gateway), the boundary is the host's user account:
+   configured caller allowlist. For editor and local-IPC surfaces, the boundary is the host's user account:
    authorization means relying on OS-level access control (file
    permissions) and not exposing the surface
    beyond the local user without an explicit network auth layer.

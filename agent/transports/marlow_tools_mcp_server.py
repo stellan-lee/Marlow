@@ -4,7 +4,7 @@ When the user runs `openai/*` turns through the codex app-server, codex
 owns the loop and builds its own tool list. By default, that means
 Marlow' richer tool surface — web search, browser automation,
 delegate_task subagents, vision analysis, persistent memory, skills,
-cross-session search, image generation, TTS — is unreachable.
+and cross-session search — is unreachable.
 
 This module exposes a curated subset of those Marlow tools to the
 spawned codex subprocess via stdio MCP. Codex registers it as a normal
@@ -17,9 +17,7 @@ Scope (what we expose):
     _snapshot / _scroll / _back / _press /
     _get_images / _console / _vision
   - vision_analyze                       — image inspection by vision model
-  - image_generate                       — image generation
   - skill_view, skills_list              — Marlow' skill library
-  - text_to_speech                       — TTS
 What we DO NOT expose:
   - terminal / shell                     — codex's own shell tool
   - read_file / write_file / patch       — codex's apply_patch + shell
@@ -75,10 +73,8 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "browser_console",
     "browser_vision",
     "vision_analyze",
-    "image_generate",
     "skill_view",
     "skills_list",
-    "text_to_speech",
 )
 
 

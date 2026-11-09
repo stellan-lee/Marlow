@@ -172,11 +172,11 @@ class TestToolResultContentShortCircuit:
         return {
             "_multimodal": True,
             "content": [
-                {"type": "text", "text": "capture mode=som 800x600 app=Safari"},
+                {"type": "text", "text": "browser screenshot 800x600"},
                 {"type": "image_url",
                  "image_url": {"url": f"data:image/png;base64,{png_b64}"}},
             ],
-            "text_summary": "capture mode=som 800x600 app=Safari",
+            "text_summary": "browser screenshot 800x600",
             "meta": {"mode": "som", "width": 800, "height": 600, "elements": 5,
                      "png_bytes": 1024},
         }
@@ -186,7 +186,7 @@ class TestToolResultContentShortCircuit:
         agent._no_list_tool_content_models = set()  # explicit empty
         monkeypatch.setattr(agent, "_model_supports_vision", lambda: True)
         out = agent._tool_result_content_for_active_model(
-            "computer_use", self._multimodal_result()
+            "browser_vision", self._multimodal_result()
         )
         # Native multimodal path: returns the content parts list.
         assert isinstance(out, list)
@@ -197,7 +197,7 @@ class TestToolResultContentShortCircuit:
         agent._no_list_tool_content_models = {("xiaomi", "mimo-v2.5")}
         monkeypatch.setattr(agent, "_model_supports_vision", lambda: True)
         out = agent._tool_result_content_for_active_model(
-            "computer_use", self._multimodal_result()
+            "browser_vision", self._multimodal_result()
         )
         # Short-circuit: a plain string summary, no image_url present.
         assert isinstance(out, str)
@@ -212,7 +212,7 @@ class TestToolResultContentShortCircuit:
         agent._no_list_tool_content_models = {("xiaomi", "mimo-v2.5")}
         monkeypatch.setattr(agent, "_model_supports_vision", lambda: True)
         out = agent._tool_result_content_for_active_model(
-            "computer_use", self._multimodal_result()
+            "browser_vision", self._multimodal_result()
         )
         assert isinstance(out, list)
 
@@ -224,7 +224,7 @@ class TestToolResultContentShortCircuit:
         # Deliberately do not assign _no_list_tool_content_models.
         monkeypatch.setattr(agent, "_model_supports_vision", lambda: True)
         out = agent._tool_result_content_for_active_model(
-            "computer_use", self._multimodal_result()
+            "browser_vision", self._multimodal_result()
         )
         assert isinstance(out, list)
 

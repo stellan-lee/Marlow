@@ -148,7 +148,7 @@ if [ "$needs_chown" = true ]; then
     # Marlow-owned subdirs: recursive chown is safe here because these are
     # created and managed exclusively by marlow (see the s6-setuidgid mkdir
     # -p block below for the canonical list).
-    for sub in cron sessions logs hooks memories skills skins plans workspace home profiles; do
+    for sub in cron sessions logs hooks memories skills plans workspace home profiles; do
         if [ -e "$MARLOW_HOME/$sub" ]; then
             chown -R marlow:marlow "$MARLOW_HOME/$sub" 2>/dev/null || \
                 echo "[stage2] Warning: chown $MARLOW_HOME/$sub failed (rootless container?) — continuing"
@@ -158,10 +158,6 @@ if [ "$needs_chown" = true ]; then
     # is remapped — otherwise:
     #   - .venv: lazy_deps.py cannot install platform packages (discord.py,
     #     telegram, slack, etc.) with EACCES (#15012, #21100)
-    #   - ui-tui: esbuild rebuilds dist/entry.js on every TUI launch (when
-    #     the source mtime is newer than dist/ or when MARLOW_TUI_FORCE_BUILD
-    #     is set) and writes to ui-tui/dist/. Without this chown the new
-    #     marlow UID can't write the build output (#28851).
     #   - node_modules: root-level dependencies (puppeteer, web tooling)
     #     that runtime code may walk/update.
     # The set mirrors the build-time `chown -R marlow:marlow` line in the
@@ -170,7 +166,6 @@ if [ "$needs_chown" = true ]; then
     # concern doesn't apply — recursive is fine.
     chown -R marlow:marlow \
         "$INSTALL_DIR/.venv" \
-        "$INSTALL_DIR/ui-tui" \
         "$INSTALL_DIR/node_modules" \
         2>/dev/null || \
         echo "[stage2] Warning: chown of build trees failed (rootless container?) — continuing"
@@ -236,7 +231,6 @@ as_marlow mkdir -p \
     "$MARLOW_HOME/hooks" \
     "$MARLOW_HOME/memories" \
     "$MARLOW_HOME/skills" \
-    "$MARLOW_HOME/skins" \
     "$MARLOW_HOME/plans" \
     "$MARLOW_HOME/workspace" \
     "$MARLOW_HOME/home"

@@ -85,6 +85,21 @@ class TestCommandBypassActiveSession:
     """Commands that must bypass the active-session guard."""
 
     @pytest.mark.asyncio
+    async def test_voice_only_input_does_not_interrupt_active_session(self):
+        adapter = _make_adapter()
+        session_key = _session_key()
+        active = asyncio.Event()
+        adapter._active_sessions[session_key] = active
+        event = _make_event("")
+        event.message_type = MessageType.VOICE
+
+        await adapter.handle_message(event)
+
+        assert adapter.sent_responses == ["handled:text:"]
+        assert session_key not in adapter._pending_messages
+        assert not active.is_set()
+
+    @pytest.mark.asyncio
     async def test_stop_bypasses_guard(self):
         """/stop must be dispatched directly, not queued."""
         adapter = _make_adapter()
@@ -289,8 +304,6 @@ class TestAllResolvableCommandsBypassGuard:
             ("/model claude-sonnet-4", "model"),
             ("/model", "model"),
             ("/reasoning high", "reasoning"),
-            ("/personality default", "personality"),
-            ("/voice on", "voice"),
             ("/insights 7", "insights"),
             ("/title my session", "title"),
             ("/resume yesterday", "resume"),
@@ -324,7 +337,7 @@ class TestAllResolvableCommandsBypassGuard:
         from marlow_cli.commands import should_bypass_active_session
 
         for cmd in (
-            "model", "reasoning", "personality", "voice", "insights", "title",
+            "model", "reasoning", "insights", "title",
             "resume", "retry", "undo", "compress", "usage",
             "reload-mcp", "sethome", "reset",
         ):

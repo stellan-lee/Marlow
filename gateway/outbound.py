@@ -37,7 +37,6 @@ _ORIGIN_ONLY_KINDS = frozenset({
 
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".3gp"}
-_VOICE_EXTS = {".ogg", ".opus"}
 _AUDIO_EXTS = {".ogg", ".opus", ".mp3", ".wav", ".m4a", ".flac"}
 
 
@@ -254,11 +253,6 @@ async def _send_envelope_with_adapter(
                 "caption": None,
                 "file_name": attachment.name,
             })
-        elif method.__name__ == "send_voice":
-            kwargs.update({
-                "audio_path": attachment.path,
-                "caption": None,
-            })
         elif method.__name__ == "send_video":
             kwargs.update({
                 "video_path": attachment.path,
@@ -357,10 +351,6 @@ def _attachment_method(adapter: Any, attachment: StagedAttachment, *, force_docu
         return adapter.send_image_file if hasattr(adapter, "send_image_file") else adapter.send_document if hasattr(adapter, "send_document") else adapter.send
     if ext in _VIDEO_EXTS:
         return adapter.send_video if hasattr(adapter, "send_video") else adapter.send_document if hasattr(adapter, "send_document") else adapter.send
-    if ext in _VOICE_EXTS:
-        return adapter.send_voice if hasattr(adapter, "send_voice") else adapter.send_document if hasattr(adapter, "send_document") else adapter.send
-    if ext in _AUDIO_EXTS:
-        return adapter.send_document if hasattr(adapter, "send_document") else adapter.send
     return adapter.send_document if hasattr(adapter, "send_document") else adapter.send
 
 
@@ -371,7 +361,7 @@ def _attachment_fallback_content(attachment: StagedAttachment) -> str:
         label = "Image"
     elif ext in _VIDEO_EXTS:
         label = "Video"
-    elif ext in _VOICE_EXTS or ext in _AUDIO_EXTS:
+    elif ext in _AUDIO_EXTS:
         label = "Audio"
     else:
         label = "File"

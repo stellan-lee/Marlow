@@ -189,7 +189,6 @@ discover_builtin_tools()
 # Each entry point now runs discovery explicitly at its own startup:
 #   - gateway/run.py            -> start_gateway() uses run_in_executor
 #   - cli.py, marlow_cli/*      -> inline on startup (no event loop)
-#   - tui_gateway/server.py     -> inline on startup (no event loop)
 #   - interactive client adapters -> background-thread session init
 
 # Plugin tool discovery (user/project/pip plugins)
@@ -222,7 +221,6 @@ _LEGACY_TOOLSET_MAP = {
     "terminal_tools": ["terminal"],
     "vision_tools": ["vision_analyze"],
     "moa_tools": ["mixture_of_agents"],
-    "image_tools": ["image_generate"],
     "skills_tools": ["skills_list", "skill_view", "skill_manage"],
     "browser_tools": [
         "browser_navigate", "browser_snapshot", "browser_click",
@@ -232,7 +230,6 @@ _LEGACY_TOOLSET_MAP = {
     ],
     "cronjob_tools": ["cronjob"],
     "file_tools": ["read_file", "write_file", "patch", "search_files"],
-    "tts_tools": ["text_to_speech"],
 }
 
 

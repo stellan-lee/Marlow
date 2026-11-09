@@ -12,7 +12,7 @@ Lifecycle:
     result = session.run_turn(user_input="hello")         # blocks until turn/completed
     # result.final_text          → assistant text returned to caller
     # result.projected_messages  → list of {role, content, ...} for messages list
-    # result.tool_iterations     → how many tool-shaped items completed (skill nudge counter)
+    # result.tool_iterations     → how many tool-shaped items completed
     # result.interrupted         → True if Ctrl+C / interrupt_requested fired mid-turn
     session.close()                                       # tears down subprocess
 

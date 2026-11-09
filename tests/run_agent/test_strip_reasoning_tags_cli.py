@@ -1,13 +1,10 @@
-"""Tests for cli.py::_strip_reasoning_tags — specifically the tool-call
-XML stripping added in openclaw/openclaw#67318 port.
+"""Regression coverage for core reasoning and tool-call tag stripping."""
 
-The CLI has its own copy of the stripper because it needs to run on the
-final displayed assistant text (after streaming) without depending on the
-AIAgent instance. It must stay in sync with run_agent.py::_strip_think_blocks
-for tool-call tag coverage."""
+from agent.agent_runtime_helpers import strip_think_blocks
 
 
-from cli import _strip_reasoning_tags
+def _strip_reasoning_tags(text):
+    return strip_think_blocks(None, text)
 
 
 class TestToolCallStripping:

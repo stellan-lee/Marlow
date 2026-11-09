@@ -26,7 +26,6 @@ def _make_agent_stub(agent_cls):
     agent._memory_enabled = True
     agent._user_profile_enabled = False
     agent._memory_nudge_interval = 5
-    agent._skill_nudge_interval = 5
     agent.background_review_callback = None
     agent.status_callback = None
     agent._cached_system_prompt = (
@@ -36,8 +35,6 @@ def _make_agent_stub(agent_cls):
     import datetime as _dt
     agent.session_start = _dt.datetime(2026, 1, 1, 12, 0, 0)
     agent._MEMORY_REVIEW_PROMPT = "review memory"
-    agent._SKILL_REVIEW_PROMPT = "review skills"
-    agent._COMBINED_REVIEW_PROMPT = "review both"
     # Non-None so the test catches a missing-kwarg regression.
     agent.enabled_toolsets = ["memory", "skills", "terminal"]
     agent.disabled_toolsets = ["x_search", "feishu_doc"]
@@ -66,7 +63,6 @@ class _ReviewAgentRecorder:
         self._memory_enabled = None
         self._user_profile_enabled = None
         self._memory_nudge_interval = None
-        self._skill_nudge_interval = None
         self.suppress_status_output = None
 
     def run_conversation(self, *args, **kwargs):
@@ -117,8 +113,6 @@ def test_review_fork_inherits_parent_cached_system_prompt():
         with patch.object(_ReviewAgentRecorder, "__setattr__", _spy_setattr):
             agent._spawn_background_review(
                 messages_snapshot=[],
-                review_memory=True,
-                review_skills=False,
             )
 
     assert "written_prompt" in captured, (
@@ -154,7 +148,6 @@ def test_review_fork_pins_session_start_and_session_id():
             self._memory_enabled = None
             self._user_profile_enabled = None
             self._memory_nudge_interval = None
-            self._skill_nudge_interval = None
             self.suppress_status_output = None
             self.session_start = None
             self.session_id = None
@@ -174,8 +167,6 @@ def test_review_fork_pins_session_start_and_session_id():
          patch("threading.Thread", _SyncThread):
         agent._spawn_background_review(
             messages_snapshot=[],
-            review_memory=True,
-            review_skills=False,
         )
 
     assert captured.get("session_start") == agent.session_start, (
@@ -207,7 +198,6 @@ def test_review_fork_inherits_parent_toolset_config():
             self._memory_enabled = None
             self._user_profile_enabled = None
             self._memory_nudge_interval = None
-            self._skill_nudge_interval = None
             self.suppress_status_output = None
             self.session_start = None
             self.session_id = None
@@ -225,8 +215,6 @@ def test_review_fork_inherits_parent_toolset_config():
          patch("threading.Thread", _SyncThread):
         agent._spawn_background_review(
             messages_snapshot=[],
-            review_memory=True,
-            review_skills=False,
         )
 
     assert captured.get("enabled_toolsets") == agent.enabled_toolsets, (

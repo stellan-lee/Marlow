@@ -1,8 +1,7 @@
 """
 Lazy dependency installer for opt-in Marlow Agent backends.
 
-Many Marlow features (Mistral TTS, ElevenLabs TTS, Honcho memory, Bedrock,
-Slack and other optional integrations) require Python packages that not every user needs. The
+Honcho, Slack and other optional integrations require Python packages that not every user needs. The
 historical approach was to bundle them all under ``pyproject.toml`` extras
 (``marlow-agent[all]``) and install them eagerly at setup time. That has
 two problems:
@@ -77,29 +76,6 @@ logger = logging.getLogger(__name__)
 LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # ─── Web search backends ───────────────────────────────────────────────
 
-    # ─── TTS providers ─────────────────────────────────────────────────────
-    # Pinned to exact versions to match pyproject.toml's no-ranges policy
-    # (see comment at top of [project.dependencies]). When bumping, update
-    # both this map AND the corresponding extra in pyproject.toml.
-    #
-    # mistralai pin tracks the `mistral` extra in pyproject.toml. PyPI
-    # quarantined the project 2026-05-12 (malicious 2.4.6, Mini Shai-Hulud);
-    # 2.4.6 was removed and clean releases resumed (2.4.7, 2.4.8). Voxtral
-    # STT + TTS share the same SDK.
-    "tts.mistral": ("mistralai==2.4.8",),
-    "tts.edge": ("edge-tts==7.2.7",),
-    "tts.elevenlabs": ("elevenlabs==1.59.0",),
-
-    # ─── Speech-to-text providers ──────────────────────────────────────────
-    "stt.mistral": ("mistralai==2.4.8",),
-    "stt.faster_whisper": (
-        "faster-whisper==1.2.1",
-        "sounddevice==0.5.5",
-        "numpy==2.4.3",
-    ),
-
-    # ─── Image generation backends ─────────────────────────────────────────
-
     # ─── Memory providers ──────────────────────────────────────────────────
     "memory.honcho": ("honcho-ai==2.0.1",),
 
@@ -110,7 +86,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # back to google's `Brotli` package (1-arg API), and any .txt/.md/.doc
     # uploaded to the Discord gateway fails to decode at att.read() with
     # "Can not decode content-encoding: br" — see #12511 / #15744.
-    "platform.discord": ("discord.py[voice]==2.7.1", "brotlicffi==1.2.0.1"),
+    "platform.discord": ("discord.py==2.7.1", "brotlicffi==1.2.0.1"),
     "platform.slack": (
         "slack-bolt==1.27.0",
         "slack-sdk==3.40.1",

@@ -23,8 +23,6 @@ def _bare_agent() -> AIAgent:
     import datetime as _dt
     agent.session_start = _dt.datetime(2026, 1, 1, 12, 0, 0)
     agent._MEMORY_REVIEW_PROMPT = "review memory"
-    agent._SKILL_REVIEW_PROMPT = "review skills"
-    agent._COMBINED_REVIEW_PROMPT = "review both"
     agent.background_review_callback = None
     agent.status_callback = None
     agent._safe_print = lambda *_args, **_kwargs: None
@@ -64,7 +62,6 @@ def test_background_review_shuts_down_memory_provider_before_close(monkeypatch):
     AIAgent._spawn_background_review(
         agent,
         messages_snapshot=[{"role": "user", "content": "hello"}],
-        review_memory=True,
     )
 
     assert [name for name, _payload in events] == [
@@ -134,7 +131,6 @@ def test_background_review_summarizer_receives_captured_messages_after_close(mon
     AIAgent._spawn_background_review(
         agent,
         messages_snapshot=messages_snapshot,
-        review_memory=True,
     )
 
     assert events == [
@@ -184,7 +180,6 @@ def test_background_review_installs_auto_deny_approval_callback(monkeypatch):
     AIAgent._spawn_background_review(
         agent,
         messages_snapshot=[{"role": "user", "content": "hello"}],
-        review_memory=True,
     )
 
     observed["after_finally"] = tt._get_approval_callback()
@@ -203,14 +198,7 @@ def test_background_review_installs_auto_deny_approval_callback(monkeypatch):
     )
 
 
-def test_background_review_summary_is_attributed_to_self_improvement_loop(monkeypatch):
-    """The CLI/gateway emission must identify the self-improvement loop.
-
-    Users who miss the line in their terminal have no way to tell that the
-    background review was what modified their skill/memory stores. The
-    summary prefix ``💾 Self-improvement review: …`` makes the origin
-    explicit so both the CLI and gateway deliveries are unambiguous.
-    """
+def test_background_review_summary_identifies_memory_review(monkeypatch):
     import json
 
     captured_prints: list = []
@@ -249,19 +237,18 @@ def test_background_review_summary_is_attributed_to_self_improvement_loop(monkey
     AIAgent._spawn_background_review(
         agent,
         messages_snapshot=[{"role": "user", "content": "hi"}],
-        review_memory=True,
     )
 
     # Exactly one summary should have been emitted, and it must identify
-    # the self-improvement review explicitly.
+    # the memory review explicitly.
     assert len(captured_prints) == 1, captured_prints
     printed = captured_prints[0]
-    assert "Self-improvement review" in printed, printed
+    assert "Memory review" in printed, printed
     assert "Memory updated" in printed, printed
 
     # Gateway path gets the same prefix.
     assert len(captured_bg_callback) == 1
-    assert captured_bg_callback[0].startswith("💾 Self-improvement review:"), (
+    assert captured_bg_callback[0].startswith("💾 Memory review:"), (
         captured_bg_callback[0]
     )
 
@@ -302,7 +289,6 @@ def test_background_review_fork_skips_external_memory_plugins(monkeypatch):
     AIAgent._spawn_background_review(
         agent,
         messages_snapshot=[{"role": "user", "content": "hello"}],
-        review_memory=True,
     )
 
     assert captured_kwargs.get("skip_memory") is True, (

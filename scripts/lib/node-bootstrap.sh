@@ -2,7 +2,7 @@
 # ============================================================================
 # scripts/lib/node-bootstrap.sh
 # ----------------------------------------------------------------------------
-# Sourceable helper: ensure Node.js >= MIN_VERSION is available for the TUI
+# Sourceable helper: ensure Node.js >= MIN_VERSION is available for browser tooling
 # (React + Ink) and browser tools.
 #
 # Strategy (first hit wins — respects the user's existing tooling):
@@ -218,7 +218,7 @@ ensure_node() {
     # Last resort: pinned nodejs.org tarball.
     _nb_install_bundled_node && { MARLOW_NODE_AVAILABLE=true; return 0; }
 
-    _nb_warn "Node.js install failed — TUI and browser tools will be unavailable."
+    _nb_warn "Node.js install failed — browser tools will be unavailable."
     _nb_warn "Install manually: https://nodejs.org/en/download/  (or: \`brew install node\`, \`fnm install $MARLOW_NODE_TARGET_MAJOR\`, etc.)"
     return 1
 }

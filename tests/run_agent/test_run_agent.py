@@ -4641,17 +4641,15 @@ class TestNormalizeCodexDictArguments:
 class TestMemoryNudgeCounterPersistence:
     """_turns_since_memory must persist across run_conversation calls."""
 
-    def test_counters_initialized_in_init(self):
-        """Counters must exist on the agent after __init__."""
+    def test_memory_counter_initialized_in_init(self):
+        """The memory counter must exist after __init__."""
         with patch("run_agent.get_tool_definitions", return_value=[]):
             a = AIAgent(
                 model="test", api_key="test-key", base_url="http://localhost:1234/v1",
                 provider="openrouter", skip_context_files=True, skip_memory=True,
             )
         assert hasattr(a, "_turns_since_memory")
-        assert hasattr(a, "_iters_since_skill")
         assert a._turns_since_memory == 0
-        assert a._iters_since_skill == 0
 
     def test_counters_not_reset_in_preamble(self):
         """The run_conversation preamble must not zero the nudge counters."""
@@ -4669,7 +4667,6 @@ class TestMemoryNudgeCounterPersistence:
         preamble_end = src.index("agent.iteration_budget = IterationBudget")
         preamble = src[:preamble_end]
         assert "agent._turns_since_memory = 0" not in preamble
-        assert "agent._iters_since_skill = 0" not in preamble
 
 
 class TestDeadRetryCode:

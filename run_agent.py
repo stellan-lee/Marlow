@@ -45,7 +45,7 @@ from typing import List, Dict, Any, Optional
 # NOTE: `fire` is ONLY used in the `__main__` block below (for running
 # run_agent.py directly as a CLI) — it is NOT needed for library usage.
 # It is imported there, not here, so that importing run_agent from a
-# daemon thread (e.g. curator's forked review agent) never fails with
+# daemon thread (e.g. a background memory review) never fails with
 # ModuleNotFoundError on broken/partial installs where `fire` isn't present.
 from datetime import datetime
 from pathlib import Path
@@ -565,10 +565,7 @@ class AIAgent:
         unavailable mid-session.  A raw ``print()`` raises ``OSError`` which
         can crash cron jobs and lose completed work.
 
-        Internally routes through ``self._print_fn`` (default: builtin
-        ``print``) so callers such as the CLI can inject a renderer that
-        handles ANSI escape sequences properly (e.g. prompt_toolkit's
-        ``print_formatted_text(ANSI(...))``) without touching this method.
+        Routes through ``self._print_fn`` when a caller provides an output sink.
         """
         try:
             fn = self._print_fn or print
@@ -580,7 +577,7 @@ class AIAgent:
         """Verbose print — suppressed when actively streaming tokens.
 
         Pass ``force=True`` for error/warning messages that should always be
-        shown even during streaming playback (TTS or display).
+        shown even during streaming.
 
         During tool execution (``_executing_tools`` is True), printing is
         allowed even with stream consumers registered because no tokens
@@ -1123,13 +1120,9 @@ class AIAgent:
         return cleanup_task_resources(self, task_id)
 
     # ------------------------------------------------------------------
-    # Background memory/skill review — prompts live in agent.background_review
+    # Background memory review
     # ------------------------------------------------------------------
-    from agent.background_review import (
-        _MEMORY_REVIEW_PROMPT,
-        _SKILL_REVIEW_PROMPT,
-        _COMBINED_REVIEW_PROMPT,
-    )
+    from agent.background_review import _MEMORY_REVIEW_PROMPT
 
     @staticmethod
     def _summarize_background_review_actions(
@@ -1143,10 +1136,8 @@ class AIAgent:
     def _spawn_background_review(
         self,
         messages_snapshot: List[Dict],
-        review_memory: bool = False,
-        review_skills: bool = False,
     ) -> None:
-        """Spawn the background memory/skill review thread.
+        """Spawn the background memory review thread.
 
         Thin wrapper — the heavy lifting lives in
         ``agent.background_review.spawn_background_review_thread`` which
@@ -1158,8 +1149,6 @@ class AIAgent:
         target, _prompt = spawn_background_review_thread(
             self,
             messages_snapshot,
-            review_memory=review_memory,
-            review_skills=review_skills,
         )
         t = threading.Thread(target=target, daemon=True, name="bg-review")
         t.start()
@@ -3081,7 +3070,7 @@ class AIAgent:
             logger.debug("interim_assistant_callback error", exc_info=True)
 
     def _fire_stream_delta(self, text: str) -> None:
-        """Fire all registered stream delta callbacks (display + TTS)."""
+        """Fire registered stream delta callbacks."""
         # If a tool iteration set the break flag, prepend a single paragraph
         # break before the first real text delta.  This prevents the original
         # problem (text concatenation across tool boundaries) without stacking
@@ -3447,17 +3436,6 @@ class AIAgent:
             return content
 
         summary = _multimodal_text_summary(result)
-        if tool_name == "computer_use":
-            return json.dumps({
-                "error": (
-                    "computer_use returned screenshot/image content, but the active "
-                    "model/provider does not support image input. Switch to a "
-                    "vision-capable model for desktop computer use, or use browser "
-                    "tools for browser tasks."
-                ),
-                "text_summary": summary,
-            })
-
         logger.warning(
             "Tool %s returned image content for non-vision model %s/%s; "
             "falling back to text summary",

@@ -18,8 +18,8 @@ Marlow Agent is an open-source AI agent framework that runs in your terminal and
 
 What makes Marlow different:
 
-- **Self-improving through skills** — Marlow learns from experience by saving reusable procedures as skills. When it solves a complex problem, discovers a workflow, or gets corrected, it can persist that knowledge as a skill document that loads into future sessions. Skills accumulate over time, making the agent better at your specific tasks and environment.
-- **Persistent memory across sessions** — remembers who you are, your preferences, environment details, and lessons learned through local memory, Holographic memory, or Honcho.
+- **Reusable skills** — request `/learn` to save a procedure for future sessions. Existing skills can be loaded and edited on request.
+- **Persistent memory across sessions** — remembers who you are, your preferences, environment details, and lessons learned through local memory or Honcho.
 - **Multi-platform gateway** — the same agent runs on Telegram, Discord, Slack, Feishu/Lark, Email, and signed webhooks with full tool access.
 - **Flexible inference** — use Codex OAuth or point Marlow at Ollama, vLLM, LM Studio, or another custom OpenAI-compatible endpoint.
 - **Profiles** — run multiple independent Marlow instances with isolated configs, sessions, skills, and memory.
@@ -71,7 +71,7 @@ marlow [flags] [command]
   --pass-session-id         Include session ID in system prompt
 ```
 
-No subcommand defaults to `chat`.
+With no arguments, Marlow shows command help.
 
 ### Chat
 
@@ -207,23 +207,21 @@ marlow uninstall            Uninstall Marlow
 
 ## Slash Commands (In-Session)
 
-Type these during an interactive chat session. New commands land fairly
+Use these in a Gateway conversation. New commands land fairly
 often; if something below looks stale, run `/help` in-session for the
 authoritative list.
 The registry of record is `marlow_cli/commands.py` — every consumer
-(autocomplete, Telegram menu, Slack mapping, `/help`) derives from it.
+(Telegram menu, Slack mapping, `/help`) derives from it.
 
 ### Session Control
 ```
 /new (/reset)        Fresh session
-/clear               Clear screen + new session (CLI)
 /retry               Resend last message
 /undo                Remove last exchange
 /title [name]        Name the session
 /compress            Manually compress context
 /stop                Kill background processes
 /rollback [N]        Restore filesystem checkpoint
-/snapshot [sub]      Create or restore state snapshots of Marlow config/state (CLI)
 /background <prompt> Run prompt in background
 /queue <prompt>      Queue for next turn
 /steer <prompt>      Inject a message after the next tool call without interrupting
@@ -231,39 +229,22 @@ The registry of record is `marlow_cli/commands.py` — every consumer
 /resume [name]       Resume a named session
 /goal [text|sub]     Set a standing goal Marlow works on across turns until achieved
                      (subcommands: status, pause, resume, clear)
-/redraw              Force a full UI repaint (CLI)
 ```
 
 ### Configuration
 ```
-/config              Show config (CLI)
 /model [name]        Show or change model
-/personality [name]  Set personality
 /reasoning [level]   Set reasoning (none|minimal|low|medium|high|xhigh|show|hide)
 /verbose             Cycle: off → new → all → verbose
-/voice [on|off|tts]  Voice mode
 /yolo                Toggle approval bypass
-/busy [sub]          Control what Enter does while Marlow is working (CLI)
-                     (subcommands: queue, steer, interrupt, status)
-/indicator [style]   Pick the TUI busy-indicator style (CLI)
-                     (styles: kaomoji, emoji, unicode, ascii)
 /footer [on|off]     Toggle gateway runtime-metadata footer on final replies
-/skin [name]         Change theme (CLI)
-/statusbar           Toggle status bar (CLI)
 ```
 
 ### Tools & Skills
 ```
-/tools               Manage tools (CLI)
-/toolsets            List toolsets (CLI)
-/skills              Search/install skills (CLI)
 /skill <name>        Load a skill into session
 /reload-skills       Re-scan ~/.marlow/skills/ for added/removed skills
-/reload              Reload .env variables into the running session (CLI)
 /reload-mcp          Reload MCP servers
-/cron                Manage cron jobs (CLI)
-/curator [sub]       Background skill maintenance (status, run, pin, archive, …)
-/plugins             List plugins (CLI)
 ```
 
 ### Gateway
@@ -281,11 +262,6 @@ The registry of record is `marlow_cli/commands.py` — every consumer
 ```
 /branch (/fork)      Branch the current session
 /browser             Open CDP browser connection
-/history             Show conversation history (CLI)
-/save                Save conversation to file (CLI)
-/copy [N]            Copy the last assistant response to clipboard (CLI)
-/paste               Attach clipboard image (CLI)
-/image               Attach local image file (CLI)
 ```
 
 ### Info
@@ -294,7 +270,6 @@ The registry of record is `marlow_cli/commands.py` — every consumer
 /commands [page]     Browse all commands (gateway)
 /usage               Token usage
 /insights [days]     Usage analytics
-/gquota              Show Google Gemini Code Assist quota usage (CLI)
 /status              Session info (gateway)
 /profile             Active profile info
 /debug               Upload debug report (system info + logs) and get shareable links
@@ -332,9 +307,7 @@ Edit with `marlow config edit` or `marlow config set section.key value`.
 | `agent` | `max_turns` (90), `tool_use_enforcement` |
 | `terminal` | `backend` (local/docker/ssh), `cwd`, `timeout` (180) |
 | `compression` | `enabled`, `threshold` (0.50), `target_ratio` (0.20) |
-| `display` | `skin`, `tool_progress`, `show_reasoning`, `show_cost` |
-| `stt` | `enabled`, `provider` (local/groq/openai/mistral) |
-| `tts` | `provider` (edge/elevenlabs/openai/minimax/mistral/neutts) |
+| `display` | `tool_progress`, `show_reasoning`, `show_cost` |
 | `memory` | `memory_enabled`, `user_profile_enabled`, `provider` |
 | `security` | `tirith_enabled`, `website_blocklist` |
 | `delegation` | `model`, `provider`, `base_url`, `api_key`, `max_iterations` (50), `reasoning_effort` |
@@ -366,8 +339,6 @@ Enable/disable via `marlow tools` (interactive) or `marlow tools enable/disable 
 | `file` | File read/write/search/patch |
 | `code_execution` | Sandboxed Python execution |
 | `vision` | Image analysis |
-| `image_gen` | AI image generation |
-| `tts` | Text-to-speech |
 | `skills` | Skill browsing and management |
 | `memory` | Persistent cross-session memory |
 | `session_search` | Search past conversations |
@@ -442,45 +413,9 @@ Note: YOLO / `approvals.mode: off` does NOT turn off secret redaction. They are 
 
 Some shell-hook integrations require explicit allowlisting before they fire. Managed via `~/.marlow/shell-hooks-allowlist.json` — prompted interactively the first time a hook wants to run.
 
-### Disabling the web/browser/image-gen tools
+### Disabling the web and browser tools
 
 To keep the model away from network or media tools entirely, open `marlow tools` and toggle per-platform. Takes effect on next session (`/reset`). See the Tools & Skills section above.
-
----
-
-## Voice & Transcription
-
-### STT (Voice → Text)
-
-Voice messages from messaging platforms are auto-transcribed.
-
-Provider priority (auto-detected):
-1. **Local faster-whisper** — free, no API key: `pip install faster-whisper`
-2. **Groq Whisper** — free tier: set `GROQ_API_KEY`
-3. **OpenAI Whisper** — paid: set `VOICE_TOOLS_OPENAI_KEY`
-4. **Mistral Voxtral** — set `MISTRAL_API_KEY`
-
-Config:
-```yaml
-stt:
-  enabled: true
-  provider: local        # local, groq, openai, mistral
-  local:
-    model: base          # tiny, base, small, medium, large-v3
-```
-
-### TTS (Text → Voice)
-
-| Provider | Env var | Free? |
-|----------|---------|-------|
-| Edge TTS | None | Yes (default) |
-| ElevenLabs | `ELEVENLABS_API_KEY` | Free tier |
-| OpenAI | `VOICE_TOOLS_OPENAI_KEY` | Paid |
-| MiniMax | `MINIMAX_API_KEY` | Paid |
-| Mistral (Voxtral) | `MISTRAL_API_KEY` | Paid |
-| NeuTTS (local) | None (`pip install neutts[all]` + `espeak-ng`) | Free |
-
-Voice commands: `/voice on` (voice-to-voice), `/voice tts` (always voice), `/voice off`.
 
 ---
 
@@ -495,7 +430,6 @@ Run additional Marlow processes as fully independent subprocesses — separate s
 | Isolation | Separate conversation, shared process | Fully independent process |
 | Duration | Minutes (bounded by parent loop) | Hours/days |
 | Tool access | Subset of parent's tools | Full tool access |
-| Interactive | No | Yes (PTY mode) |
 | Use case | Quick parallel subtasks | Long autonomous missions |
 
 ### One-Shot Mode
@@ -507,51 +441,14 @@ terminal(command="marlow chat -q 'Research GRPO papers and write summary to ~/re
 terminal(command="marlow chat -q 'Set up CI/CD for ~/myapp'", background=true)
 ```
 
-### Interactive PTY Mode (via tmux)
-
-Marlow uses prompt_toolkit, which requires a real terminal. Use tmux for interactive spawning:
-
-```
-# Start
-terminal(command="tmux new-session -d -s agent1 -x 120 -y 40 'marlow'", timeout=10)
-
-# Wait for startup, then send a message
-terminal(command="sleep 8 && tmux send-keys -t agent1 'Build a FastAPI auth service' Enter", timeout=15)
-
-# Read output
-terminal(command="sleep 20 && tmux capture-pane -t agent1 -p", timeout=5)
-
-# Send follow-up
-terminal(command="tmux send-keys -t agent1 'Add rate limiting middleware' Enter", timeout=5)
-
-# Exit
-terminal(command="tmux send-keys -t agent1 '/exit' Enter && sleep 2 && tmux kill-session -t agent1", timeout=10)
-```
-
-### Multi-Agent Coordination
-
-```
-# Agent A: backend
-terminal(command="tmux new-session -d -s backend -x 120 -y 40 'marlow -w'", timeout=10)
-terminal(command="sleep 8 && tmux send-keys -t backend 'Build REST API for user management' Enter", timeout=15)
-
-# Agent B: frontend
-terminal(command="tmux new-session -d -s frontend -x 120 -y 40 'marlow -w'", timeout=10)
-terminal(command="sleep 8 && tmux send-keys -t frontend 'Build React dashboard for user management' Enter", timeout=15)
-
-# Check progress, relay context between them
-terminal(command="tmux capture-pane -t backend -p | tail -30", timeout=5)
-terminal(command="tmux send-keys -t frontend 'Here is the API schema from the backend agent: ...' Enter", timeout=5)
-```
-
 ### Session Resume
 
 ```
 # Resume most recent session
-terminal(command="tmux new-session -d -s resumed 'marlow --continue'", timeout=10)
+terminal(command="marlow chat --continue -q 'Continue with the next step'", timeout=120)
 
 # Resume specific session
-terminal(command="tmux new-session -d -s resumed 'marlow --resume 20260225_143052_a1b2c3'", timeout=10)
+terminal(command="marlow chat --resume 20260225_143052_a1b2c3 -q 'Summarize progress'", timeout=120)
 ```
 
 ### Tips
@@ -560,7 +457,6 @@ terminal(command="tmux new-session -d -s resumed 'marlow --resume 20260225_14305
 - **Use `-w` (worktree mode)** when spawning agents that edit code — prevents git conflicts
 - **Set timeouts** for one-shot mode — complex tasks can take 5-10 minutes
 - **Use `marlow chat -q` for fire-and-forget** — no PTY needed
-- **Use tmux for interactive sessions** — raw PTY mode has `\r` vs `\n` issues with prompt_toolkit
 - **For scheduled tasks**, use the `cronjob` tool instead of spawning — handles delivery and retry
 
 ---
@@ -607,33 +503,7 @@ the `cronjob` tool, the `marlow cron` CLI (`list`, `add`, `edit`,
 
 Run `marlow cron --help` for current usage.
 
-### Curator (skill lifecycle)
-
-Background maintenance for agent-created skills. Tracks usage, marks
-idle skills stale, archives stale ones, keeps a pre-run tar.gz backup
-so nothing is lost.
-
-- **CLI:** `marlow curator <verb>` — `status`, `run`, `pause`, `resume`,
-  `pin`, `unpin`, `archive`, `restore`, `prune`, `backup`, `rollback`.
-- **Slash:** `/curator <subcommand>` mirrors the CLI.
-- **Scope:** only touches skills with `created_by: "agent"` provenance.
-  Bundled and manually installed local skills are off-limits. **Never deletes** —
-  max destructive action is archive. Pinned skills are exempt from
-  every auto-transition and every LLM review pass.
-- **Telemetry:** sidecar at `~/.marlow/skills/.usage.json` holds
-  per-skill `use_count`, `view_count`, `patch_count`,
-  `last_activity_at`, `state`, `pinned`.
-
-Config: `curator.*` (`enabled`, `interval_hours`, `min_idle_hours`,
-`stale_after_days`, `archive_after_days`, `backup.*`).
-Run `marlow curator --help` for current usage.
-
 ## Troubleshooting
-
-### Voice not working
-1. Check `stt.enabled: true` in config.yaml
-2. Verify provider: `pip install faster-whisper` or set API key
-3. In gateway: `/restart`. In CLI: exit and relaunch.
 
 ### Tool not available
 1. `marlow tools` — check if toolset is enabled for your platform
@@ -711,7 +581,6 @@ marlow-agent/
 ├── run_agent.py          # AIAgent — core conversation loop
 ├── model_tools.py        # Tool discovery and dispatch
 ├── toolsets.py           # Toolset definitions
-├── cli.py                # Interactive CLI (MarlowCLI)
 ├── marlow_state.py       # SQLite session store
 ├── agent/                # Prompt builder, context compression, memory, model routing, credential pooling, skill dispatch
 ├── marlow_cli/           # CLI subcommands, config, setup, commands
@@ -761,10 +630,9 @@ All handlers must return JSON strings. Use `get_marlow_home()` for paths, never 
 ### Adding a Slash Command
 
 1. Add `CommandDef` to `COMMAND_REGISTRY` in `marlow_cli/commands.py`
-2. Add handler in `cli.py` → `process_command()`
-3. (Optional) Add gateway handler in `gateway/run.py`
+2. Add the Gateway handler in `gateway/run.py`
 
-All consumers (help text, autocomplete, Telegram menu, Slack mapping) derive from the central registry automatically.
+All consumers (help text, Telegram menu, Slack mapping) derive from the central registry automatically.
 
 ### Agent Loop (High Level)
 

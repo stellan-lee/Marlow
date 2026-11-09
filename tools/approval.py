@@ -8,6 +8,7 @@ This module is the single source of truth for the dangerous command system:
 - Permanent allowlist persistence (config.yaml)
 """
 
+from contextlib import contextmanager
 import contextvars
 import html
 import logging
@@ -19,7 +20,7 @@ import time
 import unicodedata
 import uuid
 from typing import Optional
-from marlow_cli.config import cfg_get
+from marlow_cli.config import cfg_get, is_user_config_ignored
 
 from utils import env_var_enabled, is_truthy_value
 
@@ -42,6 +43,36 @@ _super_admin_context: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "super_admin_approval_context",
     default=False,
 )
+
+
+# One-shot CLI invocations may dispatch tools from worker threads that do
+# not inherit ContextVars. Apply the safety policy for the whole invocation.
+_headless_local_queries = 0
+_headless_local_lock = threading.Lock()
+
+
+@contextmanager
+def forbid_interactive_approval():
+    """Deny actions that need a human when a local query has no prompt."""
+    global _headless_local_queries
+    with _headless_local_lock:
+        _headless_local_queries += 1
+    try:
+        yield
+    finally:
+        with _headless_local_lock:
+            _headless_local_queries -= 1
+
+
+def _headless_approval_block(pattern_key: str, description: str) -> dict:
+    return {
+        "approved": False,
+        "message": f"BLOCKED: {description} requires approval. This local invocation cannot prompt.",
+        "pattern_key": pattern_key,
+        "description": description,
+        "outcome": "blocked",
+        "user_consent": False,
+    }
 
 
 def _fire_approval_hook(hook_name: str, **kwargs) -> None:
@@ -909,7 +940,7 @@ def is_approved(session_key: str, pattern_key: str) -> bool:
     """
     aliases = _approval_key_aliases(pattern_key)
     with _lock:
-        if any(alias in _permanent_approved for alias in aliases):
+        if not is_user_config_ignored() and any(alias in _permanent_approved for alias in aliases):
             return True
         session_approvals = _session_approved.get(session_key, set())
         return any(alias in session_approvals for alias in aliases)
@@ -952,6 +983,8 @@ def load_permanent_allowlist() -> set:
 
 def save_permanent_allowlist(patterns: set):
     """Save permanently allowed command patterns to config."""
+    if is_user_config_ignored():
+        return
     try:
         from marlow_cli.config import load_config, save_config
         config = load_config()
@@ -1259,6 +1292,9 @@ def check_dangerous_command(command: str, env_type: str,
     session_key = get_current_session_key()
     if not admin_enforced and is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
+
+    if _headless_local_queries:
+        return _headless_approval_block(pattern_key, description)
 
     is_cli = env_var_enabled("MARLOW_INTERACTIVE")
     is_gateway = _is_gateway_approval_context()
@@ -1768,7 +1804,7 @@ def check_all_command_guards(
 
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
     # flows, we do not block on approvals and we skip external guard work.
-    if not is_cli and not is_gateway and not is_ask:
+    if not (is_cli or is_gateway or is_ask or _headless_local_queries):
         # Cron sessions: respect cron_mode config
         if env_var_enabled("MARLOW_CRON_SESSION"):
             if _get_cron_approval_mode() == "deny":
@@ -1861,6 +1897,11 @@ def check_all_command_guards(
                 "description": "terminal purpose redaction failed",
                 "outcome": "purpose_redaction_failed",
             }
+
+    if _headless_local_queries:
+        return _headless_approval_block(
+            warnings[0][0], "; ".join(description for _, description, _ in warnings),
+        )
 
     # --- Phase 2.5: Smart approval (auxiliary LLM risk assessment) ---
     # When approvals.mode=smart, ask the aux LLM before prompting the user.
@@ -2165,6 +2206,9 @@ def check_execute_code_guard(code: str, env_type: str) -> dict:
         or approval_mode == "off"
     ):
         return {"approved": True, "message": None}
+
+    if _headless_local_queries:
+        return _headless_approval_block(pattern_key, description)
 
     is_gateway = _is_gateway_approval_context()
     is_ask = env_var_enabled("MARLOW_EXEC_ASK")

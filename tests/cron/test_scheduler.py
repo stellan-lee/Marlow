@@ -567,16 +567,14 @@ class TestDeliverResultWrapping:
         assert kwargs["media_files"] == [(str(media_path), False)]
 
     def test_live_adapter_sends_media_as_attachments(self, tmp_path, monkeypatch):
-        """When a live adapter is available, MEDIA files should be sent as native
-        platform attachments (e.g., Discord voice, Telegram audio) rather than
-        as literal 'MEDIA:/path' text."""
+        """A MEDIA audio file is sent as a regular document attachment."""
         from gateway.config import Platform
         from concurrent.futures import Future
-        media_path = self._safe_media_path(tmp_path, monkeypatch, "cron-voice.mp3")
+        media_path = self._safe_media_path(tmp_path, monkeypatch, "cron-recording.mp3")
 
         adapter = AsyncMock()
         adapter.send.return_value = MagicMock(success=True)
-        adapter.send_voice.return_value = MagicMock(success=True)
+        adapter.send_document.return_value = MagicMock(success=True)
 
         pconfig = MagicMock()
         pconfig.enabled = True
@@ -594,7 +592,7 @@ class TestDeliverResultWrapping:
             return future
 
         job = {
-            "id": "tts-job",
+            "id": "audio-job",
             "deliver": "origin",
             "origin": {"platform": "discord", "chat_id": "9876"},
         }
@@ -604,7 +602,7 @@ class TestDeliverResultWrapping:
              patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
             _deliver_result(
                 job,
-                f"Here is TTS\nMEDIA:{media_path}",
+                f"Recording attached\nMEDIA:{media_path}",
                 adapters={Platform.DISCORD: adapter},
                 loop=loop,
             )
@@ -613,15 +611,13 @@ class TestDeliverResultWrapping:
         adapter.send.assert_called_once()
         text_sent = adapter.send.call_args[0][1]
         assert "MEDIA:" not in text_sent
-        assert "Here is TTS" in text_sent
+        assert "Recording attached" in text_sent
 
-        # Audio file should be sent as a voice attachment
-        adapter.send_voice.assert_called_once()
-        voice_call = adapter.send_voice.call_args
-        assert voice_call[1]["audio_path"] == str(media_path)
+        adapter.send_document.assert_called_once()
+        assert adapter.send_document.call_args.kwargs["file_path"] == str(media_path)
 
     def test_live_adapter_routes_image_to_send_image_file(self, tmp_path, monkeypatch):
-        """Image MEDIA files should be routed to send_image_file, not send_voice."""
+        """Image MEDIA files go through the platform image API."""
         from gateway.config import Platform
         from concurrent.futures import Future
         media_path = self._safe_media_path(tmp_path, monkeypatch, "chart.png")
@@ -662,16 +658,16 @@ class TestDeliverResultWrapping:
 
         adapter.send_image_file.assert_called_once()
         assert adapter.send_image_file.call_args[1]["image_path"] == str(media_path)
-        adapter.send_voice.assert_not_called()
+        adapter.send_document.assert_not_called()
 
     def test_live_adapter_media_only_no_text(self, tmp_path, monkeypatch):
         """When content is ONLY a MEDIA tag with no text, media should still be sent."""
         from gateway.config import Platform
         from concurrent.futures import Future
-        media_path = self._safe_media_path(tmp_path, monkeypatch, "voice.ogg")
+        media_path = self._safe_media_path(tmp_path, monkeypatch, "recording.ogg")
 
         adapter = AsyncMock()
-        adapter.send_voice.return_value = MagicMock(success=True)
+        adapter.send_document.return_value = MagicMock(success=True)
 
         pconfig = MagicMock()
         pconfig.enabled = True
@@ -688,7 +684,7 @@ class TestDeliverResultWrapping:
             return future
 
         job = {
-            "id": "voice-only",
+            "id": "audio-only",
             "deliver": "origin",
             "origin": {"platform": "telegram", "chat_id": "999"},
         }
@@ -705,8 +701,8 @@ class TestDeliverResultWrapping:
 
         # Text send should NOT be called (no text after stripping MEDIA tag)
         adapter.send.assert_not_called()
-        # Audio should still be delivered as a voice bubble
-        adapter.send_voice.assert_called_once()
+        adapter.send_document.assert_called_once()
+        assert adapter.send_document.call_args.kwargs["file_path"] == str(media_path)
 
     def test_live_adapter_sends_cleaned_text_not_raw(self):
         """The live adapter path must send cleaned text (MEDIA tags stripped),
@@ -1961,13 +1957,15 @@ class TestSendMediaViaAdapter:
 
     def test_multiple_media_files_all_delivered(self, tmp_path, monkeypatch):
         adapter = MagicMock()
-        adapter.send_voice = AsyncMock()
+        adapter.send_document = AsyncMock()
         adapter.send_image_file = AsyncMock()
-        voice_path = self._safe_media_path(tmp_path, monkeypatch, "voice.mp3")
+        audio_path = self._safe_media_path(tmp_path, monkeypatch, "recording.mp3")
         photo_path = self._safe_media_path(tmp_path, monkeypatch, "photo.jpg")
-        media_files = [(str(voice_path), False), (str(photo_path), False)]
+        media_files = [(str(audio_path), True), (str(photo_path), False)]
         self._run_with_loop(adapter, "123", media_files, None, {"id": "j3"})
-        adapter.send_voice.assert_called_once()
+        adapter.send_document.assert_called_once_with(
+            chat_id="123", file_path=str(audio_path), metadata=None
+        )
         adapter.send_image_file.assert_called_once()
 
 

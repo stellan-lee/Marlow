@@ -10,14 +10,14 @@
   <a href="https://github.com/stellan-lee/Marlow/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="License: MIT"></a>
 </p>
 
-**A self-improving AI agent with a built-in learning loop.** Marlow creates skills from experience, improves them during use, searches past conversations, and builds a deepening model of who you are across sessions. Run it locally, on a cloud VM, or through a messaging gateway.
+**An AI agent with persistent memory, local tools, and messaging integrations.** Marlow searches past conversations, uses reusable skills, and can create skills at your request. Run it locally, on a cloud VM, or through a messaging gateway.
 
 Use a Codex subscription or any local/custom OpenAI-compatible endpoint. Switch with `marlow model`.
 
 <table>
-<tr><td><b>A real terminal interface</b></td><td>Full TUI with multiline editing, slash-command autocomplete, conversation history, interrupt-and-redirect, and streaming tool output.</td></tr>
-<tr><td><b>Lives where you do</b></td><td>Telegram, Discord, Slack, Feishu, Email, and CLI — all from a single gateway process. Voice memo transcription and cross-platform conversation continuity.</td></tr>
-<tr><td><b>A closed learning loop</b></td><td>Agent-curated memory with periodic nudges. Autonomous skill creation after complex tasks. Skills self-improve during use. FTS5 session search with LLM summarization for cross-session recall. <a href="https://github.com/plastic-labs/honcho">Honcho</a> dialectic user modeling. Compatible with the <a href="https://agentskills.io">agentskills.io</a> open standard.</td></tr>
+<tr><td><b>Scriptable command line</b></td><td>Run a single query with image input and session history, or use a stdout-only invocation in a script.</td></tr>
+<tr><td><b>Lives where you do</b></td><td>Telegram, Discord, Slack, Feishu, Teams, email, and signed webhooks through one Gateway.</td></tr>
+<tr><td><b>Persistent memory and skills</b></td><td>Local memory, project-scoped work experience and decisions, FTS5 session search, and user-initiated skill creation. <a href="https://github.com/plastic-labs/honcho">Honcho</a> dialectic user modeling. Compatible with the <a href="https://agentskills.io">agentskills.io</a> open standard.</td></tr>
 <tr><td><b>Scheduled automations</b></td><td>Built-in cron scheduler with delivery to any platform. Daily reports, nightly backups, weekly audits — all in natural language, running unattended.</td></tr>
 <tr><td><b>Delegates and parallelizes</b></td><td>Spawn isolated subagents for parallel workstreams. Write Python scripts that call tools via RPC, collapsing multi-step pipelines into zero-context-cost turns.</td></tr>
 <tr><td><b>Runs where you work</b></td><td>Local, Docker, and SSH terminal backends cover direct development, isolated containers, and remote hosts.</td></tr>
@@ -44,7 +44,7 @@ After installation:
 
 ```bash
 source ~/.bashrc    # reload shell (or: source ~/.zshrc)
-marlow              # start chatting!
+marlow chat -q "Hello"
 ```
 
 ---
@@ -52,7 +52,8 @@ marlow              # start chatting!
 ## Getting Started
 
 ```bash
-marlow              # Interactive CLI — start a conversation
+marlow chat -q "Hello" # Run one query and save the session
+marlow -z "Hello"      # Return final text on stdout for scripts
 marlow model        # Choose your LLM provider and model
 marlow tools        # Configure which tools are enabled
 marlow config set   # Set individual config values
@@ -66,24 +67,17 @@ Use `marlow --help`, `marlow setup`, and the guides in this repository for confi
 
 ---
 
-## CLI vs Messaging Quick Reference
+## Querying Marlow
 
-Marlow has two entry points: start the terminal UI with `marlow`, or run the gateway and talk to it from Telegram, Discord, Slack, Feishu, or Email. Once you're in a conversation, many slash commands are shared across both interfaces.
+Use `marlow chat -q "Describe this" --image ./photo.png` for a single query.
+Pass `--resume` or `--continue` with a query to pick up an existing session.
+A terminal can prompt for approval during a query. A non-interactive query
+denies actions that require an interactive decision.
 
-| Action                         | CLI                                           | Messaging platforms                                                              |
-| ------------------------------ | --------------------------------------------- | -------------------------------------------------------------------------------- |
-| Start chatting                 | `marlow`                                      | Run `marlow gateway setup` + `marlow gateway start`, then send the bot a message |
-| Start fresh conversation       | `/new` or `/reset`                            | `/new` or `/reset`                                                               |
-| Change model                   | `/model [provider:model]`                     | `/model [provider:model]`                                                        |
-| Set a personality              | `/personality [name]`                         | `/personality [name]`                                                            |
-| Retry or undo the last turn    | `/retry`, `/undo`                             | `/retry`, `/undo`                                                                |
-| Compress context / check usage | `/compress`, `/usage`, `/insights [--days N]` | `/compress`, `/usage`, `/insights [days]`                                        |
-| Browse skills                  | `/skills` or `/<skill-name>`                  | `/<skill-name>`                                                                  |
-| Interrupt current work         | `Ctrl+C` or send a new message                | `/stop` or send a new message                                                    |
-| Platform-specific status       | `/platforms`                                  | `/status`, `/sethome`                                                            |
-| Route privileged approvals     | Configure locally                            | [`approvals.admin`](docs/admin-approvals.md)                                     |
-
-Run `marlow --help` for CLI commands and `marlow gateway --help` for messaging gateway commands.
+Use `marlow -z "Summarize the current repository"` for stdout-only output in
+scripts. It honors explicit authorization and denies actions that require
+interactive approval. Use `marlow gateway setup` and `marlow gateway start`
+for ongoing messaging conversations. Run `marlow --help` for operator commands.
 
 ---
 

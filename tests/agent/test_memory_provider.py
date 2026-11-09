@@ -453,15 +453,15 @@ class TestPluginMemoryDiscovery:
         from plugins.memory import discover_memory_providers
         providers = discover_memory_providers()
         names = [name for name, _, _ in providers]
-        assert "holographic" in names  # always available (no external deps)
+        assert "honcho" in names
+        assert "holographic" not in names
 
     def test_load_provider_by_name(self):
         """load_memory_provider returns a working provider instance."""
         from plugins.memory import load_memory_provider
-        p = load_memory_provider("holographic")
+        p = load_memory_provider("honcho")
         assert p is not None
-        assert p.name == "holographic"
-        assert p.is_available()
+        assert p.name == "honcho"
 
     def test_load_nonexistent_returns_none(self):
         """load_memory_provider returns None for unknown names."""
@@ -508,7 +508,7 @@ class TestUserInstalledProviderDiscovery:
         providers = discover_memory_providers()
         names = [n for n, _, _ in providers]
         assert "myexternal" in names
-        assert "holographic" in names  # bundled still found
+        assert "honcho" in names
 
     def test_load_user_plugin(self, tmp_path, monkeypatch):
         """load_memory_provider() can load from $MARLOW_HOME/plugins/."""
@@ -524,35 +524,26 @@ class TestUserInstalledProviderDiscovery:
         assert p.is_available()
 
     def test_bundled_takes_precedence(self, tmp_path, monkeypatch):
-        """Bundled provider wins when user plugin has the same name."""
-        from plugins.memory import load_memory_provider, discover_memory_providers
-        # Create user plugin named "holographic" (same as bundled)
-        plugin_dir = tmp_path / "plugins" / "holographic"
-        plugin_dir.mkdir(parents=True)
-        (plugin_dir / "__init__.py").write_text(
-            "from agent.memory_provider import MemoryProvider\n"
-            "class Fake(MemoryProvider):\n"
-            "    @property\n"
-            "    def name(self): return 'holographic-FAKE'\n"
-            "    def is_available(self): return True\n"
-            "    def initialize(self, **kw): pass\n"
-            "    def sync_turn(self, *a, **kw): pass\n"
-            "    def get_tool_schemas(self): return []\n"
-            "    def handle_tool_call(self, *a, **kw): return '{}'\n"
-        )
-        monkeypatch.setattr(
-            "plugins.memory._get_user_plugins_dir",
-            lambda: tmp_path / "plugins",
-        )
-        # Load should return bundled (name "holographic"), not user (name "holographic-FAKE")
-        p = load_memory_provider("holographic")
-        assert p is not None
-        assert p.name == "holographic"  # bundled wins
+        """Bundled provider wins when a user plugin has the same name."""
+        from plugins.memory import discover_memory_providers, load_memory_provider
 
-        # discover should not duplicate
-        providers = discover_memory_providers()
-        holo_count = sum(1 for n, _, _ in providers if n == "holographic")
-        assert holo_count == 1
+        self._make_user_memory_plugin(tmp_path, "honcho")
+        monkeypatch.setattr("plugins.memory._get_user_plugins_dir", lambda: tmp_path / "plugins")
+
+        provider = load_memory_provider("honcho")
+
+        assert type(provider).__module__ == "plugins.memory.honcho"
+        assert sum(name == "honcho" for name, _, _ in discover_memory_providers()) == 1
+
+    def test_retired_provider_is_not_loaded_from_stale_plugin(self, tmp_path, monkeypatch, caplog):
+        from plugins.memory import discover_memory_providers, load_memory_provider
+
+        self._make_user_memory_plugin(tmp_path, "holographic")
+        monkeypatch.setattr("plugins.memory._get_user_plugins_dir", lambda: tmp_path / "plugins")
+
+        assert load_memory_provider("holographic") is None
+        assert all(name != "holographic" for name, _, _ in discover_memory_providers())
+        assert "Holographic memory is no longer supported" in caplog.text
 
     def test_non_memory_user_plugins_excluded(self, tmp_path, monkeypatch):
         """User plugins that don't reference MemoryProvider are skipped."""

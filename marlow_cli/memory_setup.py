@@ -178,6 +178,11 @@ def _get_available_providers() -> list:
 def cmd_setup_provider(provider_name: str) -> None:
     """Run memory setup for a specific provider, skipping the picker."""
     from marlow_cli.config import load_config, save_config
+    from plugins.memory import RETIRED_MEMORY_PROVIDER, RETIRED_MEMORY_PROVIDER_MESSAGE
+
+    if provider_name == RETIRED_MEMORY_PROVIDER:
+        print(f"\n  {RETIRED_MEMORY_PROVIDER_MESSAGE}\n")
+        return
 
     providers = _get_available_providers()
     match = None
@@ -386,6 +391,7 @@ def _write_env_vars(env_path: Path, env_writes: dict) -> None:
 def cmd_status(args) -> None:
     """Show current memory provider config."""
     from marlow_cli.config import load_config
+    from plugins.memory import RETIRED_MEMORY_PROVIDER, RETIRED_MEMORY_PROVIDER_MESSAGE
 
     config = load_config()
     mem_config = config.get("memory", {})
@@ -394,6 +400,10 @@ def cmd_status(args) -> None:
     print(f"\nMemory status\n" + "─" * 40)
     print(f"  Built-in:  always active")
     print(f"  Provider:  {provider_name or '(none — built-in only)'}")
+
+    if provider_name == RETIRED_MEMORY_PROVIDER:
+        print(f"  Status:    {RETIRED_MEMORY_PROVIDER_MESSAGE}\n")
+        return
 
     if provider_name:
         provider_config = mem_config.get(provider_name, {})

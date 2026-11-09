@@ -72,7 +72,6 @@ from gateway.platforms.base import (
     ProcessingOutcome,
     SendResult,
     cache_image_from_bytes,
-    cache_audio_from_bytes,
     cache_video_from_bytes,
     cache_document_from_bytes,
     resolve_proxy_url,
@@ -3980,97 +3979,6 @@ class TelegramAdapter(BasePlatformAdapter):
             )
         return error
 
-    async def send_voice(
-        self,
-        chat_id: str,
-        audio_path: str,
-        caption: Optional[str] = None,
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        **kwargs,
-    ) -> SendResult:
-        """Send audio as a native Telegram voice message or audio file."""
-        if not self._bot:
-            return SendResult(success=False, error="Not connected")
-        
-        try:
-            if not os.path.exists(audio_path):
-                return SendResult(success=False, error=self._missing_media_path_error("Audio", audio_path))
-            
-            with open(audio_path, "rb") as audio_file:
-                ext = os.path.splitext(audio_path)[1].lower()
-                # .ogg / .opus files -> send as voice (round playable bubble)
-                if ext in {".ogg", ".opus"}:
-                    _voice_thread = self._metadata_thread_id(metadata)
-                    reply_to_id = self._reply_to_message_id_for_send(reply_to, metadata, reply_to_mode=self._reply_to_mode)
-                    voice_thread_kwargs = self._thread_kwargs_for_send(
-                        chat_id,
-                        _voice_thread,
-                        metadata,
-                        reply_to_message_id=reply_to_id,
-                        reply_to_mode=self._reply_to_mode
-                    )
-                    msg = await self._send_with_dm_topic_reply_anchor_retry(
-                        self._bot.send_voice,
-                        {
-                            "chat_id": int(chat_id),
-                            "voice": audio_file,
-                            "caption": caption[:1024] if caption else None,
-                            "reply_to_message_id": reply_to_id,
-                            **voice_thread_kwargs,
-                            **self._notification_kwargs(metadata),
-                        },
-                        metadata,
-                        reply_to_id,
-                        "voice",
-                        reset_media=lambda: audio_file.seek(0),
-                    )
-                elif ext in {".mp3", ".m4a"}:
-                    # Telegram's Bot API sendAudio only accepts MP3 / M4A.
-                    _audio_thread = self._metadata_thread_id(metadata)
-                    reply_to_id = self._reply_to_message_id_for_send(reply_to, metadata, reply_to_mode=self._reply_to_mode)
-                    audio_thread_kwargs = self._thread_kwargs_for_send(
-                        chat_id,
-                        _audio_thread,
-                        metadata,
-                        reply_to_message_id=reply_to_id,
-                        reply_to_mode=self._reply_to_mode
-                    )
-                    msg = await self._send_with_dm_topic_reply_anchor_retry(
-                        self._bot.send_audio,
-                        {
-                            "chat_id": int(chat_id),
-                            "audio": audio_file,
-                            "caption": caption[:1024] if caption else None,
-                            "reply_to_message_id": reply_to_id,
-                            **audio_thread_kwargs,
-                            **self._notification_kwargs(metadata),
-                        },
-                        metadata,
-                        reply_to_id,
-                        "audio",
-                        reset_media=lambda: audio_file.seek(0),
-                    )
-                else:
-                    # Formats Telegram can't play natively (.wav, .flac, ...)
-                    # — fall back to document delivery instead of raising.
-                    return await self.send_document(
-                        chat_id=chat_id,
-                        file_path=audio_path,
-                        caption=caption,
-                        reply_to=reply_to,
-                        metadata=metadata,
-                    )
-            return SendResult(success=True, message_id=str(msg.message_id))
-        except Exception as e:
-            logger.error(
-                "[%s] Failed to send Telegram voice/audio, falling back to base adapter: %s",
-                self.name,
-                e,
-                exc_info=True,
-            )
-            return await super().send_voice(chat_id, audio_path, caption, reply_to, metadata=metadata)
-
     async def send_multiple_images(
         self,
         chat_id: str,
@@ -5298,8 +5206,6 @@ class TelegramAdapter(BasePlatformAdapter):
             return msg.photo[-1], "", "", "image"
         if msg.video:
             return msg.video, "", "video/mp4", "video"
-        if msg.voice:
-            return msg.voice, "voice.ogg", "audio/ogg", "audio"
         if msg.audio:
             return msg.audio, getattr(msg.audio, "file_name", "") or "", "", "audio"
         if msg.document:
@@ -5715,6 +5621,12 @@ class TelegramAdapter(BasePlatformAdapter):
         if msg.caption:
             event.text = self._clean_bot_trigger_text(msg.caption)
         
+        if msg_type == MessageType.VOICE:
+            if event.text.strip():
+                event = self._apply_telegram_group_observe_attribution(event)
+            await self.handle_message(event)
+            return
+
         # Handle stickers: describe via vision tool with caching
         if msg.sticker:
             await self._handle_sticker(msg, event)
@@ -5758,24 +5670,15 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning("[Telegram] Failed to cache photo: %s", e, exc_info=True)
 
-        # Download voice/audio messages to cache for STT transcription
-        if msg.voice:
-            try:
-                file_obj = await msg.voice.get_file()
-                audio_bytes = await file_obj.download_as_bytearray()
-                cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=".ogg")
-                event.media_urls = [cached_path]
-                event.media_types = ["audio/ogg"]
-                logger.info("[Telegram] Cached user voice at %s", cached_path)
-            except Exception as e:
-                logger.warning("[Telegram] Failed to cache voice: %s", e, exc_info=True)
-        elif msg.audio:
+        # Cache audio uploads as files.
+        if msg.audio:
             try:
                 file_obj = await msg.audio.get_file()
                 audio_bytes = await file_obj.download_as_bytearray()
-                cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=".mp3")
+                filename = getattr(msg.audio, "file_name", None) or "audio.mp3"
+                cached_path = cache_document_from_bytes(bytes(audio_bytes), filename)
                 event.media_urls = [cached_path]
-                event.media_types = ["audio/mp3"]
+                event.media_types = [getattr(msg.audio, "mime_type", None) or "audio/mpeg"]
                 logger.info("[Telegram] Cached user audio at %s", cached_path)
             except Exception as e:
                 logger.warning("[Telegram] Failed to cache audio: %s", e, exc_info=True)
@@ -5892,7 +5795,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 # code — the extension sets are identical.
 
                 # Check if supported
-                if ext not in SUPPORTED_DOCUMENT_TYPES:
+                if ext not in SUPPORTED_DOCUMENT_TYPES and not doc_mime.startswith("audio/"):
                     supported_list = ", ".join(sorted(SUPPORTED_DOCUMENT_TYPES.keys()))
                     event.text = (
                         f"Unsupported document type '{ext or 'unknown'}'. "
@@ -5907,7 +5810,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 doc_bytes = await file_obj.download_as_bytearray()
                 raw_bytes = bytes(doc_bytes)
                 cached_path = cache_document_from_bytes(raw_bytes, original_filename or f"document{ext}")
-                mime_type = SUPPORTED_DOCUMENT_TYPES[ext]
+                mime_type = doc_mime if doc_mime.startswith("audio/") else SUPPORTED_DOCUMENT_TYPES[ext]
                 event.media_urls = [cached_path]
                 event.media_types = [mime_type]
                 logger.info("[Telegram] Cached user document at %s", cached_path)

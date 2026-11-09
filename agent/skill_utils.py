@@ -57,7 +57,14 @@ def is_excluded_skill_path(path) -> bool:
     except AttributeError:
         from pathlib import PurePath
         parts = PurePath(str(path)).parts
-    return any(part in EXCLUDED_SKILL_DIRS for part in parts)
+    if any(part in EXCLUDED_SKILL_DIRS for part in parts):
+        return True
+    if "macos-computer-use" in parts:
+        # Older releases copied this bundled skill into the profile. Retire
+        # that location from discovery while leaving its files on disk.
+        retired = get_skills_dir() / "apple" / "macos-computer-use"
+        return Path(path).is_relative_to(retired)
+    return False
 
 
 # ── Lazy YAML loader ─────────────────────────────────────────────────────
@@ -520,7 +527,9 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
     for root, dirs, files in os.walk(skills_dir, followlinks=True):
         dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS]
         if filename in files:
-            matches.append(Path(root) / filename)
+            path = Path(root) / filename
+            if not is_excluded_skill_path(path):
+                matches.append(path)
     for path in sorted(matches, key=lambda p: str(p.relative_to(skills_dir))):
         yield path
 

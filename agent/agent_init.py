@@ -254,10 +254,7 @@ def init_agent(
     agent._chat_type = chat_type
     agent._thread_id = thread_id
     agent._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
-    # Pluggable print function — CLI replaces this with _cprint so that
-    # raw ANSI status lines are routed through prompt_toolkit's renderer
-    # instead of going directly to stdout where patch_stdout's StdoutProxy
-    # would mangle the escape sequences.  None = use builtins.print.
+    # Optional output sink for callers. None uses the built-in print.
     agent._print_fn = None
     agent.background_review_callback = None  # Optional sync callback for gateway delivery
     agent.skip_context_files = skip_context_files
@@ -408,7 +405,7 @@ def init_agent(
         # handler level inside marlow_logging.py, not here.
         pass
     
-    # Internal stream callback (set during streaming TTS).
+    # Optional per-turn stream callback.
     # Initialized here so _vprint can reference it before run_conversation.
     agent._stream_callback = None
     # Deferred paragraph break flag — set after tool iterations so a
@@ -433,7 +430,7 @@ def init_agent(
 
     # Optional current-turn user-message override used when the API-facing
     # user message intentionally differs from the persisted transcript
-    # (e.g. CLI voice mode adds a temporary prefix for the live call only).
+    # (e.g. a temporary prefix for the live call only).
     agent._persist_user_message_idx = None
     agent._persist_user_message_override = None
 
@@ -675,7 +672,6 @@ def init_agent(
     agent._memory_structured_conflict_require_explicit_override = True
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
-    agent._iters_since_skill = 0
     mem_config = {}
     if not skip_memory and not skip_profile_memory:
         try:
@@ -842,7 +838,7 @@ def init_agent(
     #   otherwise (incl. [])            → user excluded memory, skip injection
     #
     # Without this gate, `platform_toolsets: telegram: []` still leaks memory
-    # provider tools (fact_store, etc.) into the tool surface — a 10x latency
+    # provider tools into the tool surface — a 10x latency
     # penalty on local models and a frequent trigger of tool-call loops.
     if agent._memory_manager and agent.tools is not None and (
         agent.enabled_toolsets is None or "memory" in agent.enabled_toolsets
@@ -861,14 +857,6 @@ def init_agent(
             if _tname:
                 agent.valid_tool_names.add(_tname)
                 _existing_tool_names.add(_tname)
-
-    # Skills config: nudge interval for skill creation reminders
-    agent._skill_nudge_interval = 10
-    try:
-        skills_config = _agent_cfg.get("skills", {})
-        agent._skill_nudge_interval = int(skills_config.get("creation_nudge_interval", 10))
-    except Exception:
-        pass
 
     # Tool-use enforcement config: "auto" (default — matches hardcoded
     # model list), true (always), false (never), or list of substrings.

@@ -26,13 +26,12 @@ marlow-agent/
 ├── run_agent.py          # AIAgent class — core conversation loop (~12k LOC)
 ├── model_tools.py        # Tool orchestration, discover_builtin_tools(), handle_function_call()
 ├── toolsets.py           # Toolset definitions, _MARLOW_CORE_TOOLS list
-├── cli.py                # MarlowCLI class — interactive CLI orchestrator (~11k LOC)
 ├── marlow_state.py       # SessionDB — SQLite session store (FTS5 search)
 ├── marlow_constants.py   # get_marlow_home(), display_marlow_home() — profile-aware paths
 ├── marlow_logging.py     # setup_logging() — agent.log / errors.log / gateway.log (profile-aware)
 ├── batch_runner.py       # Parallel batch processing
 ├── agent/                # Agent internals (provider adapters, memory, caching, compression, etc.)
-├── marlow_cli/           # CLI subcommands, setup wizard, plugins loader, skin engine
+├── marlow_cli/           # CLI subcommands, setup wizard, plugin loader and single-query entry points
 ├── tools/                # Tool implementations — auto-discovered via tools/registry.py
 │   └── environments/     # Terminal backends (local, docker, ssh)
 ├── gateway/              # Messaging gateway — run.py + session.py + platforms/
@@ -40,17 +39,13 @@ marlow-agent/
 │   │                     #   and signed webhook. Discord ships as a platform plugin.
 │   └── builtin_hooks/    # Extension point for always-registered gateway hooks (none shipped)
 ├── plugins/              # Plugin system (see "Plugins" section below)
-│   ├── memory/           # Memory-provider plugins (honcho, holographic)
+│   ├── memory/           # Memory-provider plugins (honcho)
 │   ├── context_engine/   # Context-engine plugins
 │   ├── model-providers/  # Retained inference plugins (openai-codex, custom)
 │   ├── observability/    # Metrics / traces / logs plugin
-│   ├── image_gen/        # Codex OAuth image generation
 │   └── <others>/         # observability, browser/web, platforms, security
 ├── optional-skills/      # Heavier/niche skills shipped but NOT active by default
 ├── skills/               # Built-in skills bundled with the repo
-├── ui-tui/               # Ink (React) terminal UI — `marlow --tui`
-│   └── src/              # entry.tsx, app.tsx, gatewayClient.ts + app/components/hooks/lib
-├── tui_gateway/          # Python JSON-RPC backend for the TUI
 ├── cron/                 # Scheduler — jobs.py, scheduler.py
 ├── scripts/              # run_tests.sh, release.py, auxiliary scripts
 └── tests/                # Pytest suite (~17k tests across ~900 files as of May 2026)
@@ -63,7 +58,7 @@ Browse with `marlow logs [--follow] [--level ...] [--session ...]`.
 
 ## TypeScript Style
 
-Applies to TypeScript across Marlow: desktop, TUI, website, and future TS packages.
+Applies to TypeScript across Marlow: future TypeScript packages.
 
 - Prefer small nanostores over component state when state is shared, reused, or read by distant UI.
 - Let each feature own its atoms. Chat state belongs near chat, shell state near shell, shared state in `src/store`.
@@ -158,110 +153,19 @@ Reasoning content is stored in `assistant_msg["reasoning"]`.
 
 ---
 
-## CLI Architecture (cli.py)
+## Command-line and Gateway Entry Points
 
-- **Rich** for banner/panels, **prompt_toolkit** for input with autocomplete
-- **KawaiiSpinner** (`agent/display.py`) — animated faces during API calls, `┊` activity feed for tool results
-- `load_cli_config()` in cli.py merges hardcoded defaults + user config YAML
-- **Skin engine** (`marlow_cli/skin_engine.py`) — data-driven CLI theming; initialized from `display.skin` config key at startup; skins customize banner colors, spinner faces/verbs/wings, tool prefix, response box, branding text
-- `process_command()` is a method on `MarlowCLI` — dispatches on canonical command name resolved via `resolve_command()` from the central registry
-- Skill slash commands: `agent/skill_commands.py` scans `~/.marlow/skills/`, injects as **user message** (not system prompt) to preserve prompt caching
+`marlow_cli/main.py` owns CLI routing. `marlow_cli/query.py` implements
+`marlow chat -q`, including image input and session continuation.
+`marlow_cli/oneshot.py` implements the stdout-only `marlow -z` interface.
+Both use the core `AIAgent`. Operator setup and model selection use their
+own menus.
 
-### Slash Command Registry (`marlow_cli/commands.py`)
-
-All slash commands are defined in a central `COMMAND_REGISTRY` list of `CommandDef` objects. Every downstream consumer derives from this registry automatically:
-
-- **CLI** — `process_command()` resolves aliases via `resolve_command()`, dispatches on canonical name
-- **Gateway** — `GATEWAY_KNOWN_COMMANDS` frozenset for hook emission, `resolve_command()` for dispatch
-- **Gateway help** — `gateway_help_lines()` generates `/help` output
-- **Telegram** — `telegram_bot_commands()` generates the BotCommand menu
-- **Slack** — `slack_subcommand_map()` generates `/marlow` subcommand routing
-- **Autocomplete** — `COMMANDS` flat dict feeds `SlashCommandCompleter`
-- **CLI help** — `COMMANDS_BY_CATEGORY` dict feeds `show_help()`
-
-### Adding a Slash Command
-
-1. Add a `CommandDef` entry to `COMMAND_REGISTRY` in `marlow_cli/commands.py`:
-```python
-CommandDef("mycommand", "Description of what it does", "Session",
-           aliases=("mc",), args_hint="[arg]"),
-```
-2. Add handler in `MarlowCLI.process_command()` in `cli.py`:
-```python
-elif canonical == "mycommand":
-    self._handle_mycommand(cmd_original)
-```
-3. If the command is available in the gateway, add a handler in `gateway/run.py`:
-```python
-if canonical == "mycommand":
-    return await self._handle_mycommand(event)
-```
-4. For persistent settings, use `save_config_value()` in `cli.py`
-
-**CommandDef fields:**
-- `name` — canonical name without slash (e.g. `"background"`)
-- `description` — human-readable description
-- `category` — one of `"Session"`, `"Configuration"`, `"Tools & Skills"`, `"Info"`, `"Exit"`
-- `aliases` — tuple of alternative names (e.g. `("bg",)`)
-- `args_hint` — argument placeholder shown in help (e.g. `"<prompt>"`, `"[name]"`)
-- `cli_only` — only available in the interactive CLI
-- `gateway_only` — only available in messaging platforms
-- `gateway_config_gate` — config dotpath (e.g. `"display.tool_progress_command"`); when set on a `cli_only` command, the command becomes available in the gateway if the config value is truthy. `GATEWAY_KNOWN_COMMANDS` always includes config-gated commands so the gateway can dispatch them; help/menus only show them when the gate is open.
-
-**Adding an alias** requires only adding it to the `aliases` tuple on the existing `CommandDef`. No other file changes needed — dispatch, help text, Telegram menu, Slack mapping, and autocomplete all update automatically.
-
----
-
-## TUI Architecture (ui-tui + tui_gateway)
-
-The TUI is a full replacement for the classic (prompt_toolkit) CLI, activated via `marlow --tui` or `MARLOW_TUI=1`.
-
-### Process Model
-
-```
-marlow --tui
-  └─ Node (Ink)  ──stdio JSON-RPC──  Python (tui_gateway)
-       │                                  └─ AIAgent + tools + sessions
-       └─ renders transcript, composer, prompts, activity
-```
-
-TypeScript owns the screen. Python owns sessions, tools, model calls, and slash command logic.
-
-### Transport
-
-Newline-delimited JSON-RPC over stdio. Requests from Ink, events from Python. See `tui_gateway/server.py` for the full method/event catalog.
-
-### Key Surfaces
-
-| Surface | Ink component | Gateway method |
-|---------|---------------|----------------|
-| Chat streaming | `app.tsx` + `messageLine.tsx` | `prompt.submit` → `message.delta/complete` |
-| Tool activity | `thinking.tsx` | `tool.start/progress/complete` |
-| Approvals | `prompts.tsx` | `approval.respond` ← `approval.request` |
-| Clarify/sudo/secret | `prompts.tsx`, `maskedPrompt.tsx` | `clarify/sudo/secret.respond` |
-| Session picker | `sessionPicker.tsx` | `session.list/resume` |
-| Slash commands | Local handler + fallthrough | `slash.exec` → `_SlashWorker`, `command.dispatch` |
-| Completions | `useCompletion` hook | `complete.slash`, `complete.path` |
-| Theming | `theme.ts` + `branding.tsx` | `gateway.ready` with skin data |
-
-### Slash Command Flow
-
-1. Built-in client commands (`/help`, `/quit`, `/clear`, `/resume`, `/copy`, `/paste`, etc.) handled locally in `app.tsx`
-2. Everything else → `slash.exec` (runs in persistent `_SlashWorker` subprocess) → `command.dispatch` fallback
-
-### Dev Commands
-
-```bash
-cd ui-tui
-npm install       # first time
-npm run dev       # watch mode (rebuilds marlow-ink + tsx --watch)
-npm start         # production
-npm run build     # full build (marlow-ink + tsc)
-npm run type-check # typecheck only (tsc --noEmit)
-npm run lint      # eslint
-npm run fmt       # prettier
-npm test          # vitest
-```
+Gateway slash commands are registered in `marlow_cli/commands.py` and
+dispatched by `gateway/run.py`. Telegram and Slack build their menus from
+the same registry. Use `marlow_cli.config.save_config_value()` for atomic,
+typed profile setting changes. Explicit `/learn` requests can create a
+skill. Background memory review uses memory tools.
 
 ---
 
@@ -348,19 +252,15 @@ Reference: #2810 (bounds pass), #9801 (SHA pinning + audit CI).
 
 ### Top-level `config.yaml` sections (non-exhaustive):
 
-`model`, `agent`, `terminal`, `compression`, `display`, `stt`, `tts`,
+`model`, `agent`, `terminal`, `compression`, `display`,
 `memory`, `security`, `delegation`, `smart_model_routing`, `checkpoints`,
-`auxiliary`, `curator`, `skills`, `gateway`, `logging`, `cron`, `profiles`,
+`auxiliary`, `skills`, `gateway`, `logging`, `cron`, `profiles`,
 `plugins`, `honcho`.
 
-`auxiliary` holds per-task overrides for side-LLM work (curator, vision,
+`auxiliary` holds per-task overrides for side-LLM work (vision,
 embedding, title generation, session_search, etc.) — each task can pin
 its own provider/model/base_url/max_tokens/reasoning_effort. See
 `agent/auxiliary_client.py::_resolve_auto` for resolution order.
-
-`curator` holds the background skill-maintenance config —
-`enabled`, `interval_hours`, `min_idle_hours`, `stale_after_days`,
-`archive_after_days`, `backup` (nested).
 
 ### .env variables (SECRETS ONLY — API keys, tokens, passwords):
 1. Add to `OPTIONAL_ENV_VARS` in `marlow_cli/config.py` with metadata:
@@ -383,7 +283,6 @@ the env var in code (see `gateway_timeout`, `terminal.cwd` → `TERMINAL_CWD`).
 
 | Loader | Used by | Location |
 |--------|---------|----------|
-| `load_cli_config()` | CLI mode | `cli.py` — merges CLI-specific defaults + user YAML |
 | `load_config()` | `marlow tools`, `marlow setup`, most CLI subcommands | `marlow_cli/config.py` — merges `DEFAULT_CONFIG` + user YAML |
 | Direct YAML load | Gateway runtime | `gateway/run.py` + `gateway/config.py` — reads user YAML raw |
 
@@ -397,95 +296,6 @@ versa), you're on the wrong loader. Check `DEFAULT_CONFIG` coverage.
   removed** — the config loader prints a deprecation warning if it's set in
   `.env`. Same for `TERMINAL_CWD` in `.env`; the canonical setting is
   `terminal.cwd` in `config.yaml`.
-
----
-
-## Skin/Theme System
-
-The skin engine (`marlow_cli/skin_engine.py`) provides data-driven CLI visual customization. Skins are **pure data** — no code changes needed to add a new skin.
-
-### Architecture
-
-```
-marlow_cli/skin_engine.py    # SkinConfig dataclass, built-in skins, YAML loader
-~/.marlow/skins/*.yaml       # User-installed custom skins (drop-in)
-```
-
-- `init_skin_from_config()` — called at CLI startup, reads `display.skin` from config
-- `get_active_skin()` — returns cached `SkinConfig` for the current skin
-- `set_active_skin(name)` — switches skin at runtime (used by `/skin` command)
-- `load_skin(name)` — loads from user skins first, then built-ins, then falls back to default
-- Missing skin values inherit from the `default` skin automatically
-
-### What skins customize
-
-| Element | Skin Key | Used By |
-|---------|----------|---------|
-| Banner panel border | `colors.banner_border` | `banner.py` |
-| Banner panel title | `colors.banner_title` | `banner.py` |
-| Banner section headers | `colors.banner_accent` | `banner.py` |
-| Banner dim text | `colors.banner_dim` | `banner.py` |
-| Banner body text | `colors.banner_text` | `banner.py` |
-| Response box border | `colors.response_border` | `cli.py` |
-| Spinner faces (waiting) | `spinner.waiting_faces` | `display.py` |
-| Spinner faces (thinking) | `spinner.thinking_faces` | `display.py` |
-| Spinner verbs | `spinner.thinking_verbs` | `display.py` |
-| Spinner wings (optional) | `spinner.wings` | `display.py` |
-| Tool output prefix | `tool_prefix` | `display.py` |
-| Per-tool emojis | `tool_emojis` | `display.py` → `get_tool_emoji()` |
-| Agent name | `branding.agent_name` | `banner.py`, `cli.py` |
-| Welcome message | `branding.welcome` | `cli.py` |
-| Response box label | `branding.response_label` | `cli.py` |
-| Prompt symbol | `branding.prompt_symbol` | `cli.py` |
-
-### Built-in skins
-
-- `default` — Classic Marlow gold/kawaii (the current look)
-- `ares` — Crimson/bronze war-god theme with custom spinner wings
-- `mono` — Clean grayscale monochrome
-- `slate` — Cool blue developer-focused theme
-
-### Adding a built-in skin
-
-Add to `_BUILTIN_SKINS` dict in `marlow_cli/skin_engine.py`:
-
-```python
-"mytheme": {
-    "name": "mytheme",
-    "description": "Short description",
-    "colors": { ... },
-    "spinner": { ... },
-    "branding": { ... },
-    "tool_prefix": "┊",
-},
-```
-
-### User skins (YAML)
-
-Users create `~/.marlow/skins/<name>.yaml`:
-
-```yaml
-name: cyberpunk
-description: Neon-soaked terminal theme
-
-colors:
-  banner_border: "#FF00FF"
-  banner_title: "#00FFFF"
-  banner_accent: "#FF1493"
-
-spinner:
-  thinking_verbs: ["jacking in", "decrypting", "uploading"]
-  wings:
-    - ["⟨⚡", "⚡⟩"]
-
-branding:
-  agent_name: "Cyber Agent"
-  response_label: " ⚡ Cyber "
-
-tool_prefix: "▏"
-```
-
-Activate with `/skin cyberpunk` or `display.skin: cyberpunk` in config.yaml.
 
 ---
 
@@ -517,8 +327,8 @@ explicitly (it's idempotent).
 
 ### Memory-provider plugins (`plugins/memory/<name>/`)
 
-Separate discovery system for pluggable memory backends. Current built-in
-providers are **honcho** and **holographic**.
+Separate discovery system for pluggable memory backends. The built-in
+provider is **honcho**.
 
 Each provider implements the `MemoryProvider` ABC (see `agent/memory_provider.py`)
 and is orchestrated by `agent/memory_manager.py`. Lifecycle hooks include
@@ -574,15 +384,10 @@ without an explicit `kind:` get auto-coerced via a source-text heuristic
 
 Model-provider authoring conventions live in this guide and the bundled examples.
 
-### Context-engine and image-gen plugin directories
+### Context-engine plugins
 
-`plugins/context_engine/`, `plugins/image_gen/`, etc. follow the same
-pattern (ABC + orchestrator + per-plugin directory). Context engines
-plug into `agent/context_engine.py`; image-gen providers into
-`agent/image_gen_provider.py`. Reference or docs-companion plugins are
-maintained outside this tree and are not part of the bundled plugin surface.
-
----
+Context engines plug into `agent/context_engine.py`. Optional provider
+plugins can be installed in the active profile.
 
 ## Skills
 
@@ -702,9 +507,9 @@ Each platform's adapter picks a base toolset (e.g. Telegram uses
 platforms inherit from.
 
 Current toolset keys: `admin_approval`, `browser`, `clarify`,
-`code_execution`, `computer_use`, `context_engine`, `cronjob`, `debugging`,
-`delegation`, `file`, `image_gen`, `memory`, `messaging`, `moa`, `safe`,
-`search`, `session_search`, `skills`, `terminal`, `todo`, `tts`, `vision`,
+`code_execution`, `context_engine`, `cronjob`, `debugging`,
+`delegation`, `file`, `memory`, `messaging`, `moa`, `safe`,
+`search`, `session_search`, `skills`, `terminal`, `todo`, `vision`,
 and `web`.
 
 Enable/disable per platform via `marlow tools` (the curses UI) or the
@@ -746,46 +551,11 @@ work that must outlive the current turn, use `cronjob` or
 
 ---
 
-## Curator (skill lifecycle)
-
-Background skill-maintenance system that tracks usage on agent-created
-skills and auto-archives stale ones. Users never lose skills; archives
-go to `~/.marlow/skills/.archive/` and are restorable.
-
-- **Core:** `agent/curator.py` (review loop, auto-transitions, LLM review
-  prompt) + `agent/curator_backup.py` (pre-run tar.gz snapshots).
-- **CLI:** `marlow_cli/curator.py` wires `marlow curator <verb>` where
-  verbs are: `status`, `run`, `pause`, `resume`, `pin`, `unpin`,
-  `archive`, `restore`, `prune`, `backup`, `rollback`.
-- **Telemetry:** `tools/skill_usage.py` owns the sidecar
-  `~/.marlow/skills/.usage.json` — per-skill `use_count`, `view_count`,
-  `patch_count`, `last_activity_at`, `state` (active / stale /
-  archived), `pinned`.
-
-Invariants:
-- Curator only touches skills with `created_by: "agent"`; bundled and
-  manually installed local skills are off-limits.
-- Never deletes; max destructive action is archive.
-- Pinned skills are exempt from every auto-transition and from the
-  LLM review pass.
-- `skill_manage(action="delete")` refuses pinned skills; patch/edit/
-  write_file/remove_file go through so the agent can keep improving
-  pinned skills.
-
-Config section (`curator:` in `config.yaml`):
-`enabled`, `interval_hours`, `min_idle_hours`, `stale_after_days`,
-`archive_after_days`, `backup.*`.
-
-User-facing guidance is available through `marlow curator --help` and the repository README.
-
----
-
 ## Cron (scheduled jobs)
 
 `cron/jobs.py` (job store) + `cron/scheduler.py` (tick loop). Agents
 schedule jobs via the `cronjob` tool; users via `marlow cron <verb>`
-(`list`, `add`, `edit`, `pause`, `resume`, `run`, `remove`) or the
-`/cron` slash command.
+(`list`, `add`, `edit`, `pause`, `resume`, `run`, `remove`).
 
 Supported schedule formats:
 - Duration: `"30m"`, `"2h"`, `"1d"`

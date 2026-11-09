@@ -15,23 +15,6 @@ def _make_setup_args(**overrides):
     )
 
 
-def _make_chat_args(**overrides):
-    return Namespace(
-        continue_last=overrides.get("continue_last", None),
-        resume=overrides.get("resume", None),
-        model=overrides.get("model", None),
-        provider=overrides.get("provider", None),
-        toolsets=overrides.get("toolsets", None),
-        verbose=overrides.get("verbose", False),
-        query=overrides.get("query", None),
-        worktree=overrides.get("worktree", False),
-        yolo=overrides.get("yolo", False),
-        pass_session_id=overrides.get("pass_session_id", False),
-        quiet=overrides.get("quiet", False),
-        checkpoints=overrides.get("checkpoints", False),
-    )
-
-
 class TestNonInteractiveSetup:
     """Verify setup paths exit cleanly in headless/non-interactive environments."""
 
@@ -124,13 +107,14 @@ class TestNonInteractiveSetup:
         assert "Configuration reset to defaults." in out
 
     def test_chat_first_run_headless_skips_setup_prompt(self, capsys):
-        """Bare `marlow` should not prompt for input when no provider exists and stdin is headless."""
+        from marlow_cli._parser import build_top_level_parser
         from marlow_cli.main import cmd_chat
 
-        args = _make_chat_args()
+        parser, _, _ = build_top_level_parser()
+        args = parser.parse_args(["chat", "-q", "hello"])
 
         with (
-            patch("marlow_cli.main._has_any_provider_configured", return_value=False),
+            patch("marlow_cli.oneshot._resolve_query_runtime", side_effect=RuntimeError("Run marlow setup")),
             patch("marlow_cli.main.cmd_setup") as mock_setup,
             patch("sys.stdin") as mock_stdin,
             patch("builtins.input", side_effect=AssertionError("input should not be called")),
@@ -141,21 +125,15 @@ class TestNonInteractiveSetup:
 
         assert exc.value.code == 1
         mock_setup.assert_not_called()
-        out = capsys.readouterr().out
-        assert "marlow config set model.provider custom" in out
+        assert "Run marlow setup" in capsys.readouterr().err
 
-    def test_main_accepts_tts_setup_section(self, monkeypatch):
-        """`marlow setup tts` should parse and dispatch like other setup sections."""
+    def test_main_rejects_retired_tts_setup_section(self, monkeypatch, capsys):
         from marlow_cli import main as main_mod
 
-        received = {}
-
-        def fake_cmd_setup(args):
-            received["section"] = args.section
-
-        monkeypatch.setattr(main_mod, "cmd_setup", fake_cmd_setup)
-        monkeypatch.setattr("sys.argv", ["marlow", "setup", "tts"])
-
-        main_mod.main()
-
-        assert received["section"] == "tts"
+        with patch.object(main_mod, "cmd_setup") as setup:
+            monkeypatch.setattr("sys.argv", ["marlow", "setup", "tts"])
+            with pytest.raises(SystemExit) as exc:
+                main_mod.main()
+        assert exc.value.code == 2
+        assert "invalid choice" in capsys.readouterr().err
+        setup.assert_not_called()

@@ -36,7 +36,7 @@ def run_codex_app_server_turn(
 ) -> Dict[str, Any]:
     """Codex app-server runtime path. Hands the entire turn to a `codex
     app-server` subprocess and projects its events back into Marlow'
-    messages list so memory/skill review keep working.
+    messages list so background memory review can use the completed turn.
 
     Called from run_conversation() when agent.api_mode == "codex_app_server".
     Returns the same dict shape as the chat_completions path.
@@ -106,31 +106,9 @@ def run_codex_app_server_turn(
 
     # Splice projected messages into the conversation. The projector emits
     # standard {role, content, tool_calls, tool_call_id} entries, which
-    # is exactly what curator.py / sessions DB expect.
+    # is what the sessions database expects.
     if turn.projected_messages:
         messages.extend(turn.projected_messages)
-
-    # Counter ticks for the agent-improvement loop.
-    # _turns_since_memory and _user_turn_count are ALREADY incremented
-    # in the run_conversation() pre-loop block (lines ~11793-11817) so we
-    # do NOT touch them here — that would double-count.
-    # Only _iters_since_skill needs explicit increment, since the
-    # chat_completions loop bumps it per tool iteration (line ~12110)
-    # and that loop is bypassed on this path.
-    agent._iters_since_skill = (
-        getattr(agent, "_iters_since_skill", 0) + turn.tool_iterations
-    )
-
-    # Now check the skill nudge AFTER iters were incremented — same
-    # pattern the chat_completions path uses (line ~15432).
-    should_review_skills = False
-    if (
-        agent._skill_nudge_interval > 0
-        and agent._iters_since_skill >= agent._skill_nudge_interval
-        and "skill_manage" in agent.valid_tool_names
-    ):
-        should_review_skills = True
-        agent._iters_since_skill = 0
 
     # External memory provider sync (mirrors line ~15439). Skipped on
     # interrupt/error to avoid feeding partial transcripts to memory.
@@ -154,13 +132,11 @@ def run_codex_app_server_turn(
     if (
         turn.final_text
         and not turn.interrupted
-        and (should_review_memory or should_review_skills)
+        and should_review_memory
     ):
         try:
             agent._spawn_background_review(
                 messages_snapshot=list(messages),
-                review_memory=should_review_memory,
-                review_skills=should_review_skills,
             )
         except Exception:
             logger.debug("background review spawn raised", exc_info=True)

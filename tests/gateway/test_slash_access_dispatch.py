@@ -400,23 +400,22 @@ async def test_running_agent_fastpath_status_always_works():
 
 @pytest.mark.asyncio
 async def test_gate_uses_canonical_name_not_alias():
-    """If /hist resolves to canonical 'history' and history is in
-    user_allowed_commands, the alias must be allowed too."""
+    """The alias /fork inherits the policy for its canonical /branch command."""
     runner = _make_runner(
         platform_extra={
             "allow_admin_from": ["111"],
-            "user_allowed_commands": ["history"],
+            "user_allowed_commands": ["branch"],
         }
     )
-    # Find a real alias in the registry to use.
-    from marlow_cli.commands import COMMAND_REGISTRY
-    history_def = next(c for c in COMMAND_REGISTRY if c.name == "history")
-    # If /history has aliases, use one. Otherwise just use /history.
-    alias = history_def.aliases[0] if history_def.aliases else "history"
-    # Mock the history handler so we don't need real session state.
-    runner._handle_history_command = AsyncMock(return_value="history-handled")
-    result = await runner._handle_message(_make_event(f"/{alias}", _make_source(user_id="999")))
-    assert "⛔" not in (result or "")
+    runner.adapters[Platform.DISCORD].enrich_authorized_event = AsyncMock(
+        side_effect=lambda event: event
+    )
+    runner._handle_branch_command = AsyncMock(return_value="branch-handled")
+
+    result = await runner._handle_message(_make_event("/fork", _make_source(user_id="999")))
+
+    assert result == "branch-handled"
+
 
 
 # ---------------------------------------------------------------------------

@@ -59,6 +59,40 @@ def test_blank_memory_provider_does_not_auto_enable_honcho():
     save_config.assert_not_called()
 
 
+def test_gateway_agent_keeps_local_memory_with_retired_provider(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("MARLOW_HOME", str(tmp_path))
+    db_file = tmp_path / "memory_store.db"
+    db_file.write_bytes(b"historical data")
+    cfg = {"memory": {"provider": "holographic", "memory_enabled": True}, "agent": {}}
+
+    with (
+        patch("marlow_cli.config.load_config", return_value=cfg),
+        patch("marlow_cli.config.save_config") as save_config,
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            provider="custom",
+            model="test",
+            api_key="test-key-1234567890",
+            base_url="http://localhost:1234/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            platform="telegram",
+        )
+
+    assert agent._memory_store is not None
+    assert agent._memory_manager is None
+    assert "Holographic memory is no longer supported" in caplog.text
+    assert db_file.read_bytes() == b"historical data"
+    save_config.assert_not_called()
+    agent.close()
+
+
 def test_aiagent_forwards_user_id_alt_to_memory_provider():
     provider = RecordingMemoryProvider()
     cfg = {"memory": {"provider": "recording"}, "agent": {}}

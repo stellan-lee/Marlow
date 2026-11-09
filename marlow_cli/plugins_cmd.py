@@ -73,7 +73,7 @@ def _sanitize_plugin_name(
 
     ``allow_subdir=True`` permits a single forward slash inside *name* so
     category-namespaced plugin keys like ``observability/langfuse`` or
-    ``image_gen/openai`` (the registry keys emitted by ``_discover_all_plugins``)
+    ``platforms/discord`` (the registry keys emitted by ``_discover_all_plugins``)
     can be looked up. ``..`` and backslash are still rejected, leading and
     trailing slashes are stripped, and the resolved target must still live
     inside *plugins_dir*. Install paths leave this at the default ``False``

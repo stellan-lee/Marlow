@@ -1506,7 +1506,7 @@ def _skill_view_with_bump(args, **kw):
                 bump_view(str(resolved))
                 # A skill_view tool call is the agent actively loading the skill
                 # to act on it — that counts as use, not just a browse/view.
-                # Curator's stale timer keys off last_used_at (see agent/curator.py).
+                # A view also loads the skill into the active turn.
                 bump_use(str(resolved))
     except Exception:
         pass

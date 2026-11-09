@@ -8,6 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch as mock_patch
 
+import pytest
+
 import tools.approval as approval_module
 from tools.approval import (
     _get_approval_mode,
@@ -973,7 +975,7 @@ class TestFailClosedUnderPromptToolkit:
 
     def test_denies_when_prompt_toolkit_active_and_no_callback(self):
         import threading
-        import prompt_toolkit.application.current as ptc
+        ptc = pytest.importorskip("prompt_toolkit.application.current")
 
         orig = ptc.get_app_or_none
         ptc.get_app_or_none = lambda: object()  # pretend a pt app is running
@@ -1002,7 +1004,7 @@ class TestFailClosedUnderPromptToolkit:
 
     def test_callback_path_still_wins_over_guard(self):
         """Guard must not short-circuit a valid callback."""
-        import prompt_toolkit.application.current as ptc
+        ptc = pytest.importorskip("prompt_toolkit.application.current")
 
         orig = ptc.get_app_or_none
         ptc.get_app_or_none = lambda: object()

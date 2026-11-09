@@ -24,17 +24,6 @@ from utils import normalize_proxy_url
 
 logger = logging.getLogger(__name__)
 
-# Audio file extensions Marlow recognizes for native audio delivery.
-# Kept in sync with tools/send_message_tool.py and cron/scheduler.py via
-# should_send_media_as_audio() below.
-_AUDIO_EXTS = frozenset({'.ogg', '.opus', '.mp3', '.wav', '.m4a', '.flac'})
-# Telegram's Bot API sendAudio only accepts MP3 / M4A. Other audio
-# formats either need to go through sendVoice (Opus/OGG) or must be
-# delivered as a regular document.
-_TELEGRAM_AUDIO_ATTACHMENT_EXTS = frozenset({'.mp3', '.m4a'})
-_TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
-
-
 def _platform_name(platform) -> str:
     """Normalize a Platform enum / raw string into a lowercase name."""
     value = getattr(platform, "value", platform)
@@ -103,29 +92,6 @@ def _reply_anchor_for_event(event) -> str | None:
     if platform == "feishu" and thread_id and getattr(event, "reply_to_message_id", None):
         return getattr(event, "reply_to_message_id", None)
     return getattr(event, "message_id", None)
-
-
-def should_send_media_as_audio(platform, ext: str, is_voice: bool = False) -> bool:
-    """Return True when a media file should use the platform's audio sender.
-
-    Other platforms: every recognized audio extension routes through the
-    audio sender.
-
-    Telegram: the Bot API only accepts MP3/M4A for sendAudio and
-    Opus/OGG for sendVoice. Opus/OGG is only routed as audio when the
-    caller flagged ``is_voice=True`` (so we don't turn a regular audio
-    attachment into a voice bubble just because the file happens to be
-    Opus). Everything else falls through to document delivery by
-    returning ``False``.
-    """
-    normalized_ext = (ext or "").lower()
-    if normalized_ext not in _AUDIO_EXTS:
-        return False
-    if _platform_name(platform) == "telegram":
-        if normalized_ext in _TELEGRAM_VOICE_EXTS:
-            return is_voice
-        return normalized_ext in _TELEGRAM_AUDIO_ATTACHMENT_EXTS
-    return True
 
 
 def utf16_len(s: str) -> int:
@@ -701,8 +667,7 @@ def cleanup_image_cache(max_age_hours: int = 24) -> int:
 # ---------------------------------------------------------------------------
 # Audio cache utilities
 #
-# Same pattern as image cache -- voice messages from platforms are downloaded
-# here so the STT tool (OpenAI Whisper) can transcribe them from local files.
+# Keep ordinary audio uploads available as local file attachments.
 # ---------------------------------------------------------------------------
 
 AUDIO_CACHE_DIR = get_marlow_dir("cache/audio", "audio_cache")
@@ -1162,7 +1127,7 @@ SUPPORTED_IMAGE_DOCUMENT_TYPES = {
 # can actually deliver, so an unknown-extension path survives in the body
 # instead of vanishing.
 #
-# Covers images (inline), video (inline where supported), audio (voice/audio),
+# Covers images (inline), video (inline where supported), audio (file attachments),
 # documents/spreadsheets/presentations (send_document), archives, and rendered
 # web output. The dispatch partition (image vs video vs document) lives in
 # ``gateway/run.py``.
@@ -1173,7 +1138,7 @@ MEDIA_DELIVERY_EXTS: Tuple[str, ...] = (
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".svg",
     # Video (embed inline where supported)
     ".mp4", ".mov", ".avi", ".mkv", ".webm",
-    # Audio (delivered as voice/audio where supported)
+    # Audio (delivered as file attachments)
     ".mp3", ".wav", ".ogg", ".opus", ".m4a", ".flac",
     # Documents (uploaded as file attachments)
     ".pdf", ".docx", ".doc", ".odt", ".rtf", ".txt", ".md", ".epub",
@@ -1553,6 +1518,9 @@ class MessageEvent:
     # attachment/context expansion. Transient only: never persisted directly.
     raw_user_message: Optional[str] = None
     
+    def is_voice_only(self) -> bool:
+        return self.message_type == MessageType.VOICE and not (self.text or "").strip()
+
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
         return self.text.startswith("/")
@@ -1890,21 +1858,6 @@ class BasePlatformAdapter(ABC):
         self._post_delivery_callbacks: Dict[str, Any] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
-        # Auto-TTS on voice input: ``_auto_tts_default`` is the global default
-        # (``voice.auto_tts`` in config.yaml, pushed by GatewayRunner on connect).
-        # Per-chat overrides live in two sets populated from ``_voice_mode``:
-        #   - ``_auto_tts_enabled_chats``: chat explicitly opted in via ``/voice on``
-        #     or ``/voice tts`` (mode is ``voice_only`` or ``all``). Fires even when
-        #     the global default is False.
-        #   - ``_auto_tts_disabled_chats``: chat explicitly opted out via
-        #     ``/voice off`` (mode is ``off``). Suppresses auto-TTS even when the
-        #     global default is True.
-        # The gate in _process_message() is:
-        #   fire if chat in _auto_tts_enabled_chats
-        #     OR (_auto_tts_default and chat not in _auto_tts_disabled_chats)
-        self._auto_tts_default: bool = False
-        self._auto_tts_enabled_chats: set = set()
-        self._auto_tts_disabled_chats: set = set()
         # Chats where typing indicator is paused (e.g. during approval waits).
         # _keep_typing skips send_typing when the chat_id is in this set.
         self._typing_paused: set = set()
@@ -2090,21 +2043,6 @@ class BasePlatformAdapter(ABC):
     @property
     def fatal_error_retryable(self) -> bool:
         return self._fatal_error_retryable
-
-    def _should_auto_tts_for_chat(self, chat_id: str) -> bool:
-        """Whether auto-TTS on voice input should fire for ``chat_id``.
-
-        Decision layers (Issue #16007):
-          1. Explicit ``/voice on`` or ``/voice tts`` → always fire (even if
-             ``voice.auto_tts`` is False).
-          2. Explicit ``/voice off`` → never fire.
-          3. Fall back to the global ``voice.auto_tts`` config default.
-        """
-        if chat_id in self._auto_tts_enabled_chats:
-            return True
-        if chat_id in self._auto_tts_disabled_chats:
-            return False
-        return bool(self._auto_tts_default)
 
     def set_fatal_error_handler(self, handler: Callable[["BasePlatformAdapter"], Awaitable[None] | None]) -> None:
         self._fatal_error_handler = handler
@@ -2719,48 +2657,6 @@ class BasePlatformAdapter(ABC):
         
         return images, cleaned
     
-    async def send_voice(
-        self,
-        chat_id: str,
-        audio_path: str,
-        caption: Optional[str] = None,
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        **kwargs,
-    ) -> SendResult:
-        """
-        Send an audio file as a native voice message via the platform API.
-        
-        Override in subclasses to send audio as voice bubbles (Telegram)
-        or file attachments (Discord). Default falls back to sending the
-        file path as text.
-        """
-        text = f"🔊 Audio: {audio_path}"
-        if caption:
-            text = f"{caption}\n{text}"
-        return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
-
-    def prepare_tts_text(self, text: str) -> str:
-        """Prepare text for TTS. Override to filter tool output, code, etc.
-
-        Default strips markdown formatting and truncates to 4000 chars.
-        """
-        return re.sub(r'[*_`#\[\]()]', '', text)[:4000].strip()
-
-    async def play_tts(
-        self,
-        chat_id: str,
-        audio_path: str,
-        **kwargs,
-    ) -> SendResult:
-        """
-        Play auto-TTS audio for voice replies.
-
-        Override in subclasses for invisible playback (e.g. Web UI).
-        Default falls back to send_voice (shows audio player).
-        """
-        return await self.send_voice(chat_id=chat_id, audio_path=audio_path, **kwargs)
-
     async def send_video(
         self,
         chat_id: str,
@@ -2939,11 +2835,11 @@ class BasePlatformAdapter(ABC):
     @staticmethod
     def extract_media(content: str) -> Tuple[List[Tuple[str, bool]], str]:
         """
-        Extract MEDIA:<path> tags and [[audio_as_voice]] directives from response text.
+        Extract MEDIA:<path> tags and strip delivery directives.
 
-        The TTS tool returns responses like:
-            [[audio_as_voice]]
-            MEDIA:/path/to/audio.ogg
+        The retired ``[[audio_as_voice]]`` directive is still stripped from
+        older responses. Its flag is retained in the returned tuple for callers
+        that unpack it. Audio files are delivered as ordinary attachments.
 
         Skills that produce large/lossless images (e.g. info-graph, where a
         rendered JPG is 1-2 MB but Telegram's sendPhoto recompresses to
@@ -2953,8 +2849,7 @@ class BasePlatformAdapter(ABC):
         original response); this method just strips it so it never leaks into
         user-visible text. Per-file granularity is intentionally not exposed —
         when an agent emits ``[[as_document]]`` once, every image path in the
-        same response is delivered as a document, mirroring the all-or-nothing
-        scope of ``[[audio_as_voice]]``.
+        same response is delivered as a document.
 
         Args:
             content: The response text to scan.
@@ -4034,7 +3929,7 @@ class BasePlatformAdapter(ABC):
             cmd = event.get_command()
             from marlow_cli.commands import should_bypass_active_session
 
-            if should_bypass_active_session(cmd):
+            if should_bypass_active_session(cmd) or event.is_voice_only():
                 # /stop, /new, /reset must cancel the in-flight adapter task
                 # and preserve ordering of queued follow-ups.  Route those
                 # through the dedicated handoff path that serializes
@@ -4050,12 +3945,11 @@ class BasePlatformAdapter(ABC):
                         )
                     return
 
-                # Other bypass commands (/approve, /deny, /status,
-                # /background, /restart) just need direct dispatch — they
-                # don't cancel the running task.
+                # Other bypass commands and unsupported voice notes can
+                # receive a direct response without cancelling the task.
                 logger.debug(
-                    "[%s] Command '/%s' bypassing active-session guard for %s",
-                    self.name, cmd, session_key,
+                    "[%s] Dispatching %s directly during active session %s",
+                    self.name, f"/{cmd}" if cmd else "voice note", session_key,
                 )
                 try:
                     _thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
@@ -4075,7 +3969,7 @@ class BasePlatformAdapter(ABC):
                                 ttl_seconds=_eph_ttl,
                             )
                 except Exception as e:
-                    logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
+                    logger.error("[%s] Active-session dispatch failed: %s", self.name, e, exc_info=True)
                 return
 
             # Clarify text-capture bypass: if the agent is blocked on a
@@ -4343,58 +4237,8 @@ class BasePlatformAdapter(ABC):
                         )
                         text_content = _recovered
 
-                # Auto-TTS: if voice message, generate audio FIRST (before sending text)
-                # Gated via ``_should_auto_tts_for_chat``: fires when the chat has
-                # an explicit ``/voice on|tts`` opt-in OR when ``voice.auto_tts`` is
-                # True globally and no ``/voice off`` has been issued.
-                _tts_path = None
-                if (self._should_auto_tts_for_chat(event.source.chat_id)
-                        and event.message_type == MessageType.VOICE
-                        and text_content
-                        and not media_files):
-                    try:
-                        from tools.tts_tool import text_to_speech_tool, check_tts_requirements
-                        if check_tts_requirements():
-                            import json as _json
-                            speech_text = self.prepare_tts_text(text_content)
-                            if not speech_text:
-                                raise ValueError("Empty text after markdown cleanup")
-                            tts_result_str = await asyncio.to_thread(
-                                text_to_speech_tool, text=speech_text
-                            )
-                            tts_data = _json.loads(tts_result_str)
-                            _tts_path = tts_data.get("file_path")
-                    except Exception as tts_err:
-                        logger.warning("[%s] Auto-TTS failed: %s", self.name, tts_err)
-
-                # Play TTS audio before text (voice-first experience)
-                _tts_caption_delivered = False
-                if _tts_path and Path(_tts_path).exists():
-                    try:
-                        telegram_tts_caption = None
-                        if (
-                            self.platform == Platform.TELEGRAM
-                            and text_content
-                            and text_content[:1024] == text_content
-                        ):
-                            telegram_tts_caption = text_content
-                        tts_result = await self.play_tts(
-                            chat_id=event.source.chat_id,
-                            audio_path=_tts_path,
-                            caption=telegram_tts_caption,
-                            metadata=_thread_metadata,
-                        )
-                        _tts_caption_delivered = bool(
-                            telegram_tts_caption and getattr(tts_result, "success", False)
-                        )
-                    finally:
-                        try:
-                            os.remove(_tts_path)
-                        except OSError:
-                            pass
-
                 # Send the text portion
-                if text_content and not _tts_caption_delivered:
+                if text_content:
                     logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
                     _reply_anchor = _reply_anchor_for_event(event)
                     # Mark final response messages for notification delivery.
@@ -4462,14 +4306,13 @@ class BasePlatformAdapter(ABC):
                 from urllib.parse import quote as _quote
                 _image_paths: list = []
                 _non_image_media: list = []
-                for media_path, is_voice in media_files:
+                for media_path, _ in media_files:
                     _ext = Path(media_path).suffix.lower()
                     if (_ext in _IMAGE_EXTS
-                            and not is_voice
                             and not force_document_attachments):
                         _image_paths.append(media_path)
                     else:
-                        _non_image_media.append((media_path, is_voice))
+                        _non_image_media.append(media_path)
                 _non_image_local: list = []
                 for file_path in local_files:
                     if (Path(file_path).suffix.lower() in _IMAGE_EXTS
@@ -4490,18 +4333,12 @@ class BasePlatformAdapter(ABC):
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
-                for media_path, is_voice in _non_image_media:
+                for media_path in _non_image_media:
                     if human_delay > 0:
                         await asyncio.sleep(human_delay)
                     try:
                         ext = Path(media_path).suffix.lower()
-                        if should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
-                            media_result = await self.send_voice(
-                                chat_id=event.source.chat_id,
-                                audio_path=media_path,
-                                metadata=_thread_metadata,
-                            )
-                        elif ext in _VIDEO_EXTS:
+                        if ext in _VIDEO_EXTS:
                             media_result = await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=media_path,
@@ -4543,7 +4380,7 @@ class BasePlatformAdapter(ABC):
                 # A3 (#29346): if a non-empty response produced nothing
                 # deliverable, fail loudly rather than dropping it in silence.
                 _anything_delivered = (
-                    delivery_attempted or _tts_caption_delivered
+                    delivery_attempted
                     or images or local_files or media_files
                 )
                 if not _anything_delivered and _response_pre_extract.strip():

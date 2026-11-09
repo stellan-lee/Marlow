@@ -1,7 +1,5 @@
-"""Tests for the central command registry and autocomplete."""
+"""Tests for the central command registry and Gateway platform menus."""
 
-from prompt_toolkit.completion import CompleteEvent
-from prompt_toolkit.document import Document
 
 from marlow_cli.commands import (
     COMMAND_REGISTRY,
@@ -10,8 +8,6 @@ from marlow_cli.commands import (
     CommandDef,
     GATEWAY_KNOWN_COMMANDS,
     SUBCOMMANDS,
-    SlashCommandAutoSuggest,
-    SlashCommandCompleter,
     _CMD_NAME_LIMIT,
     _SLACK_RESERVED_COMMANDS,
     _TG_NAME_LIMIT,
@@ -27,15 +23,6 @@ from marlow_cli.commands import (
     telegram_bot_commands,
     telegram_menu_commands,
 )
-
-
-def _completions(completer: SlashCommandCompleter, text: str):
-    return list(
-        completer.get_completions(
-            Document(text=text),
-            CompleteEvent(completion_requested=True),
-        )
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -96,15 +83,12 @@ class TestResolveCommand:
     def test_canonical_name_resolves(self):
         assert resolve_command("help").name == "help"
         assert resolve_command("background").name == "background"
-        assert resolve_command("copy").name == "copy"
         assert resolve_command("agents").name == "agents"
 
     def test_alias_resolves_to_canonical(self):
         assert resolve_command("bg").name == "background"
         assert resolve_command("reset").name == "new"
         assert resolve_command("q").name == "queue"
-        assert resolve_command("exit").name == "quit"
-        assert resolve_command("gateway").name == "platforms"
         assert resolve_command("set-home").name == "sethome"
         assert resolve_command("set_admin_channel") is None
         assert resolve_command("setadmin") is None
@@ -121,6 +105,13 @@ class TestResolveCommand:
     def test_leading_slash_stripped(self):
         assert resolve_command("/help").name == "help"
         assert resolve_command("/bg").name == "background"
+
+    def test_retired_commands_are_absent(self):
+        names = {"voice", "personality", "skin", "journey", "curator", "indicator"}
+        assert not names.intersection(GATEWAY_KNOWN_COMMANDS)
+        assert all(resolve_command(name) is None for name in names)
+        assert not names.intersection(name for name, _ in telegram_bot_commands())
+        assert not names.intersection(slack_subcommand_map())
 
     def test_unknown_returns_none(self):
         assert resolve_command("nonexistent") is None
@@ -150,9 +141,7 @@ class TestDerivedDicts:
         assert "/bg" in COMMANDS
         assert "/reset" in COMMANDS
         assert "/q" in COMMANDS
-        assert "/exit" in COMMANDS
         assert "/reload_mcp" in COMMANDS
-        assert "/gateway" in COMMANDS
 
     def test_commands_by_category_covers_all_categories(self):
         registry_categories = {cmd.category for cmd in COMMAND_REGISTRY if not cmd.gateway_only}
@@ -497,114 +486,6 @@ class TestGatewayConfigGate:
 # Autocomplete (SlashCommandCompleter)
 # ---------------------------------------------------------------------------
 
-class TestSlashCommandCompleter:
-    # -- basic prefix completion -----------------------------------------
-
-    def test_builtin_prefix_completion_uses_shared_registry(self):
-        completions = _completions(SlashCommandCompleter(), "/re")
-        texts = {item.text for item in completions}
-
-        assert "reset" in texts
-        assert "retry" in texts
-        assert "reload-mcp" in texts
-
-    def test_builtin_completion_display_meta_shows_description(self):
-        completions = _completions(SlashCommandCompleter(), "/help")
-        assert len(completions) == 1
-        assert completions[0].display_meta_text == "Show available commands"
-
-    # -- exact-match trailing space --------------------------------------
-
-    def test_exact_match_completion_adds_trailing_space(self):
-        completions = _completions(SlashCommandCompleter(), "/help")
-
-        assert [item.text for item in completions] == ["help "]
-
-    def test_partial_match_does_not_add_trailing_space(self):
-        completions = _completions(SlashCommandCompleter(), "/hel")
-
-        assert [item.text for item in completions] == ["help"]
-
-    # -- non-slash input returns nothing ---------------------------------
-
-    def test_no_completions_for_non_slash_input(self):
-        assert _completions(SlashCommandCompleter(), "help") == []
-
-    def test_no_completions_for_empty_input(self):
-        assert _completions(SlashCommandCompleter(), "") == []
-
-    # -- skill commands via provider ------------------------------------
-
-    def test_skill_commands_are_completed_from_provider(self):
-        completer = SlashCommandCompleter(
-            skill_commands_provider=lambda: {
-                "/gif-search": {"description": "Search for GIFs across providers"},
-            }
-        )
-
-        completions = _completions(completer, "/gif")
-
-        assert len(completions) == 1
-        assert completions[0].text == "gif-search"
-        assert completions[0].display_text == "/gif-search"
-        assert completions[0].display_meta_text == "⚡ Search for GIFs across providers"
-
-    def test_skill_exact_match_adds_trailing_space(self):
-        completer = SlashCommandCompleter(
-            skill_commands_provider=lambda: {
-                "/gif-search": {"description": "Search for GIFs"},
-            }
-        )
-
-        completions = _completions(completer, "/gif-search")
-
-        assert len(completions) == 1
-        assert completions[0].text == "gif-search "
-
-    def test_no_skill_provider_means_no_skill_completions(self):
-        """Default (None) provider should not blow up or add completions."""
-        completer = SlashCommandCompleter()
-        completions = _completions(completer, "/gif")
-        # /gif doesn't match any builtin command
-        assert completions == []
-
-    def test_skill_provider_exception_is_swallowed(self):
-        """A broken provider should not crash autocomplete."""
-        completer = SlashCommandCompleter(
-            skill_commands_provider=lambda: (_ for _ in ()).throw(RuntimeError("boom")),
-        )
-        # Should return builtin matches only, no crash
-        completions = _completions(completer, "/he")
-        texts = {item.text for item in completions}
-        assert "help" in texts
-
-    def test_skill_description_truncated_at_50_chars(self):
-        long_desc = "A" * 80
-        completer = SlashCommandCompleter(
-            skill_commands_provider=lambda: {
-                "/long-skill": {"description": long_desc},
-            }
-        )
-        completions = _completions(completer, "/long")
-        assert len(completions) == 1
-        meta = completions[0].display_meta_text
-        # "⚡ " prefix + 50 chars + "..."
-        assert meta == f"⚡ {'A' * 50}..."
-
-    def test_skill_missing_description_uses_fallback(self):
-        completer = SlashCommandCompleter(
-            skill_commands_provider=lambda: {
-                "/no-desc": {},
-            }
-        )
-        completions = _completions(completer, "/no-desc")
-        assert len(completions) == 1
-        assert "Skill command" in completions[0].display_meta_text
-
-
-# ── SUBCOMMANDS extraction ──────────────────────────────────────────────
-
-
 class TestSubcommands:
     def test_reasoning_has_subcommands(self):
         assert "/reasoning" in SUBCOMMANDS
@@ -612,16 +493,6 @@ class TestSubcommands:
         assert "high" in subs
         assert "show" in subs
         assert "hide" in subs
-
-    def test_voice_has_subcommands(self):
-        assert "/voice" in SUBCOMMANDS
-        assert "on" in SUBCOMMANDS["/voice"]
-        assert "off" in SUBCOMMANDS["/voice"]
-
-    def test_cron_has_subcommands(self):
-        assert "/cron" in SUBCOMMANDS
-        assert "list" in SUBCOMMANDS["/cron"]
-        assert "add" in SUBCOMMANDS["/cron"]
 
     def test_commands_without_subcommands_not_in_dict(self):
         """Plain commands should not appear in SUBCOMMANDS."""
@@ -631,76 +502,6 @@ class TestSubcommands:
 
 
 # ── Subcommand tab completion ───────────────────────────────────────────
-
-
-class TestSubcommandCompletion:
-    def test_subcommand_completion_after_space(self):
-        """Typing '/reasoning ' then Tab should show subcommands."""
-        completions = _completions(SlashCommandCompleter(), "/reasoning ")
-        texts = {c.text for c in completions}
-        assert "high" in texts
-        assert "show" in texts
-
-    def test_subcommand_prefix_filters(self):
-        """Typing '/reasoning sh' should only show 'show'."""
-        completions = _completions(SlashCommandCompleter(), "/reasoning sh")
-        texts = {c.text for c in completions}
-        assert texts == {"show"}
-
-    def test_subcommand_exact_match_suppressed(self):
-        """Typing the full subcommand shouldn't re-suggest it."""
-        completions = _completions(SlashCommandCompleter(), "/reasoning show")
-        texts = {c.text for c in completions}
-        assert "show" not in texts
-
-    def test_no_subcommands_for_plain_command(self):
-        """Commands without subcommands yield nothing after space."""
-        completions = _completions(SlashCommandCompleter(), "/help ")
-        assert completions == []
-
-
-# ── Ghost text (SlashCommandAutoSuggest) ────────────────────────────────
-
-
-def _suggestion(text: str, completer=None) -> str | None:
-    """Get ghost text suggestion for given input."""
-    suggest = SlashCommandAutoSuggest(completer=completer)
-    doc = Document(text=text)
-
-    class FakeBuffer:
-        pass
-
-    result = suggest.get_suggestion(FakeBuffer(), doc)
-    return result.text if result else None
-
-
-class TestGhostText:
-    def test_command_name_suggestion(self):
-        """/he → 'lp'"""
-        assert _suggestion("/he") == "lp"
-
-    def test_command_name_suggestion_reasoning(self):
-        """/rea → 'soning'"""
-        assert _suggestion("/rea") == "soning"
-
-    def test_no_suggestion_for_complete_command(self):
-        assert _suggestion("/help") is None
-
-    def test_subcommand_suggestion(self):
-        """/reasoning h → 'igh'"""
-        assert _suggestion("/reasoning h") == "igh"
-
-    def test_subcommand_suggestion_show(self):
-        """/reasoning sh → 'ow'"""
-        assert _suggestion("/reasoning sh") == "ow"
-
-    def test_no_suggestion_for_non_slash(self):
-        assert _suggestion("hello") is None
-
-
-# ---------------------------------------------------------------------------
-# Telegram command name sanitization
-# ---------------------------------------------------------------------------
 
 
 class TestSanitizeTelegramName:

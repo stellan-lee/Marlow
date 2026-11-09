@@ -30,7 +30,7 @@ def test_chat_provider_argparse_acceptance(monkeypatch):
         recorded["provider"] = args.provider
 
     monkeypatch.setattr("marlow_cli.main.cmd_chat", mock_cmd_chat)
-    monkeypatch.setattr(sys, "argv", ["marlow", "chat", "--provider", "my-custom-key"])
+    monkeypatch.setattr(sys, "argv", ["marlow", "chat", "--provider", "my-custom-key", "-q", "hello"])
 
     from marlow_cli.main import main
     main()

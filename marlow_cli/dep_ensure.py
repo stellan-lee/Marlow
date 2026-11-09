@@ -9,8 +9,8 @@ install.sh is still the *installation* backend because it has 1900 lines of
 battle-tested OS detection and package-manager logic (apt/brew/pacman/dnf/
 zypper/…). Reimplementing that in Python would be huge duplication.
 
-Deps that degrade gracefully (ripgrep → grep fallback, ffmpeg → skip conversion)
-don't need ensure_dependency wired in — only hard-fail sites do (TUI needs node,
+Deps that degrade gracefully (ripgrep → grep fallback)
+don't need ensure_dependency wired in — only hard-fail sites do (browser tools need Node.js,
 browser tool needs agent-browser).
 """
 from __future__ import annotations
@@ -29,14 +29,12 @@ _DEP_CHECKS = {
         or _has_marlow_agent_browser()
     ),
     "ripgrep": lambda: shutil.which("rg") is not None,
-    "ffmpeg": lambda: shutil.which("ffmpeg") is not None,
 }
 
 _DEP_DESCRIPTIONS = {
-    "node": "Node.js (required for browser tools and TUI)",
+    "node": "Node.js (required for browser tools)",
     "browser": "Browser engine (Chromium, for web browsing tools)",
     "ripgrep": "ripgrep (fast file search)",
-    "ffmpeg": "ffmpeg (TTS voice messages)",
 }
 
 

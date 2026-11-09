@@ -18,13 +18,6 @@ def _bump_view_many(marlow_home: str, skill_name: str, iterations: int) -> None:
 
 @pytest.fixture
 def skills_home(tmp_path, monkeypatch):
-    """Isolated MARLOW_HOME with a clean skills/ dir for each test.
-
-    Pins ``curator.prune_builtins`` OFF so the bundled/hub-protection tests in
-    this module exercise the off-path semantics regardless of the shipped
-    default. Tests that want built-ins to be curation-eligible flip it back on
-    explicitly via ``monkeypatch.setattr(mod, "_prune_builtins_enabled", ...)``.
-    """
     home = tmp_path / ".marlow"
     home.mkdir()
     (home / "skills").mkdir()
@@ -34,7 +27,6 @@ def skills_home(tmp_path, monkeypatch):
     import importlib
     import tools.skill_usage as mod
     importlib.reload(mod)
-    monkeypatch.setattr(mod, "_prune_builtins_enabled", lambda: False)
     return home
 
 
@@ -90,9 +82,6 @@ def test_get_record_missing_returns_empty_record(skills_home):
     rec = get_record("nonexistent")
     assert rec["use_count"] == 0
     assert rec["view_count"] == 0
-    assert rec["state"] == "active"
-    assert rec["pinned"] is False
-    assert rec["archived_at"] is None
 
 
 def test_get_record_backfills_missing_keys(skills_home):
@@ -101,7 +90,6 @@ def test_get_record_backfills_missing_keys(skills_home):
     rec = get_record("legacy")
     assert rec["use_count"] == 5
     assert "view_count" in rec  # backfilled
-    assert "state" in rec
 
 
 def test_load_usage_handles_corrupt_file(skills_home):
@@ -180,46 +168,8 @@ def test_concurrent_bump_view_preserves_all_updates(skills_home):
 
 
 # ---------------------------------------------------------------------------
-# State transitions
+# Removal
 # ---------------------------------------------------------------------------
-
-def test_set_state_active(skills_home):
-    from tools.skill_usage import set_state, get_record, STATE_ACTIVE
-    set_state("x", STATE_ACTIVE)
-    assert get_record("x")["state"] == "active"
-
-
-def test_set_state_archived_records_timestamp(skills_home):
-    from tools.skill_usage import set_state, get_record, STATE_ARCHIVED
-    set_state("x", STATE_ARCHIVED)
-    rec = get_record("x")
-    assert rec["state"] == "archived"
-    assert rec["archived_at"] is not None
-
-
-def test_set_state_invalid_is_noop(skills_home):
-    from tools.skill_usage import set_state, get_record
-    set_state("x", "bogus")
-    # No record created for invalid state
-    rec = get_record("x")
-    assert rec["state"] == "active"  # default
-
-
-def test_restoring_from_archive_clears_timestamp(skills_home):
-    from tools.skill_usage import set_state, get_record, STATE_ARCHIVED, STATE_ACTIVE
-    set_state("x", STATE_ARCHIVED)
-    assert get_record("x")["archived_at"] is not None
-    set_state("x", STATE_ACTIVE)
-    assert get_record("x")["archived_at"] is None
-
-
-def test_set_pinned(skills_home):
-    from tools.skill_usage import set_pinned, get_record
-    set_pinned("x", True)
-    assert get_record("x")["pinned"] is True
-    set_pinned("x", False)
-    assert get_record("x")["pinned"] is False
-
 
 def test_forget_removes_record(skills_home):
     from tools.skill_usage import bump_view, forget, load_usage
@@ -230,224 +180,12 @@ def test_forget_removes_record(skills_home):
 
 
 # ---------------------------------------------------------------------------
-# Provenance filter — the load-bearing safety check
-# ---------------------------------------------------------------------------
-
-def test_agent_created_excludes_bundled(skills_home):
-    from tools.skill_usage import list_agent_created_skill_names, mark_agent_created
-    skills_dir = skills_home / "skills"
-    _write_skill(skills_dir, "bundled-skill", category="github")
-    _write_skill(skills_dir, "my-skill")
-    mark_agent_created("my-skill")
-    # Seed a bundled manifest marking bundled-skill as upstream
-    (skills_dir / ".bundled_manifest").write_text(
-        "bundled-skill:abc123\n", encoding="utf-8",
-    )
-    names = list_agent_created_skill_names()
-    assert "my-skill" in names
-    assert "bundled-skill" not in names
-
-
-def test_is_agent_created(skills_home):
-    from tools.skill_usage import is_agent_created
-    skills_dir = skills_home / "skills"
-    (skills_dir / ".bundled_manifest").write_text("bundled:abc\n", encoding="utf-8")
-    assert is_agent_created("my-skill") is True
-    assert is_agent_created("bundled") is False
-
-
-def test_agent_created_skips_archive_and_hub_dirs(skills_home):
-    from tools.skill_usage import list_agent_created_skill_names, mark_agent_created
-    skills_dir = skills_home / "skills"
-    _write_skill(skills_dir, "real-skill")
-    mark_agent_created("real-skill")
-    # Dot-prefixed dirs must be ignored even if they contain SKILL.md
-    archive = skills_dir / ".archive" / "old-skill"
-    archive.mkdir(parents=True)
-    (archive / "SKILL.md").write_text(
-        "---\nname: old-skill\n---\n", encoding="utf-8",
-    )
-    names = list_agent_created_skill_names()
-    assert "real-skill" in names
-    assert "old-skill" not in names
-
-
-# ---------------------------------------------------------------------------
-# Archive / restore
-# ---------------------------------------------------------------------------
-
-def test_archive_skill_moves_directory(skills_home):
-    from tools.skill_usage import archive_skill, get_record
-    skills_dir = skills_home / "skills"
-    skill_dir = _write_skill(skills_dir, "old-skill")
-    assert skill_dir.exists()
-
-    ok, msg = archive_skill("old-skill")
-    assert ok, msg
-    assert not skill_dir.exists()
-    assert (skills_dir / ".archive" / "old-skill" / "SKILL.md").exists()
-    assert get_record("old-skill")["state"] == "archived"
-    assert get_record("old-skill")["archived_at"] is not None
-
-
-def test_archive_refuses_bundled_skill(skills_home):
-    from tools.skill_usage import archive_skill
-    skills_dir = skills_home / "skills"
-    _write_skill(skills_dir, "bundled")
-    (skills_dir / ".bundled_manifest").write_text("bundled:abc\n", encoding="utf-8")
-
-    ok, msg = archive_skill("bundled")
-    assert not ok
-    assert "bundled" in msg.lower() or "hub" in msg.lower()
-
-
-def test_archive_missing_skill_returns_error(skills_home):
-    from tools.skill_usage import archive_skill
-    ok, msg = archive_skill("nonexistent")
-    assert not ok
-    assert "not found" in msg.lower()
-
-
-def test_restore_skill_moves_back(skills_home):
-    from tools.skill_usage import archive_skill, restore_skill, get_record
-    skills_dir = skills_home / "skills"
-    _write_skill(skills_dir, "temp-skill")
-    archive_skill("temp-skill")
-    assert not (skills_dir / "temp-skill").exists()
-
-    ok, msg = restore_skill("temp-skill")
-    assert ok, msg
-    assert (skills_dir / "temp-skill" / "SKILL.md").exists()
-    assert get_record("temp-skill")["state"] == "active"
-
-
-def test_restore_skill_finds_nested_archive_subdir(skills_home):
-    """Skills archived under nested category subdirs (e.g.
-    .archive/<category>/<skill>/) — left behind by older archive layouts or
-    external imports — must still be restorable by name."""
-    from tools.skill_usage import restore_skill, get_record
-    skills_dir = skills_home / "skills"
-    nested = skills_dir / ".archive" / "openclaw-imports" / "nested-skill"
-    nested.mkdir(parents=True)
-    (nested / "SKILL.md").write_text(
-        "---\nname: nested-skill\ndescription: x\n---\n", encoding="utf-8",
-    )
-
-    ok, msg = restore_skill("nested-skill")
-    assert ok, msg
-    assert (skills_dir / "nested-skill" / "SKILL.md").exists()
-    assert not nested.exists()
-    assert get_record("nested-skill")["state"] == "active"
-
-
-def test_restore_skill_finds_nested_timestamped_prefix(skills_home):
-    """Prefix-match path (timestamped dupes) must also descend into nested
-    archive subdirs, not just .archive/ top-level."""
-    from tools.skill_usage import restore_skill
-    skills_dir = skills_home / "skills"
-    nested = skills_dir / ".archive" / "imports" / "dup-skill-20260101000000"
-    nested.mkdir(parents=True)
-    (nested / "SKILL.md").write_text(
-        "---\nname: dup-skill\ndescription: x\n---\n", encoding="utf-8",
-    )
-
-    ok, msg = restore_skill("dup-skill")
-    assert ok, msg
-    assert (skills_dir / "dup-skill" / "SKILL.md").exists()
-
-
-def test_archive_collision_gets_suffix(skills_home):
-    from tools.skill_usage import archive_skill
-    skills_dir = skills_home / "skills"
-    _write_skill(skills_dir, "dup")
-    archive_skill("dup")
-    _write_skill(skills_dir, "dup")  # recreate
-    ok, msg = archive_skill("dup")
-    assert ok
-    # Two entries under .archive/ — second should have a timestamp suffix
-    archived = sorted(p.name for p in (skills_dir / ".archive").iterdir() if p.is_dir())
-    assert "dup" in archived
-    assert any(n.startswith("dup-") and n != "dup" for n in archived)
-
-
-# ---------------------------------------------------------------------------
-# Reporting
-# ---------------------------------------------------------------------------
-
-def test_agent_created_report_includes_marked_skills_with_defaults(skills_home):
-    from tools.skill_usage import agent_created_report, bump_view, mark_agent_created
-    skills_dir = skills_home / "skills"
-    _write_skill(skills_dir, "a")
-    _write_skill(skills_dir, "b")
-    mark_agent_created("a")
-    mark_agent_created("b")
-    bump_view("a")
-    rows = agent_created_report()
-    by_name = {r["name"]: r for r in rows}
-    assert "a" in by_name and "b" in by_name
-    assert by_name["a"]["view_count"] == 1
-    # b has only the provenance marker — activity fields still default.
-    assert by_name["b"]["view_count"] == 0
-    assert by_name["b"]["state"] == "active"
-
-
-def test_manual_skill_with_usage_is_not_curator_managed(skills_home):
-    from tools.skill_usage import agent_created_report, bump_view, list_agent_created_skill_names
-    skills_dir = skills_home / "skills"
-    _write_skill(skills_dir, "manual-skill")
-
-    bump_view("manual-skill")
-
-    assert "manual-skill" not in list_agent_created_skill_names()
-    assert "manual-skill" not in {r["name"] for r in agent_created_report()}
-
-
-def test_agent_created_report_excludes_bundled(skills_home):
-    from tools.skill_usage import agent_created_report, mark_agent_created
-    skills_dir = skills_home / "skills"
-    _write_skill(skills_dir, "mine")
-    _write_skill(skills_dir, "bundled")
-    mark_agent_created("mine")
-    (skills_dir / ".bundled_manifest").write_text("bundled:abc\n", encoding="utf-8")
-    names = {r["name"] for r in agent_created_report()}
-    assert "mine" in names
-    assert "bundled" not in names
-
-
-def test_agent_created_report_deduplicates_view_and_use_for_one_load(skills_home, monkeypatch):
-    import tools.skill_usage as skill_usage
-
-    skills_dir = skills_home / "skills"
-    _write_skill(skills_dir, "mine")
-    timestamps = iter([
-        "2026-04-30T10:00:00+00:00",
-        "2026-04-30T11:00:00+00:00",
-        "2026-04-30T12:00:00+00:00",
-        "2026-04-30T13:00:00+00:00",
-        "2026-04-30T14:00:00+00:00",
-    ])
-    monkeypatch.setattr(skill_usage, "_now_iso", lambda: next(timestamps))
-
-    skill_usage.mark_agent_created("mine")
-    skill_usage.bump_view("mine")
-    skill_usage.bump_use("mine")
-    skill_usage.bump_patch("mine")
-
-    row = next(r for r in skill_usage.agent_created_report() if r["name"] == "mine")
-    assert row["activity_count"] == 2
-    assert row["last_activity_at"] == "2026-04-30T13:00:00+00:00"
-
-
-# ---------------------------------------------------------------------------
-# Telemetry vs curation — usage is tracked for ALL skills; curation is not
+# Bundled skill telemetry
 # ---------------------------------------------------------------------------
 
 def test_bump_view_tracks_bundled_skill(skills_home):
-    """Telemetry IS recorded for bundled skills (observability), but the record
-    must NOT make the skill a curation candidate by itself."""
-    from tools.skill_usage import (
-        bump_view, load_usage, list_agent_created_skill_names,
-    )
+    """Bundled skills also record usage."""
+    from tools.skill_usage import bump_view, load_usage
     skills_dir = skills_home / "skills"
     _write_skill(skills_dir, "ship-bundled")
     (skills_dir / ".bundled_manifest").write_text(
@@ -458,94 +196,17 @@ def test_bump_view_tracks_bundled_skill(skills_home):
     rec = load_usage().get("ship-bundled")
     assert isinstance(rec, dict), "bundled skill telemetry should be recorded"
     assert rec["view_count"] == 1
-    # Pruning is off by default in this fixture → not a curation candidate.
-    assert "ship-bundled" not in list_agent_created_skill_names()
-
-
-def test_set_state_no_op_for_bundled_skill(skills_home):
-    """State transitions on bundled skills must not land in the sidecar."""
-    from tools.skill_usage import set_state, load_usage, STATE_ARCHIVED
-    skills_dir = skills_home / "skills"
-    (skills_dir / ".bundled_manifest").write_text(
-        "locked:abc\n", encoding="utf-8",
-    )
-    set_state("locked", STATE_ARCHIVED)
-    assert "locked" not in load_usage()
-
-
-def test_restore_refuses_to_shadow_bundled_skill(skills_home):
-    """If a bundled skill now occupies the name, refuse to restore."""
-    from tools.skill_usage import archive_skill, restore_skill
-    skills_dir = skills_home / "skills"
-    _write_skill(skills_dir, "shared-name")
-    archive_skill("shared-name")
-
-    # Now a bundled skill appears with the same name
-    (skills_dir / ".bundled_manifest").write_text(
-        "shared-name:abc\n", encoding="utf-8",
-    )
-    _write_skill(skills_dir, "shared-name")  # bundled install landed
-
-    ok, msg = restore_skill("shared-name")
-    assert not ok
-    assert "bundled" in msg.lower() or "shadow" in msg.lower()
-
-
-def test_bundled_telemetry_tracked_but_lifecycle_refused(skills_home):
-    """Bundled-skill telemetry is recorded without lifecycle mutation."""
-    from tools.skill_usage import (
-        bump_view, bump_use, bump_patch, set_state, set_pinned,
-        archive_skill, load_usage, STATE_ACTIVE, STATE_STALE, STATE_ARCHIVED,
-    )
-    skills_dir = skills_home / "skills"
-    _write_skill(skills_dir, "bundled-one")
-    _write_skill(skills_dir, "mine")
-
-    (skills_dir / ".bundled_manifest").write_text(
-        "bundled-one:abc\n", encoding="utf-8",
-    )
-    for name in ("bundled-one",):
-        bump_view(name)
-        bump_use(name)
-        bump_patch(name)
-        set_state(name, STATE_STALE)
-        set_state(name, STATE_ARCHIVED)
-        set_pinned(name, True)
-        ok, _msg = archive_skill(name)
-        assert not ok, f"archive_skill(\"{name}\") should refuse"
-
-    data = load_usage()
-    # Telemetry landed for both.
-    for name in ("bundled-one",):
-        assert name in data, f"{name} telemetry should be recorded"
-        assert data[name]["view_count"] == 1
-        assert data[name]["use_count"] == 1
-        assert data[name]["patch_count"] == 1
-        # But lifecycle mutators were refused — state stays the default, never
-        # archived/stale/pinned, and created_by is never agent.
-        assert data[name]["state"] == STATE_ACTIVE
-        assert data[name]["archived_at"] is None
-        assert data[name]["pinned"] is False
-        assert data[name].get("created_by") != "agent"
-
-    # Directories must still be in place on disk.
-    assert (skills_dir / "bundled-one" / "SKILL.md").exists()
-
-    # The agent-created skill can still be mutated normally.
-    bump_view("mine")
-    assert load_usage()["mine"]["view_count"] == 1
 
 
 def test_usage_report_covers_retained_provenance(skills_home):
     """usage_report() covers bundled and locally created skills."""
     from tools.skill_usage import (
-        bump_use, usage_report, mark_agent_created,
+        bump_use, usage_report,
     )
     skills_dir = skills_home / "skills"
     _write_skill(skills_dir, "bundled-one")
     _write_skill(skills_dir, "mine")
     (skills_dir / ".bundled_manifest").write_text("bundled-one:abc\n", encoding="utf-8")
-    mark_agent_created("mine")
     for n in ("bundled-one", "mine"):
         bump_use(n)
 
@@ -557,3 +218,19 @@ def test_usage_report_covers_retained_provenance(skills_home):
     for n in rows:
         assert rows[n]["use_count"] == 1
         assert rows[n]["_persisted"] is True
+
+
+
+def test_legacy_pin_and_suppression_survive_tracking(skills_home):
+    from tools.skill_usage import bump_view, get_record, read_suppressed_names, save_usage
+
+    save_usage({"custom": {"pinned": True, "state": "stale"}})
+    (skills_home / "skills" / ".curator_suppressed").write_text(
+        "retired-bundled-skill\n", encoding="utf-8"
+    )
+
+    bump_view("custom")
+
+    assert get_record("custom")["pinned"] is True
+    assert get_record("custom")["state"] == "stale"
+    assert read_suppressed_names() == {"retired-bundled-skill"}

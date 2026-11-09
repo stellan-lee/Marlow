@@ -43,11 +43,6 @@ _HOME_CHANNEL_ENV_OVERRIDES = {"email": "EMAIL_HOME_ADDRESS"}
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".3gp"}
 _AUDIO_EXTS = {".ogg", ".opus", ".mp3", ".wav", ".m4a", ".flac"}
-_VOICE_EXTS = {".ogg", ".opus"}
-# Telegram's Bot API sendAudio only accepts MP3 / M4A. Other audio
-# formats either route through sendVoice (Opus/OGG) or fall back to
-# document delivery.
-_TELEGRAM_SEND_AUDIO_EXTS = {".mp3", ".m4a"}
 _URL_SECRET_QUERY_RE = re.compile(
     r"([?&](?:access_token|api[_-]?key|auth[_-]?token|token|signature|sig)=)([^&#\s]+)",
     re.IGNORECASE,
@@ -430,10 +425,8 @@ def _describe_media_for_mirror(media_files):
     if not media_files:
         return ""
     if len(media_files) == 1:
-        media_path, is_voice = media_files[0]
+        media_path, _ = media_files[0]
         ext = os.path.splitext(media_path)[1].lower()
-        if is_voice and ext in _VOICE_EXTS:
-            return "[Sent voice message]"
         if ext in _IMAGE_EXTS:
             return "[Sent image attachment]"
         if ext in _VIDEO_EXTS:
@@ -1021,7 +1014,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                 else:
                     raise
 
-        for media_path, is_voice in media_files:
+        for media_path, _ in media_files:
             if not os.path.exists(media_path):
                 warning = f"Media file not found, skipping: {media_path}"
                 logger.warning(warning)
@@ -1040,14 +1033,6 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                         elif ext in _VIDEO_EXTS:
                             last_msg = await bot.send_video(
                                 chat_id=int_chat_id, video=f, **media_kwargs
-                            )
-                        elif ext in _VOICE_EXTS and is_voice:
-                            last_msg = await bot.send_voice(
-                                chat_id=int_chat_id, voice=f, **media_kwargs
-                            )
-                        elif ext in _TELEGRAM_SEND_AUDIO_EXTS:
-                            last_msg = await bot.send_audio(
-                                chat_id=int_chat_id, audio=f, **media_kwargs
                             )
                         else:
                             last_msg = await bot.send_document(
@@ -1071,14 +1056,6 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                             elif ext in _VIDEO_EXTS:
                                 last_msg = await bot.send_video(
                                     chat_id=int_chat_id, video=f, **media_kwargs
-                                )
-                            elif ext in _VOICE_EXTS and is_voice:
-                                last_msg = await bot.send_voice(
-                                    chat_id=int_chat_id, voice=f, **media_kwargs
-                                )
-                            elif ext in _TELEGRAM_SEND_AUDIO_EXTS:
-                                last_msg = await bot.send_audio(
-                                    chat_id=int_chat_id, audio=f, **media_kwargs
                                 )
                             else:
                                 last_msg = await bot.send_document(
@@ -1213,7 +1190,7 @@ async def _send_feishu(pconfig, chat_id, message, media_files=None, thread_id=No
             if not last_result.success:
                 return _error(f"Feishu send failed: {last_result.error}")
 
-        for media_path, is_voice in media_files:
+        for media_path, _ in media_files:
             if not os.path.exists(media_path):
                 return _error(f"Media file not found: {media_path}")
 
@@ -1222,10 +1199,6 @@ async def _send_feishu(pconfig, chat_id, message, media_files=None, thread_id=No
                 last_result = await adapter.send_image_file(chat_id, media_path, metadata=metadata)
             elif ext in _VIDEO_EXTS:
                 last_result = await adapter.send_video(chat_id, media_path, metadata=metadata)
-            elif ext in _VOICE_EXTS and is_voice:
-                last_result = await adapter.send_voice(chat_id, media_path, metadata=metadata)
-            elif ext in _AUDIO_EXTS:
-                last_result = await adapter.send_voice(chat_id, media_path, metadata=metadata)
             else:
                 last_result = await adapter.send_document(chat_id, media_path, metadata=metadata)
 

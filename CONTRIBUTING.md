@@ -34,7 +34,7 @@ This is the most common question for new contributors. The answer is almost alwa
 - It requires end-to-end integration with API keys, auth flows, or multi-component configuration managed by the agent harness
 - It needs custom processing logic that must execute precisely every time (not "best effort" from LLM interpretation)
 - It handles binary data, streaming, or real-time events that can't go through the terminal
-- Examples: local browser automation, TTS (audio encoding + platform delivery), vision analysis (base64 image handling)
+- Examples: local browser automation, vision analysis (base64 image handling)
 
 ### Should the Skill be bundled?
 
@@ -51,7 +51,7 @@ Specialized community skills should ship independently and can be copied into `~
 
 ## Memory Providers: Ship as a Standalone Plugin
 
-**We are no longer accepting new memory providers into this repo.** The retained built-in providers under `plugins/memory/` are Honcho and Holographic. If you want to add a new memory backend, publish it as a **standalone plugin repo** that users install into `~/.marlow/plugins/` (or via a pip entry point).
+**We are no longer accepting new memory providers into this repo.** Honcho is the bundled provider under `plugins/memory/`. If you want to add a new memory backend, publish it as a **standalone plugin repo** that users install into `~/.marlow/plugins/` (or via a pip entry point).
 
 Standalone memory plugins:
 
@@ -76,7 +76,7 @@ This isn't a quality bar — it's a coupling-and-maintenance decision. Memory pr
 | **Git** | With `--recurse-submodules` support, and the `git-lfs` extension installed |
 | **Python 3.11+** | uv will install it if missing |
 | **uv** | Fast Python package manager ([install](https://docs.astral.sh/uv/)) |
-| **Node.js 20+** | Needed for TUI development and local browser tooling |
+| **Node.js 20+** | Needed for local browser tooling |
 
 ### Clone and install
 
@@ -136,7 +136,6 @@ pytest tests/ -v
 ```
 marlow-agent/
 ├── run_agent.py              # AIAgent class — core conversation loop, tool dispatch, session persistence
-├── cli.py                    # MarlowCLI class — interactive TUI, prompt_toolkit integration
 ├── model_tools.py            # Tool orchestration (thin layer over tools/registry.py)
 ├── toolsets.py               # Tool groupings and presets (marlow-cli, marlow-telegram, etc.)
 ├── marlow_state.py           # SQLite session database with FTS5 full-text search, session titles
@@ -161,7 +160,6 @@ marlow-agent/
 │   ├── callbacks.py              # Interactive callbacks (clarify, sudo, approval)
 │   ├── doctor.py                 # Diagnostics
 │   ├── skills_config.py          # Local skills configuration helpers
-│   └── skin_engine.py            # Skin/theme engine — data-driven CLI visual customization
 │
 ├── tools/                    # Tool implementations (self-registering)
 │   ├── registry.py               # Central tool registry (schemas, handlers, dispatch)
@@ -486,7 +484,7 @@ Every new or modernized skill — bundled, optional, or contributed — must mee
    Good: `Search arXiv papers by keyword, author, category, or ID.`
    Bad: `A powerful and comprehensive skill that allows the agent to search arXiv for relevant academic papers using various criteria including keywords, authors, and categories.`
 
-2. **Tools referenced in SKILL.md prose must be native Marlow tools or MCP servers the skill explicitly expects.** When the skill needs a capability, point at the proper tool by name in backticks: `` `terminal` ``, `` `web_extract` ``, `` `web_search` ``, `` `read_file` ``, `` `write_file` ``, `` `patch` ``, `` `search_files` ``, `` `vision_analyze` ``, `` `browser_navigate` ``, `` `delegate_task` ``, `` `image_generate` ``, `` `text_to_speech` ``, `` `cronjob` ``, `` `memory` ``, `` `skill_view` ``, `` `todo` ``, `` `execute_code` ``.
+2. **Tools referenced in SKILL.md prose must be native Marlow tools or MCP servers the skill explicitly expects.** When the skill needs a capability, point at the proper tool by name in backticks: `` `terminal` ``, `` `web_extract` ``, `` `web_search` ``, `` `read_file` ``, `` `write_file` ``, `` `patch` ``, `` `search_files` ``, `` `vision_analyze` ``, `` `browser_navigate` ``, `` `delegate_task` ``, `` `cronjob` ``, `` `memory` ``, `` `skill_view` ``, `` `todo` ``, `` `execute_code` ``.
 
    Do NOT name shell utilities the agent already has wrapped:
 
@@ -528,56 +526,6 @@ Every new or modernized skill — bundled, optional, or contributed — must mee
 - **Progressive disclosure.** Put the most common workflow first. Edge cases and advanced usage go at the bottom.
 - **Include helper scripts** for XML/JSON parsing or complex logic — don't expect the LLM to write parsers inline every time.
 - **Test it.** Run `marlow --toolsets skills -q "Use the X skill to do Y"` and verify the agent follows the instructions correctly.
-
----
-
-## Adding a Skin / Theme
-
-Marlow uses a data-driven skin system — no code changes needed to add a new skin.
-
-**Option A: User skin (YAML file)**
-
-Create `~/.marlow/skins/<name>.yaml`:
-
-```yaml
-name: mytheme
-description: Short description of the theme
-
-colors:
-  banner_border: "#HEX"     # Panel border color
-  banner_title: "#HEX"      # Panel title color
-  banner_accent: "#HEX"     # Section header color
-  banner_dim: "#HEX"        # Muted/dim text color
-  banner_text: "#HEX"       # Body text color
-  response_border: "#HEX"   # Response box border
-
-spinner:
-  waiting_faces: ["(⚔)", "(⛨)"]
-  thinking_faces: ["(⚔)", "(⌁)"]
-  thinking_verbs: ["forging", "plotting"]
-  wings:                     # Optional left/right decorations
-    - ["⟪⚔", "⚔⟫"]
-
-branding:
-  agent_name: "My Agent"
-  welcome: "Welcome message"
-  response_label: " ⚔ Agent "
-  prompt_symbol: "⚔"
-
-tool_prefix: "╎"             # Tool output line prefix
-```
-
-All fields are optional — missing values inherit from the default skin.
-
-**Option B: Built-in skin**
-
-Add to `_BUILTIN_SKINS` dict in `marlow_cli/skin_engine.py`. Use the same schema as above but as a Python dict. Built-in skins ship with the package and are always available.
-
-**Activating:**
-- CLI: `/skin mytheme` or set `display.skin: mytheme` in config.yaml
-- Config: `display: { skin: mytheme }`
-
-See `marlow_cli/skin_engine.py` for the full schema and existing skins as examples.
 
 ---
 

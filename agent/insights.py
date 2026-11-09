@@ -1266,7 +1266,7 @@ class InsightsEngine:
                 lines.append(
                     f"  Task loads: {summary.get('task_loads', 0):,}  "
                     f"Slash loads: {summary.get('slash_loads', 0):,}  "
-                    f"Curator inspections: {summary.get('curator_inspections', 0):,}"
+                    f"Historical inspections: {summary.get('curator_inspections', 0):,}"
                 )
             lines.append("")
 

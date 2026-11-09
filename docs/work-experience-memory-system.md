@@ -1,7 +1,7 @@
 # Work Experience Memory for Marlow
 
 Status: Decision-aware Work Experience implemented on 2026-08-21.
-Automatic retrospective capture, work-record UI, gateway/TUI capture, shared/team
+Automatic retrospective capture, work-record UI, gateway capture, shared/team
 experience, embeddings, and remote synchronization remain deferred.
 
 ## Implementation boundary (authoritative)
@@ -39,7 +39,7 @@ Not implemented yet:
   confidence updates;
 - model-based contextual applicability judgments and event-triggered recall;
 - proof that a recalled lesson or Decision changed behavior or caused an outcome;
-- work-record UI, gateway/TUI capture, shared/team experience, embeddings, or
+- work-record UI, gateway capture, shared/team experience, embeddings, or
   remote synchronization.
 
 `experience.mode: capture` remains a forward-compatible project-consent
@@ -159,11 +159,10 @@ capture only after the behavioral experiment succeeds.
 | `state.db` / `SessionDB` | Raw session and message persistence | SQLite/WAL, FTS5, migrations, concurrency, lineage, export/delete patterns | It stores raw messages, tool calls, and reasoning; session retention and privacy differ from experience retention |
 | `session_search` | On-demand FTS discovery and transcript windows | Search UX and anchored provenance lookup | It returns historical transcript text, with no repository, outcome, confidence, applicability, or contradiction model |
 | Context compression | Preserve an in-progress conversation under token pressure | Existing action/state/decision summary vocabulary | It is a mutable continuity handoff, created only when context is tight; compression is not task completion or verification |
-| Skills | Profile-level procedural guidance | Progressive disclosure, usage telemetry, curator lifecycle, user editing | A skill is directly behavioral and class-level. A single tentative observation should not become a skill |
+| Skills | Profile-level procedural guidance | Progressive disclosure, usage telemetry, user editing | A skill is directly behavioral and class-level. A single tentative observation should not become a skill |
 | Todos and goals | Current plan and standing objective | Clear current-state semantics | They represent ongoing work, not historical evidence |
 | Checkpoints | File rollback | Repository/path hashing and retention patterns | They store file snapshots, not semantic experience, and may contain private source |
 | Trajectories | Optional training/debug traces | Offline evaluation material | They contain full ShareGPT-style messages, tools, and reasoning and are unsuitable for normal recall |
-| Learning graph / Journey | Inspect and mutate learned skills and memory chunks | Proven CLI/TUI CRUD patterns | It does not model tasks, evidence, confidence, scope, or contradictions |
 
 The built-in memory split is intentional. `tools/memory_tool.py:1-24`
 describes two bounded, file-backed stores frozen into the system prompt at
@@ -235,10 +234,8 @@ Work experience should use this seam but not reuse
 fallible evidence. The current user request, current repository, current tests,
 and explicit project instructions must outrank them.
 
-There is also no reliable clean-request boundary today. Classic CLI expands
-`@file`, `@diff`, and `@url` content before the agent call
-(`cli.py:12266-12431`), and TUI passes expanded content through
-`tui_gateway/server.py:4266-4375`. Task signatures must not accidentally index
+There is also no reliable clean-request boundary today. The CLI expands
+`@file`, `@diff`, and `@url` content before the agent call. Task signatures must not accidentally index
 attached source or fetched pages. The integration therefore needs a typed turn
 input envelope with separate `raw_request_text` and synthetic/attached context;
 parsing rendered delimiters afterward is not an acceptable security boundary.
@@ -274,7 +271,7 @@ responses (`agent/conversation_loop.py:3823-3831`). A capture hook in the normal
 epilogue would omit exactly the attempted work the design wants to preserve.
 Plugin `on_session_end` is misleadingly fired after every
 `run_conversation()` at `agent/conversation_loop.py:4863-4877`; true
-CLI/gateway/TUI boundaries use `on_session_finalize`. Session finalization is a
+CLI and gateway boundaries use `on_session_finalize`. Session finalization is a
 flush opportunity, not a task-completion trigger.
 
 The current background review mechanism is not the lesson policy to reuse.
@@ -1074,7 +1071,7 @@ Default sharing boundary:
 - Profiles/roles remain isolated by `MARLOW_HOME`.
 - MVP0 uses the literal sentinel `local-owner` inside the already isolated
   profile, never an OS username, path, email, or platform identifier. Classic
-  CLI maps to this owner. TUI and every other runtime fail closed until they
+  CLI maps to this owner. Every other runtime fail closed until they
   supply the same raw-input, logical-cwd, and egress contracts.
 - Repository lessons do not cross repositories automatically, and project
   lessons use an explicitly configured repo-relative project root. Running at
@@ -1176,11 +1173,6 @@ hashes, producer metadata, retrieval events, and repository labels by default,
 and require explicit re-scoping on import. Deleting `state.db` does not delete
 previous exports.
 
-Journey and Curator provide useful interaction precedents:
-`marlow_cli/journey.py:228-338` has editor/confirmation flows, while
-`marlow_cli/curator.py:39-217` demonstrates status, dry-run, archive/restore,
-and rollback-oriented lifecycle controls.
-
 Deleting a source session should offer, not assume, deletion of linked work
 records. Deleting a work record that supports a lesson must warn the user and
 either retract the lesson or leave it with visibly missing provenance.
@@ -1234,7 +1226,7 @@ Modes:
 Lessons and Decisions are manually added, explicitly approved, or imported from
 controlled evaluation fixtures. MVP0 does **not** automatically capture work
 records, reflect on conversations, extract decisions, observe raw tool results,
-resolve contradictions, or promote skills. It also excludes TUI governance,
+resolve contradictions, or promote skills. It also excludes
 gateway, groups, subagent learning, `codex_app_server`, embeddings, remote sync,
 dashboard UI, historical backfill, portable export/import, and profile-wide
 automatic sharing.
@@ -1266,7 +1258,7 @@ Proceed with automatic learning only after the behavioral gate passes:
 3. With separate consent, add bounded synchronous reflection that writes
    proposed work records/lessons only; measure review burden and precision.
 4. Add observed action conformance and conservative contradiction handling.
-5. Consider TUI governance, delegation correlation, a dedicated database, or
+5. Consider delegation correlation, a dedicated database, or
    remote synchronization only when individually justified.
 
 ### 10.3 Exact MVP0 code surface
@@ -1306,7 +1298,7 @@ Existing modules changed:
 - `marlow_cli/main.py` — register the governance command.
 
 Experience is never double-written into `MemoryStore`, structured cards,
-skills, session search, Curator, Journey, or consolidation. `MemoryManager`
+skills, session search, or consolidation. `MemoryManager`
 supplies only the shared internal-fence scrubber; it is not an experience
 persistence backend.
 
@@ -1396,7 +1388,7 @@ MVP0 integration tests:
 - store failures are fail-open for the user's work and metadata-only in logs;
 - no cross-profile, cross-project, cross-repository, or disallowed-provider item
   is returned;
-- unbound Telegram, Telegram group/channel, other gateway, TUI, and
+- unbound Telegram, Telegram group/channel, other gateway, and
   `codex_app_server` turns fail closed; and
 - reopen/WAL tests verify purge behavior and its documented limitations.
 

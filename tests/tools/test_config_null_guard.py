@@ -8,34 +8,6 @@ return ``None`` instead of the default — calling ``.lower()`` on that raises
 from unittest.mock import patch
 
 
-# ── TTS tool ──────────────────────────────────────────────────────────────
-
-class TestTTSProviderNullGuard:
-    """tools/tts_tool.py — _get_provider()"""
-
-    def test_explicit_null_provider_returns_default(self):
-        """YAML ``tts: {provider: null}`` should fall back to default."""
-        from tools.tts_tool import _get_provider, DEFAULT_PROVIDER
-
-        result = _get_provider({"provider": None})
-        assert result == DEFAULT_PROVIDER.lower().strip()
-
-    def test_missing_provider_returns_default(self):
-        """No ``provider`` key at all should also return default."""
-        from tools.tts_tool import _get_provider, DEFAULT_PROVIDER
-
-        result = _get_provider({})
-        assert result == DEFAULT_PROVIDER.lower().strip()
-
-    def test_valid_provider_passed_through(self):
-        from tools.tts_tool import _get_provider
-
-        result = _get_provider({"provider": "OPENAI"})
-        assert result == "openai"
-
-
-# ── Web tools ─────────────────────────────────────────────────────────────
-
 class TestMCPAuthNullGuard:
     """tools/mcp_tool.py — MCPServerTask.__init__() auth config line"""
 

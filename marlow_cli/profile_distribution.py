@@ -593,7 +593,7 @@ def _copy_dist_payload(
 
 def _bootstrap_user_dirs(target: Path) -> None:
     """Create the bootstrap dirs a fresh profile expects."""
-    for d in ("memories", "sessions", "skills", "skins", "logs",
+    for d in ("memories", "sessions", "skills", "logs",
               "plans", "workspace", "cron", "home"):
         (target / d).mkdir(parents=True, exist_ok=True)
 

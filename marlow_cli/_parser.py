@@ -1,10 +1,6 @@
 """
 Top-level argparse construction for the marlow CLI.
 
-Lives in its own module so other modules (e.g. ``relaunch.py``) can
-introspect the parser to discover which flags exist without running the
-``main`` fn.
-
 Only the top-level parser and the ``chat`` subparser live here. Every other
 subparser (model, gateway, sessions, …) is built inline in ``main.py``
 because its dispatch is tightly coupled to module-level ``cmd_*`` functions.
@@ -13,37 +9,13 @@ because its dispatch is tightly coupled to module-level ``cmd_*`` functions.
 import argparse
 
 
-# `--profile` / `-p` is consumed by ``main._apply_profile_override`` before
-# argparse runs (it sets ``MARLOW_HOME`` and strips itself from ``sys.argv``),
-# so it isn't on the parser. Listed here so all "carry over on relaunch"
-# metadata lives in one file.
-PRE_ARGPARSE_INHERITED_FLAGS: list[tuple[str, bool]] = [
-    ("--profile", True),
-    ("-p", True),
-]
-
-
-def _inherited_flag(parser, *args, **kwargs):
-    """Register a flag that ``marlow_cli.relaunch`` should carry over when
-    the CLI re-execs itself (e.g. after ``sessions browse`` picks a session,
-    or after the setup wizard launches chat).
-
-    Equivalent to ``parser.add_argument(...)`` plus tagging the resulting
-    Action with ``inherit_on_relaunch = True`` so the relaunch table builder
-    can find it via introspection.
-    """
-    action = parser.add_argument(*args, **kwargs)
-    action.inherit_on_relaunch = True
-    return action
-
-
 _EPILOGUE = """
 Examples:
-    marlow                        Start interactive chat
-    marlow chat -q "Hello"        Single query mode
-    marlow -c                     Resume the most recent session
-    marlow -c "my project"        Resume a session by name (latest in lineage)
-    marlow --resume <session_id>  Resume a specific session by ID
+    marlow                                 Show available commands
+    marlow chat -q "Hello"                 Run one query
+    marlow -z "Hello"                      Print only the final answer
+    marlow chat -c -q "Continue"           Resume the most recent session
+    marlow chat -r SESSION -q "Continue"   Resume a session by ID or title
     marlow setup                  Run setup wizard
     marlow logout                 Clear stored authentication
     marlow model                  Select default model
@@ -54,8 +26,7 @@ Examples:
     marlow config edit            Edit config in $EDITOR
     marlow config set model gpt-4 Set a config value
     marlow gateway                Run messaging gateway
-    marlow -s codex,native-mcp
-    marlow -w                     Start in isolated git worktree
+    marlow chat -w -q "Fix issue" Run one query in an isolated Git worktree
     marlow gateway install        Install gateway background service
     marlow sessions list          List past sessions
     marlow sessions browse        Interactive session picker
@@ -98,31 +69,29 @@ def build_top_level_parser():
             "One-shot mode: send a single prompt and print ONLY the final "
             "response text to stdout. No banner, no spinner, no tool "
             "previews, no session_id line. Tools, memory, rules, and "
-            "AGENTS.md in the CWD are loaded as normal; approvals are "
-            "auto-bypassed. Intended for scripts / pipes."
+            "AGENTS.md in the CWD are loaded as normal. Actions requiring an "
+            "interactive approval are blocked. Intended for scripts / pipes."
         ),
     )
     # --model / --provider are accepted at the top level so they can pair
     # with -z without needing the `chat` subcommand.  If neither -z nor a
     # subcommand consumes them, they fall through harmlessly as None.
     # Mirrors `marlow chat --model ... --provider ...` semantics.
-    _inherited_flag(
-        parser,
+    parser.add_argument(
         "-m",
         "--model",
         default=None,
         help=(
             "Model override for this invocation (e.g. gpt-5.4 or a local model id). "
-            "Applies to -z/--oneshot and --tui. Also settable via MARLOW_INFERENCE_MODEL env var."
+            "Applies to -z/--oneshot. Also settable via MARLOW_INFERENCE_MODEL env var."
         ),
     )
-    _inherited_flag(
-        parser,
+    parser.add_argument(
         "--provider",
         default=None,
         help=(
             "Provider override for this invocation (openai-codex or custom). "
-            "Applies to -z/--oneshot and --tui. The persistent provider lives in config.yaml "
+            "Applies to -z/--oneshot. The persistent provider lives in config.yaml "
             "under model.provider — use `marlow setup` or edit the file to change it."
         ),
     )
@@ -130,7 +99,7 @@ def build_top_level_parser():
         "-t",
         "--toolsets",
         default=None,
-        help="Comma-separated toolsets to enable for this invocation. Applies to -z/--oneshot and --tui.",
+        help="Comma-separated toolsets to enable for this invocation. Applies to -z/--oneshot.",
     )
     parser.add_argument(
         "--resume",
@@ -162,8 +131,7 @@ def build_top_level_parser():
         default=False,
         help="Run in an isolated git worktree (for parallel agents)",
     )
-    _inherited_flag(
-        parser,
+    parser.add_argument(
         "--accept-hooks",
         action="store_true",
         default=False,
@@ -174,50 +142,30 @@ def build_top_level_parser():
             "runs that can't prompt."
         ),
     )
-    _inherited_flag(
-        parser,
+    parser.add_argument(
         "--yolo",
         action="store_true",
         default=False,
         help="Bypass all dangerous command approval prompts (use at your own risk)",
     )
-    _inherited_flag(
-        parser,
+    parser.add_argument(
         "--pass-session-id",
         action="store_true",
         default=False,
         help="Include the session ID in the agent's system prompt",
     )
-    _inherited_flag(
-        parser,
+    parser.add_argument(
         "--ignore-user-config",
         action="store_true",
         default=False,
         help="Ignore ~/.marlow/config.yaml and fall back to built-in defaults (credentials in .env are still loaded)",
     )
-    _inherited_flag(
-        parser,
+    parser.add_argument(
         "--ignore-rules",
         action="store_true",
         default=False,
-        help="Skip auto-injection of AGENTS.md, SOUL.md, .cursorrules, and memory",
+        help="Skip auto-injection of AGENTS.md, .cursorrules, and memory",
     )
-    _inherited_flag(
-        parser,
-        "--tui",
-        action="store_true",
-        default=False,
-        help="Launch the modern TUI instead of the classic REPL",
-    )
-    _inherited_flag(
-        parser,
-        "--dev",
-        dest="tui_dev",
-        action="store_true",
-        default=False,
-        help="With --tui: run TypeScript sources via tsx (skip dist build)",
-    )
-
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
     # =========================================================================
@@ -225,8 +173,8 @@ def build_top_level_parser():
     # =========================================================================
     chat_parser = subparsers.add_parser(
         "chat",
-        help="Interactive chat with the agent",
-        description="Start an interactive chat session with Marlow Agent",
+        help="Run a single query with the agent",
+        description="Run one query with Marlow Agent, then exit",
     )
     chat_parser.add_argument(
         "-q", "--query", help="Single query (non-interactive mode)"
@@ -234,15 +182,13 @@ def build_top_level_parser():
     chat_parser.add_argument(
         "--image", help="Optional local image path to attach to a single query"
     )
-    _inherited_flag(
-        chat_parser,
+    chat_parser.add_argument(
         "-m", "--model", help="Model to use (e.g. gpt-5.4 or a local model id)",
     )
     chat_parser.add_argument(
         "-t", "--toolsets", help="Comma-separated toolsets to enable"
     )
-    _inherited_flag(
-        chat_parser,
+    chat_parser.add_argument(
         "--provider",
         # No `choices=` here: user-defined providers from config.yaml `providers:`
         # are also valid values, and runtime resolution (resolve_runtime_provider)
@@ -294,8 +240,7 @@ def build_top_level_parser():
         default=argparse.SUPPRESS,
         help="Run in an isolated git worktree (for parallel agents on the same repo)",
     )
-    _inherited_flag(
-        chat_parser,
+    chat_parser.add_argument(
         "--accept-hooks",
         action="store_true",
         default=argparse.SUPPRESS,
@@ -318,53 +263,33 @@ def build_top_level_parser():
         metavar="N",
         help="Maximum tool-calling iterations per conversation turn (default: 90, or agent.max_turns in config)",
     )
-    _inherited_flag(
-        chat_parser,
+    chat_parser.add_argument(
         "--yolo",
         action="store_true",
         default=argparse.SUPPRESS,
         help="Bypass all dangerous command approval prompts (use at your own risk)",
     )
-    _inherited_flag(
-        chat_parser,
+    chat_parser.add_argument(
         "--pass-session-id",
         action="store_true",
         default=argparse.SUPPRESS,
         help="Include the session ID in the agent's system prompt",
     )
-    _inherited_flag(
-        chat_parser,
+    chat_parser.add_argument(
         "--ignore-user-config",
         action="store_true",
         default=argparse.SUPPRESS,
         help="Ignore ~/.marlow/config.yaml and fall back to built-in defaults (credentials in .env are still loaded). Useful for isolated CI runs, reproduction, and third-party integrations.",
     )
-    _inherited_flag(
-        chat_parser,
+    chat_parser.add_argument(
         "--ignore-rules",
         action="store_true",
         default=argparse.SUPPRESS,
-        help="Skip auto-injection of AGENTS.md, SOUL.md, .cursorrules, and memory. Combine with --ignore-user-config for a fully isolated run.",
+        help="Skip auto-injection of AGENTS.md, .cursorrules, and memory. Combine with --ignore-user-config for a fully isolated run.",
     )
     chat_parser.add_argument(
         "--source",
         default=None,
         help="Session source tag for filtering (default: cli). Use 'tool' for third-party integrations that should not appear in user session lists.",
     )
-    _inherited_flag(
-        chat_parser,
-        "--tui",
-        action="store_true",
-        default=False,
-        help="Launch the modern TUI instead of the classic REPL",
-    )
-    _inherited_flag(
-        chat_parser,
-        "--dev",
-        dest="tui_dev",
-        action="store_true",
-        default=False,
-        help="With --tui: run TypeScript sources via tsx (skip dist build)",
-    )
-
     return parser, subparsers, chat_parser
