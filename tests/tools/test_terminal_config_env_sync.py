@@ -4,7 +4,7 @@ terminal_tool._get_env_config() reads ALL terminal settings from os.environ
 (TERMINAL_*).  config.yaml values therefore have to be bridged into env vars
 at startup, by THREE separate code paths:
 
-  1. cli.py            -> ``env_mappings`` dict (CLI / TUI startup)
+  1. marlow_cli/query.py            -> ``_TERMINAL_ENV`` dict (CLI / TUI startup)
   2. gateway/run.py    -> ``_terminal_env_map`` dict (gateway / messaging
                           platforms)
   3. marlow_cli/config.py:save_config_value
@@ -71,10 +71,9 @@ def _extract_dict_keys(source: str, dict_name: str) -> set[str]:
 
 
 def _cli_env_map_keys() -> set[str]:
-    """terminal config keys bridged by cli.load_cli_config()."""
-    import cli
-    source = inspect.getsource(cli.load_cli_config)
-    return _extract_dict_keys(source, "env_mappings")
+    """terminal config keys bridged by the headless query."""
+    from marlow_cli.query import _TERMINAL_ENV
+    return set(_TERMINAL_ENV)
 
 
 def _gateway_env_map_keys() -> set[str]:
@@ -97,7 +96,7 @@ def _save_config_env_sync_keys() -> set[str]:
     return {k.split(".", 1)[1] for k in keys if k.startswith("terminal.")}
 
 
-# Keys present in cli.py env_mappings but intentionally absent from
+# Keys present in marlow_cli/query.py _TERMINAL_ENV but intentionally absent from
 # gateway/run.py or set_config_value.  Each entry must be justified.
 _CLI_ONLY_OK = frozenset({
     # sudo_password is not a terminal-backend option — it's a credential
@@ -118,7 +117,7 @@ def _terminal_tool_env_var_names() -> set[str]:
 
 
 def test_cli_and_gateway_env_maps_agree():
-    """cli.py and gateway/run.py must bridge the same set of terminal keys.
+    """marlow_cli/query.py and gateway/run.py must bridge the same set of terminal keys.
 
     Both feed the same downstream consumer (terminal_tool).  Drift between
     them means a config.yaml setting that "works in CLI mode but not gateway
@@ -131,14 +130,14 @@ def test_cli_and_gateway_env_maps_agree():
     missing_in_cli = gw_keys - cli_keys
 
     assert not missing_in_gateway, (
-        f"Keys in cli.py env_mappings but missing from gateway/run.py "
+        f"Keys in marlow_cli/query.py _TERMINAL_ENV but missing from gateway/run.py "
         f"_terminal_env_map: {sorted(missing_in_gateway)}.  Add them to "
         f"both maps (same bug class as docker_run_as_host_user shipping "
         f"wired in cli but not gateway in April 2026)."
     )
     assert not missing_in_cli, (
-        f"Keys in gateway/run.py _terminal_env_map but missing from cli.py "
-        f"env_mappings: {sorted(missing_in_cli)}.  Add them to both maps."
+        f"Keys in gateway/run.py _terminal_env_map but missing from marlow_cli/query.py "
+        f"_TERMINAL_ENV: {sorted(missing_in_cli)}.  Add them to both maps."
     )
 
 
@@ -176,7 +175,7 @@ def test_docker_run_as_host_user_is_bridged_everywhere():
     """Explicit pin for the bug we just fixed.
 
     docker_run_as_host_user was added to terminal_tool._get_env_config and
-    DockerEnvironment but NOT to cli.py's env_mappings or gateway/run.py's
+    DockerEnvironment but NOT to marlow_cli/query.py's _TERMINAL_ENV or gateway/run.py's
     _terminal_env_map, so ``terminal.docker_run_as_host_user: true`` in
     config.yaml had no effect at runtime.  This guard makes the regression
     impossible to reintroduce silently.

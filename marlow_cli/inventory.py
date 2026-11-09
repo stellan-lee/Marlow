@@ -1,4 +1,4 @@
-"""Provider/model inventory shared by the TUI and interactive picker.
+"""Provider and model inventory for operator pickers.
 
 Before this module the three call-sites each duplicated:
 

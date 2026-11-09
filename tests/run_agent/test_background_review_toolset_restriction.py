@@ -1,17 +1,4 @@
-"""Tests that the background review agent restricts tools at runtime, not at schema time.
-
-Regression coverage for issue #15204 (the background skill-review agent must
-not perform non-skill side effects like terminal, send_message, delegate_task)
-combined with issue #25322 / PR #17276 (the review fork must hit the parent's
-Anthropic/OpenRouter prefix cache).
-
-Reconciling the two: the fork now inherits the parent's full ``tools`` schema
-so the cache-key matches, and enforces the memory+skills restriction at
-runtime via a thread-local whitelist on the existing
-``get_pre_tool_call_block_message`` gate. Safety is preserved mechanically
-(any non-whitelisted dispatch is blocked) without the schema-level narrowing
-that caused the prefix-cache miss.
-"""
+"""The background review inherits schemas but can only dispatch the memory tool."""
 
 from unittest.mock import patch
 
@@ -28,15 +15,12 @@ def _make_agent_stub(agent_cls):
     agent._memory_enabled = True
     agent._user_profile_enabled = False
     agent._memory_nudge_interval = 5
-    agent._skill_nudge_interval = 5
     agent.background_review_callback = None
     agent.status_callback = None
     agent._cached_system_prompt = None
     import datetime as _dt
     agent.session_start = _dt.datetime(2026, 1, 1, 12, 0, 0)
     agent._MEMORY_REVIEW_PROMPT = "review memory"
-    agent._SKILL_REVIEW_PROMPT = "review skills"
-    agent._COMBINED_REVIEW_PROMPT = "review both"
     # Non-None so the test catches a missing-kwarg regression.
     agent.enabled_toolsets = ["memory", "skills", "terminal"]
     agent.disabled_toolsets = ["x_search", "feishu_doc"]
@@ -70,8 +54,6 @@ def test_background_review_matches_parent_toolset_config():
          patch("threading.Thread", _SyncThread):
         agent._spawn_background_review(
             messages_snapshot=[],
-            review_memory=True,
-            review_skills=False,
         )
 
     assert "enabled_toolsets" in captured, "AIAgent.__init__ was not called"
@@ -86,13 +68,6 @@ def test_background_review_matches_parent_toolset_config():
 
 
 def test_background_review_installs_thread_local_whitelist():
-    """The review fork must install a memory/skills-only thread-local whitelist.
-
-    The schema-level toolset narrowing was lifted (for prefix-cache parity),
-    so #15204's safety contract now relies on the runtime whitelist gate to
-    deny terminal/send_message/delegate_task at dispatch time. Verify the
-    whitelist is set with exactly the memory+skills tool names.
-    """
     import run_agent
     from marlow_cli import plugins as _plugins
 
@@ -116,43 +91,7 @@ def test_background_review_installs_thread_local_whitelist():
          patch("threading.Thread", _SyncThread):
         agent._spawn_background_review(
             messages_snapshot=[],
-            review_memory=True,
-            review_skills=False,
         )
 
     assert "whitelist" in captured, "set_thread_tool_whitelist was not called"
-    whitelist = captured["whitelist"]
-    # memory + skills tools must be allowed
-    assert "memory" in whitelist
-    assert "skill_manage" in whitelist
-    assert "skill_view" in whitelist
-    assert "skills_list" in whitelist
-    # dangerous tools must NOT be in the whitelist
-    assert "terminal" not in whitelist
-    assert "send_message" not in whitelist
-    assert "delegate_task" not in whitelist
-    assert "web_search" not in whitelist
-    assert "execute_code" not in whitelist
-
-
-def test_background_review_agent_tools_are_limited():
-    """Verify the resolved memory+skills toolsets only contain memory and skill tools.
-
-    Sanity check on the source of truth for what the runtime whitelist is
-    derived from — if a future PR adds e.g. `terminal` to the `memory`
-    toolset, the review-fork safety contract silently breaks.
-    """
-    from toolsets import resolve_multiple_toolsets
-
-    expected_tools = set(resolve_multiple_toolsets(["memory", "skills"]))
-
-    assert "memory" in expected_tools
-    assert "skill_manage" in expected_tools
-    assert "skill_view" in expected_tools
-    assert "skills_list" in expected_tools
-
-    assert "terminal" not in expected_tools
-    assert "send_message" not in expected_tools
-    assert "delegate_task" not in expected_tools
-    assert "web_search" not in expected_tools
-    assert "execute_code" not in expected_tools
+    assert captured["whitelist"] == {"memory"}

@@ -10,7 +10,7 @@
 # service. This is the canonical s6-overlay pattern for "container
 # exits when the program exits" semantics, and it lets us preserve
 # every pre-s6 invocation contract (chat passthrough, sleep infinity,
-# bash, --tui) without re-implementing argument routing through
+# bash) without re-implementing argument routing through
 # /run/s6/container_environment.
 #
 # So why does this service exist at all? Two reasons:

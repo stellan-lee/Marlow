@@ -202,7 +202,7 @@ class TestCmdUpdateBranchFallback:
 
     @patch("shutil.which")
     @patch("subprocess.run")
-    def test_update_refreshes_repo_and_tui_node_dependencies(
+    def test_update_refreshes_browser_dependencies(
         self, mock_run, mock_which, mock_args
     ):
         from marlow_cli import main as hm
@@ -219,41 +219,11 @@ class TestCmdUpdateBranchFallback:
             if call.args and call.args[0][0] == "/usr/bin/npm"
         ]
 
-        # cmd_update runs npm commands in these locations:
-        #   1. repo root  — root-only install (--workspaces=false)
-        #   2. repo root  — workspace install (--workspace ui-tui)
-        #
-        # With a single workspace lockfile at the repo root, the root
-        # install covers all workspaces.  The web/ ci call runs from the
-        # workspace root too (parent of web_dir) when the root lockfile
-        # exists.
-        #
-        # The root install omits `--silent` and runs without
-        # `capture_output` so optional postinstall scripts (e.g.
-        # optional dependency installers can print progress —
-        # otherwise long downloads look like a hang (#18840).
-        root_flags = [
-            "/usr/bin/npm",
-            "ci",
-            "--no-fund",
-            "--no-audit",
-            "--progress=false",
-            "--workspaces=false",
-        ]
-        ws_flags = [
-            "/usr/bin/npm",
-            "ci",
-            "--no-fund",
-            "--no-audit",
-            "--progress=false",
-            "--workspace",
-            "ui-tui",
-        ]
-        assert npm_calls[:2] == [
-            (root_flags, PROJECT_ROOT),
-            (ws_flags, PROJECT_ROOT),
-        ]
-        assert len(npm_calls) == 2
+        # Browser dependencies are installed once from the root lockfile.
+        assert npm_calls == [(
+            ["/usr/bin/npm", "ci", "--no-fund", "--no-audit", "--progress=false"],
+            PROJECT_ROOT,
+        )]
         # Regression for #18840: root npm installs must stream output
         # (capture_output=False) so postinstall progress is visible.
         root_install_calls = [
@@ -265,7 +235,7 @@ class TestCmdUpdateBranchFallback:
             and call.kwargs.get("cwd") == PROJECT_ROOT
             and "--silent" not in call.args[0]
         ]
-        assert len(root_install_calls) == 2  # root-only + workspace install
+        assert len(root_install_calls) == 1
         for call in root_install_calls:
             assert call.kwargs.get("capture_output") is False, (
                 "repo-root npm install must stream output "

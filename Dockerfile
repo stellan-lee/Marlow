@@ -25,7 +25,7 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/marlow/.playwright
 # marlow process and per-profile gateways.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg gcc python3-dev python3-venv libffi-dev procps git openssh-client docker-cli xz-utils && \
+    ca-certificates curl iputils-ping python3 python-is-python3 ripgrep gcc python3-dev python3-venv libffi-dev procps git openssh-client docker-cli xz-utils && \
     rm -rf /var/lib/apt/lists/*
 
 # ---------- s6-overlay install ----------
@@ -108,27 +108,8 @@ WORKDIR /opt/marlow
 # Copy only package manifests first so npm install + Playwright are cached
 # unless the lockfiles themselves change.
 #
-# ui-tui/packages/marlow-ink/ is copied IN FULL (not just its manifests)
-# because it is referenced as a `file:` workspace dependency from
-# ui-tui/package.json.  Copying the tree up front lets npm resolve the
-# workspace to real content instead of stopping at a bare package.json.
 COPY package.json package-lock.json ./
-COPY ui-tui/package.json ui-tui/
-COPY ui-tui/packages/marlow-ink/ ui-tui/packages/marlow-ink/
-
-# `npm_config_install_links=false` forces npm to install `file:` deps as
-# symlinks instead of copies.  This is the default since npm 10+, which is
-# what the image ships now (via the node:22 source stage).  We set it
-# explicitly anyway as defense-in-depth: the previous Debian-bundled npm
-# 9.x defaulted to install-as-copy, which produced a hidden
-# node_modules/.package-lock.json that permanently disagreed with the root
-# lock on the @marlow/ink entry, tripped the TUI launcher's
-# `_tui_need_npm_install()` check on every startup, and triggered a
-# runtime `npm install` that then failed with EACCES.  Keeping the env
-# guards against a future regression if the source npm version changes.
-ENV npm_config_install_links=false
-
-RUN npm install --prefer-offline --no-audit && \
+RUN npm ci --prefer-offline --no-audit && \
     npx playwright install --with-deps chromium --only-shell && \
     npm cache clean --force
 
@@ -161,24 +142,16 @@ RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra 
 # .dockerignore excludes node_modules, so the installs above survive.
 COPY --chown=marlow:marlow . .
 
-# Build terminal UI assets.
-RUN cd ui-tui && npm run build
-
 # ---------- Permissions ----------
 # Make install dir world-readable so any MARLOW_UID can read it at runtime.
 # The venv needs to be traversable too.
-# node_modules trees additionally need to be writable by the marlow user
-# so the runtime `npm install` triggered by _tui_need_npm_install() in
-# marlow_cli/main.py succeeds (see #18800). /opt/marlow/web is build-time
-# only (MARLOW_WEB_DIST points at marlow_cli/web_dist) and is intentionally
-# not chowned here.
 # The .venv MUST remain marlow-writable so lazy_deps.py can install
 # remaining optional platform packages and future pin bumps at first use.
 # Without this, `uv pip install` fails with EACCES and adapters silently
 # fail to load.  See tools/lazy_deps.py.
 USER root
 RUN chmod -R a+rX /opt/marlow && \
-    chown -R marlow:marlow /opt/marlow/.venv /opt/marlow/ui-tui /opt/marlow/node_modules
+    chown -R marlow:marlow /opt/marlow/.venv /opt/marlow/node_modules
 # Start as root so the s6-overlay stage2 hook can usermod/groupmod and chown
 # the data volume. Each supervised service then drops to the marlow user via
 # `s6-setuidgid marlow` in its run script. If MARLOW_UID is unset, services
@@ -277,7 +250,7 @@ VOLUME [ "/opt/data" ]
 # /etc/cont-init.d/* (our stage2 hook), starts s6-rc services
 # declared in /etc/s6-overlay/s6-rc.d/, then exec's its remaining
 # argv as the container's "main program" with stdin/stdout/stderr
-# inherited (this is what makes interactive --tui work). When the
+# inherited. When the
 # main program exits, /init begins stage 3 shutdown and the container
 # exits with the program's exit code. Replaces tini — see Phase 2 of
 # docs/plans/2026-05-07-s6-overlay-dynamic-subagent-gateways.md.
@@ -288,7 +261,6 @@ VOLUME [ "/opt/data" ]
 #   docker run <image>                  → /init main-wrapper.sh   (CMD default)
 #   docker run <image> chat -q "hi"     → /init main-wrapper.sh chat -q hi
 #   docker run <image> sleep infinity   → /init main-wrapper.sh sleep infinity
-#   docker run <image> --tui            → /init main-wrapper.sh --tui
 #
 # main-wrapper.sh handles arg routing (bare-exec vs. marlow
 # subcommand vs. no-args), drops to the marlow user via s6-setuidgid,

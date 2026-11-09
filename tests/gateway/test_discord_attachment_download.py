@@ -362,7 +362,7 @@ class TestHandleMessageUsesAuthenticatedRead:
 
     @pytest.mark.asyncio
     async def test_native_voice_note_is_classified_as_voice(self, monkeypatch):
-        """Discord native voice notes must enter the auto-STT voice path."""
+        """Discord voice notes are recognized without downloading audio."""
         adapter = _make_adapter()
         adapter._client = SimpleNamespace(user=SimpleNamespace(id=999))
         adapter.handle_message = AsyncMock()
@@ -401,12 +401,14 @@ class TestHandleMessageUsesAuthenticatedRead:
 
         event = adapter.handle_message.call_args[0][0]
         assert event.message_type == MessageType.VOICE
-        assert event.media_urls == ["/tmp/voice_from_read.ogg"]
-        assert event.media_types == ["audio/ogg"]
+        assert event.is_voice_only()
+        assert event.media_urls == []
+        assert event.media_types == []
+        att.read.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_plain_audio_attachment_stays_audio(self, monkeypatch):
-        """Plain audio uploads should stay out of automatic voice-note STT."""
+        """Plain audio uploads remain available as attachments."""
         adapter = _make_adapter()
         adapter._client = SimpleNamespace(user=SimpleNamespace(id=999))
         adapter.handle_message = AsyncMock()

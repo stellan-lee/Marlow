@@ -150,6 +150,7 @@ def register_from_config(
     cfg: Optional[Dict[str, Any]],
     *,
     accept_hooks: bool = False,
+    allow_prompt: bool = True,
 ) -> List[ShellHookSpec]:
     """Register every configured shell hook on the plugin manager.
 
@@ -161,7 +162,8 @@ def register_from_config(
     promising that the user has opted in via a flag, env var, or config
     setting.  ``MARLOW_ACCEPT_HOOKS=1`` and ``hooks_auto_accept: true`` are
     also honored inside this function so either CLI or gateway call sites
-    pick them up.
+    pick them up. Set ``allow_prompt=False`` for script invocations that
+    may use persisted or explicit authorization without reading the terminal.
 
     Returns the list of :class:`ShellHookSpec` entries that ended up wired
     up on the plugin manager.  Skipped entries (unknown events, malformed,
@@ -195,6 +197,9 @@ def register_from_config(
             already_allowlisted = _is_allowlisted(spec.event, spec.command)
 
         if not already_allowlisted:
+            if not (allow_prompt or effective_accept):
+                logger.debug("Unapproved shell hook for %s skipped in script mode", spec.event)
+                continue
             if not _prompt_and_record(
                 spec.event, spec.command, accept_hooks=effective_accept,
             ):

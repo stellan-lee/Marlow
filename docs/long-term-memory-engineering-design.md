@@ -126,7 +126,7 @@ Approval of this design means approving the following system-level decisions:
 5. **Scope:** project scope is the safe default; repository and profile scope require explicit selection or promotion.
 6. **Recall:** hard authorization and validity filters run before ranking, and only a small bounded set of active items is disclosed.
 7. **Language:** local retrieval uses structured tags plus `unicode61` and CJK trigram indexes; embeddings are optional reranking, not authority or truth.
-8. **Providers:** Honcho, Holographic, and other external providers remain advisory and cannot establish canonical Decision state.
+8. **Providers:** Honcho and other external providers remain advisory and cannot establish canonical Decision state.
 9. **Consolidation:** the existing consolidation system becomes a candidate-generation/migration source and is retired as an independent runtime authority.
 10. **Graph and explanation:** SQLite links provide the first relationship graph; influence tracing records retrieval/disclosure without claiming hidden causal reasoning.
 
@@ -206,7 +206,7 @@ The current memory surfaces have intentionally different jobs:
 | Session history | Raw conversational provenance | Too large, sensitive, ambiguous, and costly for routine recall |
 | Session search | Manual discovery of old messages | Returns text, not current authority or lifecycle |
 | Structured cards | Heuristic extraction experiment | No canonical CRUD store; assistant-source risk |
-| Honcho / Holographic | Fuzzy cross-session recall and user modeling | Heterogeneous, optional, potentially remote, and not authoritative |
+| Honcho / external memory | Fuzzy cross-session recall and user modeling | Heterogeneous, optional, potentially remote, and not authoritative |
 | Memory consolidation | Candidate discovery and conflict experiment | Separate database, separate lifecycle, weak runtime scope, duplicates ExperienceStore |
 | Skills | Mature reusable procedures | Too directive for tentative or one-off decisions |
 | Todos / goals | Current work state | Not historical judgment |
@@ -314,7 +314,7 @@ A historical attempted outcome with safe evidence, diagnosis, attempts, verifica
 
 ### 5.6 External Recollection
 
-Text returned by Honcho, Holographic, or another external memory provider. It is useful context but unverified and non-authoritative unless separately promoted through the canonical Decision workflow.
+Text returned by Honcho or another external memory provider. It is useful context but unverified and non-authoritative unless separately promoted through the canonical Decision workflow.
 
 ### 5.7 Candidate
 
@@ -2118,7 +2118,7 @@ Structured cards stored in opaque external providers cannot be reliably enumerat
 - leaves existing remote content as advisory provider memory;
 - offers user-selected promotion only when a provider can surface a specific item safely.
 
-Honcho/Holographic content is never bulk-imported as active Decisions.
+Honcho content is never bulk-imported as active Decisions.
 
 ---
 
@@ -2740,7 +2740,7 @@ Drop complete lower-ranked items. Do not truncate semantic fields into misleadin
 
 ### 22.10 Unsupported runtime
 
-Existing Work Experience frontend gates remain fail-closed. PR 1–10 does not silently enable Decision disclosure for unsupported TUI, group, cron, subagent, or batch paths.
+Existing Work Experience frontend gates remain fail-closed. PR 1–10 does not silently enable Decision disclosure for unsupported group, cron, subagent, or batch paths.
 
 ---
 
@@ -3349,7 +3349,7 @@ Legacy provider string becomes one `RECOLLECTION / UNVERIFIED_EXTERNAL` candidat
 - Context budgets by kind.
 - All context tags scrubbed in one-shot and streaming paths.
 - Provider failures isolated.
-- Existing Honcho/Holographic tests remain green.
+- Existing Honcho tests remain green.
 - Static profile memory not duplicated per turn.
 
 #### Acceptance criteria
@@ -3935,7 +3935,7 @@ marlow experience migrate consolidation --dry-run
 **Advantages:** simple and human-readable.  
 **Rejected because:** no stable IDs, scope, authority, immutable revisions, anchor validation, supersession graph, retrieval diagnostics, or transactional lifecycle.
 
-### 28.2 Make Honcho or Holographic canonical
+### 28.2 Make an external memory provider canonical
 
 **Advantages:** semantic recall and user modeling already available.  
 **Rejected because:** optional/heterogeneous provider behavior, remote trust, weak common deletion/scope semantics, inferred content, and no canonical local authority contract.
@@ -4052,7 +4052,7 @@ The PR 1–10 program is complete only when all of the following are true.
 - [ ] Consolidation migration is dry-run-first, idempotent, and candidate-only.
 - [ ] Normal runtime no longer injects consolidation claims.
 - [ ] Structured cards no longer create a competing canonical path.
-- [ ] Honcho/Holographic remain advisory through typed or legacy adapters.
+- [ ] Honcho remain advisory through typed or legacy adapters.
 
 ### 30.7 Relationships and explanation
 

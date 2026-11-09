@@ -3,8 +3,8 @@
 Marlow CLI - Main entry point.
 
 Usage:
-    marlow                     # Interactive chat (default)
-    marlow chat                # Interactive chat
+    marlow                     # Show command help
+    marlow chat -q "Hello"     # Run a single query
     marlow gateway             # Run gateway in foreground
     marlow gateway start       # Start gateway as service
     marlow gateway stop        # Stop gateway service
@@ -81,41 +81,8 @@ def _set_process_title() -> None:
         pass
 
 
-# Mouse-tracking residue suppression — runs BEFORE every other import on the
-# TUI hot path so the terminal stops emitting SGR/X10 mouse reports while the
-# Python launcher is still doing imports (≈100–300ms in cooked + echo mode,
-# before the Node TUI takes stdin into raw mode). During that window any
-# incoming bytes are echoed straight back to the user's shell scrollback as
-# ``^[[<…M`` text. The TUI itself runs `resetTerminalModes()` again in
-# `entry.tsx`; this is just the earlier cousin. ``MARLOW_TUI_NO_EARLY_DISABLE``
-# escapes the behaviour for diagnostics.
-def _suppress_mouse_residue_early() -> None:
-    if os.environ.get("MARLOW_TUI_NO_EARLY_DISABLE") == "1":
-        return
-    if not (os.environ.get("MARLOW_TUI") == "1" or "--tui" in sys.argv[1:]):
-        return
-    try:
-        # Skip when stdout is redirected (`marlow --tui … >log`, CI capture):
-        # the bytes can't reach the terminal anyway and would just pollute
-        # the log with raw CSI.
-        if not os.isatty(1):
-            return
-        # Disable every mouse-tracking variant we know about. Idempotent and
-        # safe to send even when no tracking is currently asserted.
-        os.write(
-            1,
-            b"\x1b[?1003l\x1b[?1002l\x1b[?1001l\x1b[?1000l\x1b[?9l"
-            b"\x1b[?1006l\x1b[?1005l\x1b[?1015l\x1b[?1016l\x1b[?2029l",
-        )
-    except OSError:
-        pass
-
-
-_suppress_mouse_residue_early()
-
-
 import argparse
-import hashlib
+from contextlib import redirect_stdout
 import json
 import shutil
 import stat
@@ -280,7 +247,11 @@ try:
     import yaml as _yaml_early
 
     _cfg_path = get_marlow_home() / "config.yaml"
-    if _cfg_path.exists():
+    _skip_early_config = (
+        os.environ.get("MARLOW_IGNORE_USER_CONFIG") == "1"
+        or "--ignore-user-config" in sys.argv[1:]
+    )
+    if not _skip_early_config and _cfg_path.exists():
         with open(_cfg_path, encoding="utf-8") as _f:
             _early_cfg_raw = _yaml_early.safe_load(_f) or {}
         if "MARLOW_REDACT_SECRETS" not in os.environ:
@@ -620,870 +591,19 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
             return None
 
 
-def _resolve_last_session(source: str = "cli") -> Optional[str]:
-    """Look up the most recently-used session ID for a source."""
-    db = None
-    try:
-        from marlow_state import SessionDB
-
-        db = SessionDB()
-        sessions = db.search_sessions(source=source, limit=1)
-        return sessions[0]["id"] if sessions else None
-    except Exception:
-        pass
-    finally:
-        if db is not None:
-            try:
-                db.close()
-            except Exception:
-                pass
-    return None
-
-
-def _resolve_session_by_name_or_id(name_or_id: str) -> Optional[str]:
-    """Resolve a session name (title) or ID to a session ID.
-
-    - If it looks like a session ID (contains underscore + hex), try direct lookup first.
-    - Otherwise, treat it as a title and use resolve_session_by_title (auto-latest).
-    - Falls back to the other method if the first doesn't match.
-    - If the resolved session is a compression root, follow the chain forward
-      to the latest continuation. Users who remember the old root ID (e.g.
-      from an exit summary printed before the bug fix, or from notes) get
-      resumed at the live tip instead of a stale parent with no messages.
-    """
-    try:
-        from marlow_state import SessionDB
-
-        db = SessionDB()
-
-        # Try as exact session ID first
-        session = db.get_session(name_or_id)
-        resolved_id: Optional[str] = None
-        if session:
-            resolved_id = session["id"]
-        else:
-            # Try as title (with auto-latest for lineage)
-            resolved_id = db.resolve_session_by_title(name_or_id)
-
-        if resolved_id:
-            # Project forward through compression chain so resumes land on
-            # the live tip instead of a dead compressed parent.
-            try:
-                resolved_id = db.get_compression_tip(resolved_id) or resolved_id
-            except Exception:
-                pass
-
-        db.close()
-        return resolved_id
-    except Exception:
-        pass
-    return None
-
-
-def _read_tui_active_session_file(path: Optional[str]) -> Optional[str]:
-    if not path:
-        return None
-    try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
-        sid = str(data.get("session_id") or "").strip()
-        return sid or None
-    except Exception:
-        return None
-
-
-def _print_tui_exit_summary(
-    session_id: Optional[str], active_session_file: Optional[str] = None
-) -> None:
-    """Print a shell-visible epilogue after TUI exits."""
-    target = (
-        _read_tui_active_session_file(active_session_file)
-        or session_id
-        or _resolve_last_session(source="tui")
-    )
-    if not target:
-        return
-
-    db = None
-    try:
-        from marlow_state import SessionDB
-
-        db = SessionDB()
-        session = db.get_session(target)
-        if not session:
-            return
-
-        title = db.get_session_title(target)
-        message_count = int(session.get("message_count") or 0)
-        if message_count == 0:
-            return  # No real conversation — don't show resume info
-        input_tokens = int(session.get("input_tokens") or 0)
-        output_tokens = int(session.get("output_tokens") or 0)
-        cache_read_tokens = int(session.get("cache_read_tokens") or 0)
-        cache_write_tokens = int(session.get("cache_write_tokens") or 0)
-        reasoning_tokens = int(session.get("reasoning_tokens") or 0)
-        total_tokens = (
-            input_tokens
-            + output_tokens
-            + cache_read_tokens
-            + cache_write_tokens
-            + reasoning_tokens
-        )
-    except Exception:
-        return
-    finally:
-        if db is not None:
-            db.close()
-
-    print()
-    print("Resume this session with:")
-    print(f"  marlow --tui --resume {target}")
-    if title:
-        print(f'  marlow --tui -c "{title}"')
-    print()
-    print(f"Session:        {target}")
-    if title:
-        print(f"Title:          {title}")
-    print(f"Messages:       {message_count}")
-    print(
-        "Tokens:         "
-        f"{total_tokens} (in {input_tokens}, out {output_tokens}, "
-        f"cache {cache_read_tokens + cache_write_tokens}, reasoning {reasoning_tokens})"
-    )
-
-
-_NPM_LOCK_RUNTIME_KEYS = frozenset({"ideallyInert", "peer"})
-"""Lockfile fields npm writes non-deterministically at install time.
-
-``ideallyInert`` is npm's runtime annotation for packages it skipped installing
-(per-platform opt-outs).  ``peer`` is dropped from the hidden ``.package-lock.json``
-on dev-dependencies that are *also* declared as peers — the canonical
-``package-lock.json`` records the dual role, but npm 9's actualized tree strips
-it.  Neither key represents a real skew between what was declared and what was
-installed, so we exclude them from the comparison in :func:`_tui_need_npm_install`
-to avoid false-positive reinstalls on every launch.
-"""
-
-
-def _workspace_root(dir: Path) -> Path:
-    """Return the npm workspace root for *dir*.
-
-    In a workspace checkout the single ``package-lock.json`` and hoisted
-    ``node_modules/`` live at the workspace root (the parent of the
-    sub-package directory).  Heuristic: if *dir* has a ``package.json``
-    but **no** ``package-lock.json``, and its **parent** has a
-    ``package-lock.json``, the parent is the workspace root.
-    Otherwise *dir* itself is the root (standalone project or
-    prebuilt-bundle layout).
-
-    Used by ``_tui_need_npm_install``, ``_make_tui_argv``, and
-    ``_build_web_ui`` so that lockfile/node_modules resolution and
-    ``npm install`` cwd stay consistent — a single helper prevents
-    the checks from diverging if someone accidentally creates a
-    sub-package lockfile (e.g. running ``npm install`` in the wrong
-    directory).
-    """
-    if (
-        (dir / "package.json").is_file()
-        and not (dir / "package-lock.json").is_file()
-        and (dir.parent / "package-lock.json").is_file()
-    ):
-        return dir.parent
-    return dir
-
-
-def _tui_need_npm_install(root: Path) -> bool:
-    """True when @marlow/ink is missing or node_modules is behind package-lock.json.
-
-    Prebuilt bundle mode: when ``dist/entry.js`` exists and there is no
-    ``package-lock.json`` (packaged layouts may ship only ``dist/`` +
-    ``package.json``), skip reinstall entirely — the bundle is self-contained
-    and there is nothing to install.
-
-    With npm workspaces the single ``package-lock.json`` and the hoisted
-    ``node_modules/`` live at the workspace root (the parent of the
-    ``ui-tui/`` directory).  The lockfile / ink / marker checks use that
-    workspace root; only the prebuilt-bundle sentinel stays relative to
-    *root* (``ui-tui/dist/entry.js``).
-
-    Compares ``package-lock.json`` against ``node_modules/.package-lock.json``
-    (npm's hidden lockfile) by **content**, not mtime: git checkouts and npm
-    rewrites can bump the root lockfile's timestamp even when installed deps
-    already match, which used to trigger a spurious "Installing TUI
-    dependencies" on every launch.
-
-    For each entry in the root lock's ``packages`` map:
-      - missing from hidden lock → reinstall (unless the entry is marked
-        ``optional`` or ``peer``, which npm may intentionally skip per platform)
-      - present but with differing fields (excluding npm-written runtime
-        annotations like ``ideallyInert``) → reinstall
-
-    Extra entries that exist only in the hidden lock are ignored — stale
-    transitives left over from a removed dependency don't break runtime and
-    we'd rather not force a reinstall for them. Falls back to mtime
-    comparison if either lockfile is unparseable.
-    """
-    # Prebuilt self-contained bundle: no lockfile
-    # shipped, dist/entry.js is the single runtime artefact.
-    entry = root / "dist" / "entry.js"
-    # With npm workspaces the lockfile lives at the workspace root.
-    ws_root = _workspace_root(root)
-    lock = ws_root / "package-lock.json"
-    if entry.is_file() and not lock.is_file():
-        return False
-
-    ink = ws_root / "node_modules" / "@marlow" / "ink" / "package.json"
-    if not ink.is_file():
-        return True
-    if not lock.is_file():
-        return False
-    marker = ws_root / "node_modules" / ".package-lock.json"
-    if not marker.is_file():
-        return True
-
-    # Compare lockfile contents, not mtimes: git checkouts and npm rewrites
-    # can bump the root lockfile timestamp even when installed deps already
-    # match. Fall back to mtime when either file is unparseable.
-    try:
-        wanted = json.loads(lock.read_text(encoding="utf-8")).get("packages") or {}
-        installed = json.loads(marker.read_text(encoding="utf-8")).get("packages") or {}
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return lock.stat().st_mtime > marker.stat().st_mtime
-
-    def comparable(pkg: dict) -> dict:
-        return {k: v for k, v in pkg.items() if k not in _NPM_LOCK_RUNTIME_KEYS}
-
-    for name, pkg in wanted.items():
-        if not name:
-            continue
-
-        if not isinstance(pkg, dict):
-            continue
-
-        if name not in installed:
-            if pkg.get("optional") or pkg.get("peer"):
-                continue
-            return True
-
-        if isinstance(installed[name], dict) and comparable(pkg) != comparable(
-            installed[name]
-        ):
-            return True
-
-    return False
-
-
-_TUI_BUILD_INPUT_DIRS = (
-    "src",
-    "packages/marlow-ink/src",
-)
-
-_TUI_BUILD_INPUT_FILES = (
-    "package.json",
-    "package-lock.json",
-    "tsconfig.json",
-    "tsconfig.build.json",
-    "babel.compiler.config.cjs",
-    "scripts/build.mjs",
-    "packages/marlow-ink/package.json",
-    "packages/marlow-ink/index.js",
-    "packages/marlow-ink/text-input.js",
-)
-
-_TUI_BUILD_INPUT_SUFFIXES = frozenset(
-    {".cjs", ".js", ".jsx", ".json", ".mjs", ".ts", ".tsx"}
-)
-
-
-def _iter_tui_build_inputs(root: Path):
-    """Yield source/config files that affect ``ui-tui/dist/entry.js``."""
-    for rel in _TUI_BUILD_INPUT_FILES:
-        path = root / rel
-        if path.is_file():
-            yield path
-
-    for rel in _TUI_BUILD_INPUT_DIRS:
-        base = root / rel
-        if not base.is_dir():
-            continue
-        for path in base.rglob("*"):
-            if path.is_file() and path.suffix in _TUI_BUILD_INPUT_SUFFIXES:
-                yield path
-
-
-def _tui_need_rebuild(root: Path) -> bool:
-    """True when ``dist/entry.js`` is missing or older than TUI inputs.
-
-    The TUI bundle is self-contained. Rebuilding it on every launch adds a
-    visible cold-start tax, while a simple mtime freshness
-    check still rebuilds immediately after source updates, dependency updates,
-    or local edits. Set ``MARLOW_TUI_FORCE_BUILD=1`` to force the old behaviour.
-    """
-    force = (os.environ.get("MARLOW_TUI_FORCE_BUILD") or "").strip().lower()
-    if force in {"1", "true", "yes", "on"}:
-        return True
-
-    entry = root / "dist" / "entry.js"
-    try:
-        output_mtime = entry.stat().st_mtime
-    except OSError:
-        return True
-
-    for path in _iter_tui_build_inputs(root):
-        try:
-            if path.stat().st_mtime > output_mtime:
-                return True
-        except OSError:
-            return True
-    return False
-
-
-def _ensure_tui_node() -> None:
-    """Make sure `node` + `npm` are on PATH for the TUI.
-
-    If either is missing and scripts/lib/node-bootstrap.sh is available, source
-    it and call `ensure_node` (fnm/nvm/proto/brew/bundled cascade). After
-    install, capture the resolved node binary path from the bash subprocess
-    and prepend its directory to os.environ["PATH"] so shutil.which finds the
-    new binaries in this Python process — regardless of which version manager
-    was used (nvm, fnm, proto, brew, or the bundled fallback).
-
-    Idempotent no-op when node+npm are already discoverable. Set
-    ``MARLOW_SKIP_NODE_BOOTSTRAP=1`` to disable auto-install.
-    """
-    if shutil.which("node") and shutil.which("npm"):
-        return
-    if os.environ.get("MARLOW_SKIP_NODE_BOOTSTRAP"):
-        return
-
-    helper = PROJECT_ROOT / "scripts" / "lib" / "node-bootstrap.sh"
-    if not helper.is_file():
-        return
-
-    marlow_home = os.environ.get("MARLOW_HOME") or str(Path.home() / ".marlow")
-    try:
-        # Helper writes logs to stderr; we ask bash to print `command -v node`
-        # on stdout once ensure_node succeeds. Subshell PATH edits don't leak
-        # back into Python, so the stdout capture is the bridge.
-        result = subprocess.run(
-            [
-                "bash",
-                "-c",
-                f'source "{helper}" >&2 && ensure_node >&2 && command -v node',
-            ],
-            env={**os.environ, "MARLOW_HOME": marlow_home},
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return
-
-    parts = os.environ.get("PATH", "").split(os.pathsep)
-    extras: list[Path] = []
-
-    resolved = (result.stdout or "").strip()
-    if resolved:
-        extras.append(Path(resolved).resolve().parent)
-
-    extras.extend([Path(marlow_home) / "node" / "bin", Path.home() / ".local" / "bin"])
-
-    for extra in extras:
-        s = str(extra)
-        if extra.is_dir() and s not in parts:
-            parts.insert(0, s)
-    os.environ["PATH"] = os.pathsep.join(parts)
-
-
-def _find_bundled_tui(marlow_cli_dir: Path | None = None) -> Path | None:
-    """Find a pre-built TUI entry.js bundled in the wheel."""
-    if marlow_cli_dir is None:
-        marlow_cli_dir = Path(__file__).parent
-    bundled = marlow_cli_dir / "tui_dist" / "entry.js"
-    return bundled if bundled.is_file() else None
-
-
-def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
-    """TUI: --dev → tsx src; else node dist (MARLOW_TUI_DIR prebuilt or esbuild)."""
-    _ensure_tui_node()
-
-    def _node_bin(bin: str) -> str:
-        if bin == "node":
-            env_node = os.environ.get("MARLOW_NODE")
-            if env_node and os.path.isfile(env_node) and os.access(env_node, os.X_OK):
-                return env_node
-        path = shutil.which(bin)
-        if not path and bin == "node":
-            try:
-                from marlow_cli.dep_ensure import ensure_dependency
-                if ensure_dependency("node"):
-                    path = shutil.which("node")
-            except Exception:
-                pass
-        if not path:
-            print(f"{bin} not found — install Node.js to use the TUI.")
-            sys.exit(1)
-        return path
-
-    # Footgun: --dev against a prebuilt bundle that has no source/node_modules.
-    ext_dir = os.environ.get("MARLOW_TUI_DIR")
-    if tui_dev and ext_dir:
-        print(
-            f"Error: --dev is incompatible with MARLOW_TUI_DIR={ext_dir}\n"
-            f"The prebuilt TUI has no source code to hot-reload.\n"
-            f"Unset MARLOW_TUI_DIR (e.g. `unset MARLOW_TUI_DIR`) to use --dev from a checkout.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    # 1. Prebuilt bundle: just run it.
-    if not tui_dev:
-        if ext_dir:
-            p = Path(ext_dir)
-            if (p / "dist" / "entry.js").is_file():
-                node = _node_bin("node")
-                return [node, "--expose-gc", str(p / "dist" / "entry.js")], p
-
-        # 1b. Bundled in wheel (pip install)
-        bundled = _find_bundled_tui()
-        if bundled is not None:
-            node = _node_bin("node")
-            return [node, "--expose-gc", str(bundled)], bundled.parent
-
-    # 2. Normal flow: npm install if needed, always esbuild, then node dist/entry.js.
-    #    --dev flow: npm install if needed, then tsx src/entry.tsx.
-    #    npm install runs from the workspace root (where package-lock.json lives);
-    #    npm workspaces resolves ui-tui deps automatically.
-    did_install = False
-    if _tui_need_npm_install(tui_dir):
-        npm = _node_bin("npm")
-        if not os.environ.get("MARLOW_QUIET"):
-            print("Installing TUI dependencies…")
-        result = subprocess.run(
-            [npm, "install", "--silent", "--no-fund", "--no-audit", "--progress=false"],
-            cwd=str(_workspace_root(tui_dir)),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env={**os.environ, "CI": "1"},
-        )
-        if result.returncode != 0:
-            combined = f"{result.stdout or ''}\n{result.stderr or ''}".strip()
-            preview = "\n".join(combined.splitlines()[-30:])
-            print("npm install failed.")
-            if preview:
-                print(preview)
-            sys.exit(1)
-        did_install = True
-
-    if tui_dev:
-        # Keep the local @marlow/ink package exports in sync with source.
-        # --dev runs src/entry.tsx directly, but @marlow/ink resolves through
-        # packages/marlow-ink/dist/entry-exports.js. If that dist bundle is
-        # stale after a pull, newer hooks/components can exist in src while
-        # being missing at runtime (e.g. useCursorAdvance). Prebuild it here.
-        npm = _node_bin("npm")
-        ink_dir = tui_dir / "packages" / "marlow-ink"
-        result = subprocess.run(
-            [npm, "run", "build"],
-            cwd=str(ink_dir),
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            combined = f"{result.stdout or ''}{result.stderr or ''}".strip()
-            preview = "\n".join(combined.splitlines()[-30:])
-            print("TUI dev prebuild failed.")
-            if preview:
-                print(preview)
-            sys.exit(1)
-
-        tsx = tui_dir / "node_modules" / ".bin" / "tsx"
-        if tsx.exists():
-            return [str(tsx), "src/entry.tsx"], tui_dir
-        return [npm, "start"], tui_dir
-
-    if did_install or _tui_need_rebuild(tui_dir):
-        npm = _node_bin("npm")
-        result = subprocess.run(
-            [npm, "run", "build"],
-            cwd=str(tui_dir),
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            combined = f"{result.stdout or ''}{result.stderr or ''}".strip()
-            preview = "\n".join(combined.splitlines()[-30:])
-            print("TUI build failed.")
-            if preview:
-                print(preview)
-            sys.exit(1)
-
-    node = _node_bin("node")
-    return [node, "--expose-gc", str(tui_dir / "dist" / "entry.js")], tui_dir
-
-
-def _normalize_tui_toolsets(toolsets: object) -> list[str]:
-    """Normalize argparse/Fire-style toolset input for the TUI subprocess."""
-    try:
-        from marlow_cli.oneshot import _normalize_toolsets
-
-        return _normalize_toolsets(toolsets) or []
-    except (AttributeError, ImportError):
-        if not toolsets:
-            return []
-
-        raw_items = [toolsets] if isinstance(toolsets, str) else toolsets
-        if not isinstance(raw_items, (list, tuple)):
-            raw_items = [raw_items]
-
-        normalized: list[str] = []
-        for item in raw_items:
-            if isinstance(item, str):
-                normalized.extend(part.strip() for part in item.split(","))
-            else:
-                normalized.append(str(item).strip())
-
-        return [item for item in normalized if item]
-
-
-def _launch_tui(
-    resume_session_id: Optional[str] = None,
-    tui_dev: bool = False,
-    model: Optional[str] = None,
-    provider: Optional[str] = None,
-    toolsets: object = None,
-    verbose: Optional[bool] = None,
-    quiet: bool = False,
-    query: Optional[str] = None,
-    image: Optional[str] = None,
-    worktree: bool = False,
-    checkpoints: bool = False,
-    pass_session_id: bool = False,
-    max_turns: Optional[int] = None,
-    accept_hooks: bool = False,
-):
-    """Replace current process with the TUI."""
-    tui_dir = PROJECT_ROOT / "ui-tui"
-
-    import tempfile
-
-    env = os.environ.copy()
-    active_session_fd, active_session_file = tempfile.mkstemp(
-        prefix="marlow-tui-active-session-", suffix=".json"
-    )
-    os.close(active_session_fd)
-    env["MARLOW_TUI_ACTIVE_SESSION_FILE"] = active_session_file
-    env["MARLOW_PYTHON_SRC_ROOT"] = os.environ.get(
-        "MARLOW_PYTHON_SRC_ROOT", str(PROJECT_ROOT)
-    )
-    env.setdefault("MARLOW_PYTHON", sys.executable)
-    env.setdefault("MARLOW_CWD", os.getcwd())
-    env.setdefault("NODE_ENV", "development" if tui_dev else "production")
-
-    wt_info = None
-    if worktree:
-        try:
-            from cli import (
-                _cleanup_worktree,
-                _git_repo_root,
-                _prune_stale_worktrees,
-                _setup_worktree,
-            )
-
-            repo = _git_repo_root()
-            if repo:
-                _prune_stale_worktrees(repo)
-            wt_info = _setup_worktree()
-        except Exception as exc:
-            print(f"✗ Failed to create TUI worktree: {exc}", file=sys.stderr)
-            wt_info = None
-        if not wt_info:
-            sys.exit(1)
-        env["MARLOW_CWD"] = wt_info["path"]
-        env["TERMINAL_CWD"] = wt_info["path"]
-
-    if model:
-        env["MARLOW_MODEL"] = model
-        env["MARLOW_INFERENCE_MODEL"] = model
-    if provider:
-        env["MARLOW_TUI_PROVIDER"] = provider
-        env["MARLOW_INFERENCE_PROVIDER"] = provider
-    tui_toolsets = _normalize_tui_toolsets(toolsets)
-    if tui_toolsets:
-        env["MARLOW_TUI_TOOLSETS"] = ",".join(tui_toolsets)
-    if query:
-        env["MARLOW_TUI_QUERY"] = query
-    if image:
-        env["MARLOW_TUI_IMAGE"] = image
-    if checkpoints:
-        env["MARLOW_TUI_CHECKPOINTS"] = "1"
-    if pass_session_id:
-        env["MARLOW_TUI_PASS_SESSION_ID"] = "1"
-    if max_turns is not None:
-        env["MARLOW_TUI_MAX_TURNS"] = str(max_turns)
-    if verbose:
-        env["MARLOW_TUI_TOOL_PROGRESS"] = "verbose"
-    elif quiet:
-        env["MARLOW_TUI_TOOL_PROGRESS"] = "off"
-    if accept_hooks:
-        env["MARLOW_ACCEPT_HOOKS"] = "1"
-    # Guarantee an 8GB V8 heap for the TUI. Default node cap is ~1.5–4GB
-    # depending on version and can fatal-OOM on long sessions with large
-    # transcripts / reasoning blobs. Token-level merge: respect any
-    # user-supplied --max-old-space-size (they may have set it higher).
-    # --expose-gc is *not* added here: Node rejects it in NODE_OPTIONS
-    # ("--expose-gc is not allowed in NODE_OPTIONS") and refuses to start.
-    # It is passed as a direct argv flag in _make_tui_argv() instead.
-    _tokens = env.get("NODE_OPTIONS", "").split()
-    if not any(t.startswith("--max-old-space-size=") for t in _tokens):
-        _tokens.append("--max-old-space-size=8192")
-    env["NODE_OPTIONS"] = " ".join(_tokens)
-    # MARLOW_TUI_RESUME is an internal hand-off from the Python wrapper to the
-    # Ink app.  Because we start from os.environ.copy(), an exported/stale value
-    # in the user's shell would otherwise make a plain `marlow --tui` try to
-    # resume a non-existent session and leave the UI at "error: session not
-    # found" with no live session.  Only forward a resume id that argparse
-    # resolved for this invocation; direct `node ui-tui/dist/entry.js` users can
-    # still set MARLOW_TUI_RESUME themselves.
-    env.pop("MARLOW_TUI_RESUME", None)
-    if resume_session_id:
-        env["MARLOW_TUI_RESUME"] = resume_session_id
-
-    argv, cwd = _make_tui_argv(tui_dir, tui_dev)
-    code: Optional[int] = None
-    try:
-        try:
-            code = subprocess.call(argv, cwd=str(cwd), env=env)
-        except KeyboardInterrupt:
-            code = 130
-
-        if code in {0, 130}:
-            _print_tui_exit_summary(resume_session_id, active_session_file)
-    finally:
-        try:
-            os.unlink(active_session_file)
-        except OSError:
-            pass
-        if wt_info:
-            try:
-                _cleanup_worktree(wt_info)
-            except Exception:
-                pass
-
-    # Exit code 42 = TUI requested an update. Relaunch as `marlow update` so
-    # the user sees update output directly and gets the new version.
-    # preserve_inherited=False ensures --tui and other flags are NOT carried
-    # into the update subcommand.
-    if code == 42:
-        from marlow_cli.relaunch import relaunch
-
-        print()
-        print("⚕ Launching update...")
-        print()
-        relaunch(["update"], preserve_inherited=False)
-
-    sys.exit(code)
-
-
-def _sync_bundled_skills_quietly() -> None:
-    """Seed ``~/.marlow/skills/`` with the bundled skill library on first launch.
-
-    Called from any CLI entrypoint that the user might use as their first
-    interaction with Marlow — chat, TUI, and gateway. The skills_sync
-    module is manifest-based and idempotent:
-    skipped skills cost ~milliseconds, so calling this repeatedly is fine.
-
-    Failures are swallowed because skills are an enhancement, not a hard
-    dependency. Marlow still functions without them; the user just sees an
-    empty skills library.
-    """
-    try:
-        from tools.skills_sync import sync_skills
-
-        sync_skills(quiet=True)
-    except Exception:
-        pass
-
-
 def cmd_chat(args):
-    """Run interactive chat CLI."""
-    use_tui = getattr(args, "tui", False) or os.environ.get("MARLOW_TUI") == "1"
+    """Run one query without starting an interactive chat interface."""
+    from marlow_cli.query import run_query
 
-    # Resolve --continue into --resume with the latest session or by name
-    continue_val = getattr(args, "continue_last", None)
-    if continue_val and not getattr(args, "resume", None):
-        if isinstance(continue_val, str):
-            # -c "session name" — resolve by title or ID
-            resolved = _resolve_session_by_name_or_id(continue_val)
-            if resolved:
-                args.resume = resolved
-            else:
-                print(f"No session found matching '{continue_val}'.")
-                print("Use 'marlow sessions list' to see available sessions.")
-                sys.exit(1)
-        else:
-            # -c with no argument — continue the most recent session
-            source = "tui" if use_tui else "cli"
-            last_id = _resolve_last_session(source=source)
-            if not last_id and source == "tui":
-                last_id = _resolve_last_session(source="cli")
-            if last_id:
-                args.resume = last_id
-            else:
-                kind = "TUI" if use_tui else "CLI"
-                print(f"No previous {kind} session found to continue.")
-                sys.exit(1)
-
-    # Resolve --resume by title if it's not a direct session ID
-    resume_val = getattr(args, "resume", None)
-    if resume_val:
-        resolved = _resolve_session_by_name_or_id(resume_val)
-        if resolved:
-            args.resume = resolved
-        # If resolution fails, keep the original value — _init_agent will
-        # report "Session not found" with the original input
-
-    # Session<->workspace binding: cd back into a resumed session's recorded cwd
-    # so it resumes in the repo it belonged to. Opt out with --no-restore-cwd;
-    # skipped under --worktree (that path owns its own dir). Best-effort — a
-    # missing dir warns and stays put rather than failing the resume.
-    if (
-        getattr(args, "resume", None)
-        and not getattr(args, "no_restore_cwd", False)
-        and not getattr(args, "worktree", False)
-    ):
-        try:
-            from marlow_state import SessionDB
-
-            _saved_cwd = ((SessionDB().get_session(args.resume) or {}).get("cwd") or "").strip()
-            if _saved_cwd and not os.path.isdir(_saved_cwd):
-                print(f"⚠ session's recorded dir is gone ({_saved_cwd}); staying in {os.getcwd()}")
-            elif _saved_cwd and os.path.realpath(_saved_cwd) != os.path.realpath(os.getcwd()):
-                os.chdir(_saved_cwd)
-                print(f"↪ restored workspace dir: {_saved_cwd}")
-        except Exception:
-            pass  # never let cwd-restore break a resume
-
-    # First-run guard: check if any provider is configured before launching
-    if not _has_any_provider_configured():
-        print()
-        print(
-            "It looks like Marlow isn't configured yet -- no API keys or providers found."
-        )
-        print()
-        print("  Run:  marlow setup")
-        print()
-
-        from marlow_cli.setup import (
-            is_interactive_stdin,
-            print_noninteractive_setup_guidance,
-        )
-
-        if not is_interactive_stdin():
-            print_noninteractive_setup_guidance(
-                "No interactive TTY detected for the first-run setup prompt."
-            )
-            sys.exit(1)
-
-        try:
-            reply = input("Run setup now? [Y/n] ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            reply = "n"
-        if reply in {"", "y", "yes"}:
-            cmd_setup(args)
-            return
-        print()
-        print("You can run 'marlow setup' at any time to configure.")
-        sys.exit(1)
-
-    # Start update check in background (runs while other init happens).
-    try:
-        from marlow_cli.banner import prefetch_update_check
-
-        prefetch_update_check()
-    except Exception:
-        pass
-
-    # Sync bundled skills on every CLI launch (fast -- skips unchanged skills)
-    try:
-        _sync_bundled_skills_for_startup()
-    except Exception:
-        pass
-
-    # --yolo: bypass all dangerous command approvals
-    if getattr(args, "yolo", False):
-        os.environ["MARLOW_YOLO_MODE"] = "1"
-
-    # --ignore-user-config: make load_cli_config() / load_config() skip the
-    # user's ~/.marlow/config.yaml and return built-in defaults. Set BEFORE
-    # importing cli (which runs `CLI_CONFIG = load_cli_config()` at module
-    # import time). Credentials in .env are still loaded — this flag only
-    # ignores behavioral/config settings.
-    if getattr(args, "ignore_user_config", False):
-        os.environ["MARLOW_IGNORE_USER_CONFIG"] = "1"
-
-    # --ignore-rules: skip auto-injection of AGENTS.md/SOUL.md/.cursorrules
-    # (rules) and memory entries.
-    # Maps to AIAgent(skip_context_files=True, skip_memory=True).
-    if getattr(args, "ignore_rules", False):
-        os.environ["MARLOW_IGNORE_RULES"] = "1"
-
-    # --source: tag session source for filtering (e.g. 'tool' for third-party integrations)
-    if getattr(args, "source", None):
-        os.environ["MARLOW_SESSION_SOURCE"] = args.source
-
-    if use_tui:
-        _launch_tui(
-            getattr(args, "resume", None),
-            tui_dev=getattr(args, "tui_dev", False),
-            model=getattr(args, "model", None),
-            provider=getattr(args, "provider", None),
-            toolsets=getattr(args, "toolsets", None),
-            verbose=getattr(args, "verbose", None),
-            quiet=getattr(args, "quiet", False),
-            query=getattr(args, "query", None),
-            image=getattr(args, "image", None),
-            worktree=getattr(args, "worktree", False),
-            checkpoints=getattr(args, "checkpoints", False),
-            pass_session_id=getattr(args, "pass_session_id", False),
-            max_turns=getattr(args, "max_turns", None),
-            accept_hooks=getattr(args, "accept_hooks", False),
-        )
-
-    # Import and run the CLI
-    from cli import main as cli_main
-
-    # Build kwargs from args
-    kwargs = {
-        "model": args.model,
-        "provider": getattr(args, "provider", None),
-        "toolsets": args.toolsets,
-        "verbose": getattr(args, "verbose", None),
-        "quiet": getattr(args, "quiet", False),
-        "query": args.query,
-        "image": getattr(args, "image", None),
-        "resume": getattr(args, "resume", None),
-        "worktree": getattr(args, "worktree", False),
-        "checkpoints": getattr(args, "checkpoints", False),
-        "pass_session_id": getattr(args, "pass_session_id", False),
-        "max_turns": getattr(args, "max_turns", None),
-        "ignore_rules": getattr(args, "ignore_rules", False),
-        "ignore_user_config": getattr(args, "ignore_user_config", False),
-        "compact": getattr(args, "compact", False),
-    }
-    # Filter out None values
-    kwargs = {k: v for k, v in kwargs.items() if v is not None}
-
-    try:
-        cli_main(**kwargs)
-    except ValueError as e:
-        print(f"Error: {e}")
-        sys.exit(1)
+    sys.exit(run_query(args))
 
 
 def cmd_gateway(args):
     """Gateway management commands."""
-    _sync_bundled_skills_quietly()
+    try:
+        _sync_bundled_skills_for_startup()
+    except Exception:
+        logger.debug("Bundled skill sync failed", exc_info=True)
 
     from marlow_cli.gateway import gateway_command
 
@@ -1509,7 +629,7 @@ def cmd_postinstall(args):
     print("⚕ Marlow post-install bootstrap")
     print()
 
-    for dep in ("node", "browser", "ripgrep", "ffmpeg"):
+    for dep in ("node", "browser", "ripgrep"):
         ensure_dependency(dep)
 
     if not _has_any_provider_configured():
@@ -1870,7 +990,6 @@ _AUX_TASKS: list[tuple[str, str, str]] = [
     ("mcp", "MCP", "MCP tool reasoning"),
     ("title_generation", "Title generation", "session titles"),
     ("profile_describer", "Profile describer", "auto profile descriptions"),
-    ("curator", "Curator", "skill-usage review pass"),
 ]
 
 
@@ -3436,7 +2555,9 @@ _UPDATE_CRITICAL_FILES = (
     "marlow_cli/main.py",
     "marlow_cli/config.py",
     "marlow_cli/__init__.py",
-    "cli.py",
+    "marlow_cli/_parser.py",
+    "marlow_cli/query.py",
+    "marlow_cli/oneshot.py",
     "run_agent.py",
     "model_tools.py",
     "toolsets.py",
@@ -3695,139 +2816,6 @@ def _run_npm_install_deterministic(
 
 
 
-
-
-def _print_curator_first_run_notice() -> None:
-    """Print a short heads-up about the skill curator after `marlow update`.
-
-    Only fires when the curator is enabled AND has no recorded run yet, which
-    is exactly the window where the gateway ticker used to fire Curator
-    against a fresh skill library immediately after an update. We defer the
-    first real pass by one ``interval_hours``; this notice tells the user how
-    to preview or disable before then. Silent on steady state.
-    """
-    try:
-        from agent import curator
-    except Exception:
-        return
-    try:
-        if not curator.is_enabled():
-            return
-        state = curator.load_state()
-    except Exception:
-        return
-    if state.get("last_run_at"):
-        # Curator has run before (real or already seeded) — no notice needed.
-        return
-    try:
-        hours = curator.get_interval_hours()
-    except Exception:
-        hours = 24 * 7
-    days = max(1, hours // 24)
-    print()
-    print("ℹ Skill curator")
-    print(
-        f"  Background skill maintenance is enabled. First pass is deferred "
-        f"~{days}d after installation; only agent-created skills are in "
-        f"scope and nothing is ever auto-deleted (archive is recoverable)."
-    )
-    print("  Preview now:  marlow curator run --dry-run")
-    print("  Pause it:     marlow curator pause")
-    print(
-        "  Project:      https://github.com/stellan-lee/Marlow#readme"
-    )
-
-
-def _print_curator_recent_run_notice() -> None:
-    """Print the most recent curator run summary, exactly once.
-
-    The curator runs in the background (gateway tick + CLI session start),
-    so users learn about skill consolidations only by stumbling into a
-    rename. ``marlow update`` is a high-attention surface — surface the
-    most recent run's rename map here, once.
-
-    Show-once: state stamps ``last_run_summary_shown_at`` after printing.
-    Subsequent ``marlow update`` invocations skip the block until a newer
-    curator run lands. Silent when the curator has never run, when the
-    most recent summary has already been shown, or when the summary has
-    no rename information to display (no archives).
-    """
-    try:
-        from agent import curator
-    except Exception:
-        return
-    try:
-        state = curator.load_state()
-    except Exception:
-        return
-
-    last_run_at = state.get("last_run_at")
-    if not last_run_at:
-        return  # no curator run yet — first-run notice handles this case
-
-    if state.get("last_run_summary_shown_at") == last_run_at:
-        return  # already shown for this run
-
-    summary = state.get("last_run_summary") or ""
-    if not summary:
-        return
-
-    # Only print when there's something interesting to show — i.e. the
-    # rename map block was appended (multi-line summary). A bare "auto:
-    # no changes; llm: no change" doesn't warrant interrupting the
-    # update flow.
-    if "\n" not in summary:
-        # Still stamp it shown so we don't reconsider it on every update.
-        try:
-            state["last_run_summary_shown_at"] = last_run_at
-            curator.save_state(state)
-        except Exception:
-            pass
-        return
-
-    # Format the timestamp as "Xh ago" for readability.
-    when = _format_time_ago(last_run_at)
-    print()
-    print(f"ℹ Skill curator — last run {when}")
-    for line in summary.splitlines():
-        print(f"  {line}")
-    print(
-        "  (This message shows once per curator run. "
-        "View anytime: marlow curator status)"
-    )
-
-    # Stamp shown so we don't repeat on the next update.
-    try:
-        state["last_run_summary_shown_at"] = last_run_at
-        curator.save_state(state)
-    except Exception:
-        pass
-
-
-def _format_time_ago(iso_ts: str) -> str:
-    """Render an ISO timestamp as `Xh ago` / `Xd ago` / `Xm ago`. Best effort."""
-    try:
-        from datetime import datetime, timezone
-        ts = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        delta = datetime.now(timezone.utc) - ts
-        secs = int(delta.total_seconds())
-        if secs < 60:
-            return "just now"
-        if secs < 3600:
-            return f"{secs // 60}m ago"
-        if secs < 86400:
-            return f"{secs // 3600}h ago"
-        return f"{secs // 86400}d ago"
-    except Exception:
-        return "recently"
-
-
-
-
-# Back-compat alias: some tests and any external callers may import the old
-# warn-only name.  The new behaviour (kill stale processes) replaces it.
 
 
 def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
@@ -4229,45 +3217,15 @@ def _update_node_dependencies() -> None:
     if not (PROJECT_ROOT / "package.json").exists():
         return
 
-    # With a single workspace lockfile the root install would cover ALL
-    # workspaces — but `marlow update` only needs the CLI/TUI build, so we
-    # install root-only first then add just the workspaces those surfaces
-    # require.  The other workspaces (e.g. the bootstrap installer) are not
-    # needed during `marlow update` and are skipped.
-    print("→ Updating Node.js dependencies...")
-    extra_args = ["--no-fund", "--no-audit", "--progress=false"]
-
-    # Step 1: root install (no workspace recursion).
-    root_args = [*extra_args, "--workspaces=false"]
-    root_result = _run_npm_install_deterministic(
+    print("→ Updating browser-tool dependencies...")
+    result = _run_npm_install_deterministic(
         npm,
         PROJECT_ROOT,
-        extra_args=tuple(root_args),
+        extra_args=("--no-fund", "--no-audit", "--progress=false"),
         capture_output=False,
     )
-    if root_result.returncode != 0:
+    if result.returncode != 0:
         print("  ⚠ npm install failed in repo root")
-        stderr = (root_result.stderr or "").strip() if root_result.stderr else ""
-        if stderr:
-            print(f"    {stderr.splitlines()[-1]}")
-        return
-
-    # Step 2: install only the workspace update needs (ui-tui).
-    # --workspace selects specific workspaces; the rest are skipped.
-    ws_args = [*extra_args, "--workspace", "ui-tui"]
-    ws_result = _run_npm_install_deterministic(
-        npm,
-        PROJECT_ROOT,
-        extra_args=tuple(ws_args),
-        capture_output=False,
-    )
-    if ws_result.returncode == 0:
-        print("  ✓ repo root + ui-tui, web workspaces")
-    else:
-        print("  ⚠ npm workspace install failed")
-        stderr = (ws_result.stderr or "").strip() if ws_result.stderr else ""
-        if stderr:
-            print(f"    {stderr.splitlines()[-1]}")
 
 
 class _UpdateOutputStream:
@@ -5333,47 +4291,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
         print()
         print("✓ Update complete!")
 
-        # Curator first-run heads-up. Only prints when curator is enabled AND
-        # has never run — i.e. the window where the ticker would otherwise
-        # have fired against a fresh skill library. Kept silent on steady
-        # state so we don't nag.
-        try:
-            _print_curator_first_run_notice()
-        except Exception as e:
-            logger.debug("Curator first-run notice failed: %s", e)
-
-        # Most-recent curator run notice — show-once per run. Surfaces the
-        # rename map (`old-name → umbrella`) on the high-attention update
-        # surface so users learn about consolidations without having to
-        # check `marlow curator status`. Self-stamps after printing so it
-        # never repeats for the same run.
-        try:
-            _print_curator_recent_run_notice()
-        except Exception as e:
-            logger.debug("Curator recent-run notice failed: %s", e)
-
         # Repair RHEL-family root installs where /usr/local/bin isn't on PATH
         # for non-login interactive shells.  No-op on every other platform.
         try:
             _ensure_fhs_path_guard()
         except Exception as e:
             logger.debug("FHS PATH guard check failed: %s", e)
-
-        # Refresh the cua-driver binary used by the Computer Use toolset.
-        # The upstream installer is gated on macOS and on the binary already
-        # being on PATH, so this is a no-op for users who don't have it.
-        # Tying the refresh to ``marlow update`` gives users a predictable
-        # cadence (matches when they pull new agent code) without adding
-        # startup latency or a per-launch GitHub API call.
-        try:
-            if sys.platform == "darwin" and shutil.which("cua-driver"):
-                from marlow_cli.tools_config import install_cua_driver
-
-                print()
-                print("→ Refreshing cua-driver (Computer Use)...")
-                install_cua_driver(upgrade=True)
-        except Exception as e:
-            logger.debug("cua-driver refresh failed: %s", e)
 
         # Write exit code *before* the gateway restart attempt.
         # When running as ``marlow update --gateway`` (spawned by the gateway's
@@ -6213,13 +5136,13 @@ def cmd_profile(args):
             print(f"  {name} gateway start      Start the messaging gateway")
             if clone or clone_all:
                 print(f"\n  Edit {profile_dir_display}/.env for different API keys")
-                print(f"  Edit {profile_dir_display}/SOUL.md for different personality")
+                print(f"  Set agent.system_prompt in {profile_dir_display}/config.yaml to customize instructions")
             else:
                 print(
                     f"\n  ⚠ This profile has no API keys yet. Run '{name} setup' first,"
                 )
                 print(f"    or it will inherit keys from your shell environment.")
-                print(f"  Edit {profile_dir_display}/SOUL.md to customize personality")
+                print(f"  Set agent.system_prompt in {profile_dir_display}/config.yaml to customize instructions")
             print()
 
         except (ValueError, FileExistsError, FileNotFoundError) as e:
@@ -6709,10 +5632,10 @@ def cmd_logs(args):
 # to parse.
 _BUILTIN_SUBCOMMANDS = frozenset(
     {
-        "checkpoints", "completion", "computer-use",
-        "config", "cron", "curator", "debug", "doctor",
+        "checkpoints", "completion",
+        "config", "cron", "debug", "doctor",
         "dump", "fallback", "gateway", "hooks", "insights",
-        "experience", "journey", "learning", "memory-graph",
+        "experience",
         "login", "logout", "logs", "mcp", "memory",
         "model", "pairing", "plugins", "postinstall", "profile",
         "prompt-size",
@@ -6795,7 +5718,6 @@ def _plugin_cli_discovery_needed() -> bool:
     """
     first = _first_positional_argv()
     if first is None:
-        # Bare ``marlow`` or only flags → defaults to ``chat``.
         return False
     if first in _BUILTIN_SUBCOMMANDS:
         return False
@@ -6815,22 +5737,12 @@ _AGENT_SUBCOMMANDS = {
 }
 
 
-def _is_tui_chat_launch(args) -> bool:
-    return bool(getattr(args, "tui", False) or os.environ.get("MARLOW_TUI") == "1")
-
-
 def _command_has_dedicated_mcp_startup(args) -> bool:
     if args.command == "gateway" and getattr(args, "gateway_command", None) == "run":
         return True
     if args.command == "cron" and getattr(args, "cron_command", None) in {"run", "tick"}:
         return True
     return False
-
-
-def _should_background_mcp_startup(args) -> bool:
-    if _is_tui_chat_launch(args):
-        return False
-    return args.command in {None, "chat", "rl"}
 
 
 def _prepare_agent_startup(args) -> None:
@@ -6852,47 +5764,26 @@ def _prepare_agent_startup(args) -> None:
             "plugin discovery failed at CLI startup",
             exc_info=True,
         )
-    _run_inline_mcp_discovery = True
-    if _is_tui_chat_launch(args):
-        # The TUI launcher hands off to a dedicated startup path that already
-        # backgrounds MCP discovery with a bounded join before the first tool
-        # snapshot.
-        _run_inline_mcp_discovery = False
-    elif _command_has_dedicated_mcp_startup(args):
-        # These entrypoints already do their own MCP startup later on the real
-        # runtime path (gateway executor or cron job runner).
-        _run_inline_mcp_discovery = False
-    elif _should_background_mcp_startup(args):
-        try:
-            from marlow_cli.mcp_startup import start_background_mcp_discovery
+    if getattr(args, "oneshot", None) is not None or args.command == "chat":
+        from marlow_cli.mcp_startup import start_background_mcp_discovery
 
-            start_background_mcp_discovery(
-                logger=logger,
-                thread_name="cli-mcp-discovery",
-            )
-        except Exception:
-            logger.debug(
-                "Background MCP tool discovery failed at CLI startup",
-                exc_info=True,
-            )
-        _run_inline_mcp_discovery = False
-    if _run_inline_mcp_discovery:
+        start_background_mcp_discovery(logger=logger, thread_name="cli-mcp-discovery")
+    elif not _command_has_dedicated_mcp_startup(args):
         try:
-            # MCP tool discovery remains synchronous for entrypoints that do
-            # not own a later bounded/executor startup path.
             from tools.mcp_tool import discover_mcp_tools
 
             discover_mcp_tools()
         except Exception:
-            logger.debug(
-                "MCP tool discovery failed at CLI startup",
-                exc_info=True,
-            )
+            logger.debug("MCP tool discovery failed at CLI startup", exc_info=True)
     try:
         from marlow_cli.config import load_config
         from agent.shell_hooks import register_from_config
 
-        register_from_config(load_config(), accept_hooks=_accept_hooks)
+        register_from_config(
+            load_config(),
+            accept_hooks=_accept_hooks,
+            allow_prompt=getattr(args, "oneshot", None) is None,
+        )
     except Exception:
         logger.debug(
             "shell-hook registration failed at CLI startup",
@@ -7186,12 +6077,12 @@ def main():
         "setup",
         help="Interactive setup wizard",
         description="Configure Marlow Agent with an interactive wizard. "
-        "Run a specific section: marlow setup model|tts|terminal|gateway|tools|agent",
+        "Run a specific section: marlow setup model|terminal|gateway|tools|agent",
     )
     setup_parser.add_argument(
         "section",
         nargs="?",
-        choices=["model", "tts", "terminal", "gateway", "tools", "agent"],
+        choices=["model", "terminal", "gateway", "tools", "agent"],
         default=None,
         help="Run a specific setup section instead of the full wizard",
     )
@@ -7223,7 +6114,7 @@ def main():
     # =========================================================================
     postinstall_parser = subparsers.add_parser(
         "postinstall",
-        help="Bootstrap non-Python deps for pip installs (node, browser, ripgrep, ffmpeg)",
+        help="Bootstrap non-Python deps for pip installs (node, browser, ripgrep)",
         description="One-shot post-install for pip users. Installs system "
         "dependencies that pip cannot provide, then runs setup if needed.",
     )
@@ -7998,46 +6889,6 @@ Examples:
             logging.getLogger(__name__).debug("Plugin CLI discovery failed: %s", _exc)
 
     # =========================================================================
-    # curator command — background skill maintenance
-    # =========================================================================
-    curator_parser = subparsers.add_parser(
-        "curator",
-        help="Background skill maintenance (curator) — status, run, pause, pin",
-        description=(
-            "The curator is an auxiliary-model background task that "
-            "periodically reviews agent-created skills, prunes stale ones, "
-            "consolidates overlaps, and archives obsolete skills. "
-            "Bundled skills are protected by default. "
-            "Archives are recoverable; auto-deletion never happens."
-        ),
-    )
-    try:
-        from marlow_cli.curator import register_cli as _register_curator_cli
-
-        _register_curator_cli(curator_parser)
-    except Exception as _exc:
-        logging.getLogger(__name__).debug("curator CLI wiring failed: %s", _exc)
-
-    # =========================================================================
-    # journey command — learned skills + memories over time
-    # =========================================================================
-    journey_parser = subparsers.add_parser(
-        "journey",
-        aliases=["learning", "memory-graph"],
-        help="Timeline of learned skills + memories over time",
-        description=(
-            "A terminal timeline of learned skills and memories over time, "
-            "with a playable constellation scrubber."
-        ),
-    )
-    try:
-        from marlow_cli.journey import register_cli as _register_journey_cli
-
-        _register_journey_cli(journey_parser)
-    except Exception as _exc:
-        logging.getLogger(__name__).debug("journey CLI wiring failed: %s", _exc)
-
-    # =========================================================================
     # experience command — user governance for durable work experience
     # =========================================================================
     experience_parser = subparsers.add_parser(
@@ -8060,7 +6911,7 @@ Examples:
         help="Configure external memory provider",
         description=(
             "Set up and manage external memory provider plugins.\n\n"
-            "Available providers: honcho, holographic.\n\n"
+            "Bundled external memory provider: honcho.\n\n"
             "Only one external provider can be active at a time.\n"
             "Built-in memory (MEMORY.md/USER.md) is always active."
         ),
@@ -8237,75 +7088,6 @@ Examples:
 
     tools_parser.set_defaults(func=cmd_tools)
 
-    # =========================================================================
-    # computer-use command — manage Computer Use (cua-driver) on macOS
-    # =========================================================================
-    computer_use_parser = subparsers.add_parser(
-        "computer-use",
-        help="Manage the Computer Use (cua-driver) backend (macOS)",
-        description=(
-            "Install or check the cua-driver binary used by the\n"
-            "`computer_use` toolset. macOS-only.\n\n"
-            "Use `marlow computer-use install` to fetch and run the\n"
-            "upstream cua-driver installer. This is equivalent to the\n"
-            "post-setup hook that `marlow tools` runs when you first\n"
-            "enable the Computer Use toolset, and is a stable target\n"
-            "for re-running the install if it didn't fire (e.g. when\n"
-            "toggling the toolset on a returning-user setup)."
-        ),
-    )
-    computer_use_sub = computer_use_parser.add_subparsers(dest="computer_use_action")
-
-    computer_use_install = computer_use_sub.add_parser(
-        "install",
-        help="Install or repair the cua-driver binary (macOS)",
-    )
-    computer_use_install.add_argument(
-        "--upgrade",
-        action="store_true",
-        help=(
-            "Re-run the upstream installer even if cua-driver is already on "
-            "PATH. The upstream install.sh always pulls the latest release, "
-            "so this performs an in-place upgrade."
-        ),
-    )
-    computer_use_sub.add_parser(
-        "status",
-        help="Print whether cua-driver is installed and on PATH",
-    )
-
-    def cmd_computer_use(args):
-        action = getattr(args, "computer_use_action", None)
-        if action == "install":
-            from marlow_cli.tools_config import install_cua_driver
-            install_cua_driver(upgrade=bool(getattr(args, "upgrade", False)))
-            return
-        if action == "status":
-            import shutil
-            import subprocess
-            path = shutil.which("cua-driver")
-            if path:
-                version = ""
-                try:
-                    version = subprocess.run(
-                        ["cua-driver", "--version"],
-                        capture_output=True, text=True, timeout=5,
-                    ).stdout.strip()
-                except Exception:
-                    pass
-                if version:
-                    print(f"cua-driver: installed at {path} ({version})")
-                else:
-                    print(f"cua-driver: installed at {path}")
-                print("  Refresh to latest: marlow computer-use install --upgrade")
-                return
-            print("cua-driver: not installed")
-            print("  Run: marlow computer-use install")
-            return
-        # No subcommand → show help
-        computer_use_parser.print_help()
-
-    computer_use_parser.set_defaults(func=cmd_computer_use)
     # =========================================================================
     # mcp command — manage MCP server connections
     # =========================================================================
@@ -8664,12 +7446,9 @@ Examples:
                 print("Cancelled.")
                 return
 
-            # Launch marlow --resume <id> by replacing the current process
-            print(f"Resuming session: {selected_id}")
-            from marlow_cli.relaunch import relaunch
-
-            relaunch(["--resume", selected_id])
-            return  # won't reach here after execvp
+            print(f"Session: {selected_id}")
+            print(f"Resume with: marlow chat --resume {selected_id} -q 'Your next message'")
+            return
 
         elif action == "optimize":
             db_path = db.db_path
@@ -9161,65 +7940,54 @@ Examples:
         cmd_version(args)
         return
 
-    # Discover Python plugins and register shell hooks once, before any
-    # command that can fire lifecycle hooks.  Both are idempotent; gated
-    # so introspection/management commands (marlow hooks list, cron
-    # list, gateway status, mcp add, ...) don't pay discovery cost or
-    # trigger consent prompts for hooks the user is still inspecting.
-    _prepare_agent_startup(args)
-
-    # Handle top-level --oneshot / -z: single-shot mode, stdout = final
-    # response only, nothing else. Bypasses cli.py entirely.
-    if getattr(args, "oneshot", None):
-        from marlow_cli.oneshot import run_oneshot
-
-        sys.exit(
-            run_oneshot(
-                args.oneshot,
-                model=getattr(args, "model", None),
-                provider=getattr(args, "provider", None),
-                toolsets=getattr(args, "toolsets", None),
-            )
-        )
-
-    # Handle top-level --resume / --continue as shortcut to chat
-    if (args.resume or args.continue_last) and args.command is None:
-        args.command = "chat"
-        for attr, default in [
-            ("query", None),
-            ("model", None),
-            ("provider", None),
-            ("toolsets", None),
-            ("verbose", None),
-            ("worktree", False),
-        ]:
-            if not hasattr(args, attr):
-                setattr(args, attr, default)
-        cmd_chat(args)
-        return
-
-    # Default to chat if no command specified
-    if args.command is None:
-        for attr, default in [
-            ("query", None),
-            ("model", None),
-            ("provider", None),
-            ("toolsets", None),
-            ("verbose", None),
-            ("resume", None),
-            ("continue_last", None),
-            ("worktree", False),
-        ]:
-            if not hasattr(args, attr):
-                setattr(args, attr, default)
-        cmd_chat(args)
-        return
-
-    # Execute the command
-    if hasattr(args, "func"):
-        args.func(args)
-    else:
+    if args.command is None and args.oneshot is None:
         parser.print_help()
+        return
+
+    if args.command == "chat" and not (args.query or args.image):
+        chat_parser.error("provide a query with --query or an image with --image")
+
+    from marlow_cli.query import _invocation_environment
+
+    overrides = {}
+    if args.command == "chat" or args.oneshot is not None:
+        if args.ignore_user_config:
+            overrides["MARLOW_IGNORE_USER_CONFIG"] = "1"
+        if args.ignore_rules:
+            overrides["MARLOW_IGNORE_RULES"] = "1"
+
+    with _invocation_environment(overrides):
+        # Discover Python plugins and register shell hooks once, before any
+        # command that can fire lifecycle hooks.  Both are idempotent; gated
+        # so introspection/management commands (marlow hooks list, cron
+        # list, gateway status, mcp add, ...) don't pay discovery cost or
+        # trigger consent prompts for hooks the user is still inspecting.
+        if args.oneshot is not None:
+            # Reserve stdout for the final answer even when plugins emit output
+            # during startup.
+            with redirect_stdout(sys.stderr):
+                _prepare_agent_startup(args)
+
+            # The script interface prints only the final response.
+            from marlow_cli.oneshot import run_oneshot
+
+            sys.exit(
+                run_oneshot(
+                    args.oneshot,
+                    model=getattr(args, "model", None),
+                    provider=getattr(args, "provider", None),
+                    toolsets=getattr(args, "toolsets", None),
+                    yolo=args.yolo,
+                )
+            )
+
+        _prepare_agent_startup(args)
+
+        # Execute the command
+        if hasattr(args, "func"):
+            args.func(args)
+        else:
+            parser.print_help()
 
 
 if __name__ == "__main__":

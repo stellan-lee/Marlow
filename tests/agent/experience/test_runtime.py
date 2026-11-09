@@ -28,10 +28,11 @@ class _FormattingService:
         return ",".join(item.item_id for item in result.items)
 
 
-def test_only_explicit_owner_and_guest_origins_are_experience_eligible() -> None:
+def test_only_supported_origins_are_experience_eligible() -> None:
     assert TurnOrigin.CLASSIC_CLI.experience_eligible is True
     assert TurnOrigin.TELEGRAM.experience_eligible is True
     assert TurnOrigin.TELEGRAM_GUEST.experience_eligible is True
+    assert TurnOrigin.TEAMS.experience_eligible is True
     assert all(
         not origin.experience_eligible
         for origin in TurnOrigin
@@ -40,6 +41,7 @@ def test_only_explicit_owner_and_guest_origins_are_experience_eligible() -> None
             TurnOrigin.CLASSIC_CLI,
             TurnOrigin.TELEGRAM,
             TurnOrigin.TELEGRAM_GUEST,
+            TurnOrigin.TEAMS,
         }
     )
     assert normalize_turn_origin("not-a-runtime") is TurnOrigin.UNKNOWN

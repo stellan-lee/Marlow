@@ -315,7 +315,6 @@ class TestRunBackgroundTask:
 
         mock_adapter = AsyncMock()
         mock_adapter.send = AsyncMock()
-        mock_adapter.send_voice = AsyncMock()
         mock_adapter.send_video = AsyncMock()
         mock_adapter.send_image_file = AsyncMock()
         mock_adapter.send_document = AsyncMock()
@@ -323,7 +322,6 @@ class TestRunBackgroundTask:
         # No text, no markdown images — just the four media attachments.
         mock_adapter.extract_media = MagicMock(return_value=(media, ""))
         mock_adapter.extract_images = MagicMock(return_value=([], ""))
-        # Non-telegram platform so every audio ext routes through send_voice.
         runner.adapters[Platform.DISCORD] = mock_adapter
 
         source = SessionSource(
@@ -336,14 +334,15 @@ class TestRunBackgroundTask:
         try:
             await runner._run_background_task("make stuff", source, "bg_test")
 
-            mock_adapter.send_voice.assert_called_once()
-            assert _os.path.realpath(mock_adapter.send_voice.call_args.kwargs["audio_path"]) == _os.path.realpath(_ogg)
             mock_adapter.send_video.assert_called_once()
             assert _os.path.realpath(mock_adapter.send_video.call_args.kwargs["video_path"]) == _os.path.realpath(_mp4)
             mock_adapter.send_image_file.assert_called_once()
             assert _os.path.realpath(mock_adapter.send_image_file.call_args.kwargs["image_path"]) == _os.path.realpath(_png)
-            mock_adapter.send_document.assert_called_once()
-            assert _os.path.realpath(mock_adapter.send_document.call_args.kwargs["file_path"]) == _os.path.realpath(_pdf)
+            document_paths = {
+                _os.path.realpath(call.kwargs["file_path"])
+                for call in mock_adapter.send_document.call_args_list
+            }
+            assert document_paths == {_os.path.realpath(_ogg), _os.path.realpath(_pdf)}
         finally:
             import shutil as _shutil
             _shutil.rmtree(_tmpdir, ignore_errors=True)
@@ -501,20 +500,3 @@ class TestBackgroundInCLICommands:
         """The /background command is in the Session category."""
         from marlow_cli.commands import COMMANDS_BY_CATEGORY
         assert "/background" in COMMANDS_BY_CATEGORY["Session"]
-
-    def test_background_autocompletes(self):
-        """The /background command appears in autocomplete results."""
-        pytest.importorskip("prompt_toolkit")
-        from marlow_cli.commands import SlashCommandCompleter
-        from prompt_toolkit.document import Document
-
-        completer = SlashCommandCompleter()
-        doc = Document("backgro")  # Partial match
-        completions = list(completer.get_completions(doc, None))
-        # Text doesn't start with / so no completions
-        assert len(completions) == 0
-
-        doc = Document("/backgro")  # With slash prefix
-        completions = list(completer.get_completions(doc, None))
-        cmd_displays = [str(c.display) for c in completions]
-        assert any("/background" in d for d in cmd_displays)

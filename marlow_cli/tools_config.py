@@ -1,7 +1,6 @@
 """Lightweight per-platform toolset and MCP configuration."""
 from __future__ import annotations
 import json as _json
-import os, shutil, subprocess, sys
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 from marlow_cli.cli_output import print_error as _print_error, print_info as _print_info, print_success as _print_success, print_warning as _print_warning
@@ -16,9 +15,7 @@ CONFIGURABLE_TOOLSETS=[
 ("file","📁 File Operations","read, write, patch, and search"),
 ("code_execution","⚡ Code Execution","programmatic Python tool execution"),
 ("vision","👁️  Vision / Image Analysis","analyze images"),
-("image_gen","🎨 Image Generation","Codex OAuth image generation"),
 ("moa","🧠 Mixture of Agents","multi-agent aggregation"),
-("tts","🔊 Text-to-Speech","built-in, local, plugin, and command providers"),
 ("skills","📚 Skills","local SKILL.md discovery and management"),
 ("todo","📋 Task Planning","task planning"),
 ("memory","💾 Memory","local and configured external memory"),
@@ -28,8 +25,7 @@ CONFIGURABLE_TOOLSETS=[
 ("admin_approval","🛡️ Administrator Approval","gateway administrator decisions"),
 ("delegation","👥 Task Delegation","foreground and background subagents"),
 ("cronjob","⏰ Cron Jobs","scheduled and one-shot jobs"),
-("messaging","📨 Cross-Platform Messaging","retained messaging connectors"),
-("computer_use","🖱️ Computer Use (macOS)","local cua-driver desktop control")]
+("messaging","📨 Cross-Platform Messaging","retained messaging connectors")]
 _DEFAULT_OFF_TOOLSETS={"moa"}
 _TOOLSET_PLATFORM_RESTRICTIONS:Dict[str,Set[str]]={}
 PLATFORMS={k:{"label":v.label,"default_toolset":v.default_toolset} for k,v in _PLATFORMS_REGISTRY.items()}
@@ -157,32 +153,6 @@ def _prompt_toolset_checklist(title, current, platform="cli", **_kwargs):
     return {rows[i][0] for i in picked}
 
 
-_POST_SETUP_INSTALLED = {
-    "cua_driver": lambda: bool(shutil.which(_cua_driver_cmd())),
-}
-
-
-def _post_setup_already_installed(post_setup_key: str) -> bool:
-    predicate = _POST_SETUP_INSTALLED.get(post_setup_key)
-    if predicate is None:
-        return True
-    try:
-        return bool(predicate())
-    except Exception:
-        return True
-
-
-def _toolset_needs_configuration_prompt(
-    toolset: str,
-    config: dict,
-    *,
-    force_fresh: bool = False,
-) -> bool:
-    """Return whether a retained toolset still needs a setup side effect."""
-    del config, force_fresh
-    if toolset == "computer_use":
-        return not _post_setup_already_installed("cua_driver")
-    return False
 def tools_command(args=None,first_install=False,config=None):
  del args; config=config if config is not None else load_config(); platforms=_get_enabled_platforms() or ["cli"]
  if first_install:targets=platforms
@@ -197,192 +167,6 @@ def tools_command(args=None,first_install=False,config=None):
  for platform in targets:
   current=_get_platform_tools(config,platform,include_default_mcp_servers=False); initial=current-_DEFAULT_OFF_TOOLSETS if first_install else current
   chosen=_prompt_toolset_checklist(PLATFORMS[platform]["label"],initial,platform); _save_platform_tools(config,platform,chosen); _print_success(f"Saved {PLATFORMS[platform]['label']} tool configuration")
-
-def _cua_driver_cmd() -> str:
-    """Return the cua-driver executable name/path, honoring non-empty overrides."""
-    return os.environ.get("MARLOW_CUA_DRIVER_CMD", "").strip() or "cua-driver"
-
-
-def _check_cua_driver_asset_for_arch() -> bool:
-    """Check whether the latest CUA release ships an asset for this architecture.
-
-    Returns True if the asset likely exists (or if we cannot determine it).
-    Returns False and prints a warning when the asset is confirmed missing,
-    so callers can skip the install attempt and avoid a raw 404.
-    """
-    import platform as _plat
-    import urllib.request
-
-    machine = _plat.machine()  # "x86_64" or "arm64"
-    if machine == "arm64":
-        # arm64 (Apple Silicon) assets are always published.
-        return True
-
-    # x86_64 / Intel — probe the latest release for an architecture-specific
-    # asset before falling through to the upstream installer.
-    api_url = (
-        "https://api.github.com/repos/trycua/cua/releases/latest"
-    )
-    try:
-        req = urllib.request.Request(api_url, headers={"Accept": "application/vnd.github+json"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            release = _json.loads(resp.read().decode())
-        tag = release.get("tag_name", "")
-        assets = release.get("assets", [])
-        arch_names = {"x86_64", "amd64"}
-        has_asset = any(
-            any(a in a_info.get("name", "").lower() for a in arch_names)
-            for a_info in assets
-        )
-        if not has_asset:
-            _print_warning(
-                f"    Latest CUA release ({tag}) has no Intel (x86_64) asset."
-            )
-            _print_info(
-                "    CUA Driver currently only ships Apple Silicon builds."
-            )
-            _print_info(
-                "    See: https://github.com/trycua/cua/issues/1493"
-            )
-            return False
-    except Exception:
-        # Network / API failure — proceed and let the installer handle it.
-        pass
-    return True
-
-
-def install_cua_driver(upgrade: bool = False) -> bool:
-    """Install or refresh the cua-driver binary used by Computer Use.
-
-    The upstream installer always pulls the latest release tag, so re-running
-    it is the canonical way to upgrade. We expose two modes:
-
-    * ``upgrade=False`` — original post-setup behaviour: skip if already
-      installed, install otherwise. Used by the toolset enable flow where
-      we don't want to surprise the user with a network fetch.
-    * ``upgrade=True`` — always re-run the installer (or call ``cua-driver
-      update`` if the binary supports it). Used by ``marlow update`` and
-      by ``marlow computer-use install --upgrade``.
-
-    Returns True iff cua-driver is installed (or successfully refreshed)
-    when the function returns. macOS-only — silently returns False on
-    other platforms.
-    """
-    import platform as _plat
-    import shutil
-    import subprocess
-
-    if _plat.system() != "Darwin":
-        if upgrade:
-            # Silent on non-macOS — `marlow update` calls this for every
-            # user; only macOS users with cua-driver care.
-            return False
-        _print_warning("    Computer Use (cua-driver) is macOS-only; skipping.")
-        return False
-
-    driver_cmd = _cua_driver_cmd()
-    binary = shutil.which(driver_cmd)
-
-    # Not installed → fresh install path (only when caller asked for it).
-    if not binary and not upgrade:
-        if not shutil.which("curl"):
-            _print_warning("    curl not found — install manually:")
-            _print_info("      https://github.com/trycua/cua/blob/main/libs/cua-driver/README.md")
-            return False
-        if not _check_cua_driver_asset_for_arch():
-            return False
-        return _run_cua_driver_installer(label="Installing")
-
-    # Already installed and caller didn't ask to upgrade → just confirm.
-    if binary and not upgrade:
-        try:
-            version = subprocess.run(
-                [driver_cmd, "--version"],
-                capture_output=True, text=True, timeout=5,
-            ).stdout.strip()
-            _print_success(f"    {driver_cmd} already installed: {version or 'unknown version'}")
-        except Exception:
-            _print_success(f"    {driver_cmd} already installed.")
-        _print_info("    Grant macOS permissions if not done yet:")
-        _print_info("      System Settings > Privacy & Security > Accessibility")
-        _print_info("      System Settings > Privacy & Security > Screen Recording")
-        return True
-
-    # upgrade=True path — refresh to the latest upstream release.
-    if not shutil.which("curl"):
-        _print_warning("    curl not found — cannot refresh cua-driver.")
-        return bool(binary)
-
-    if not _check_cua_driver_asset_for_arch():
-        return bool(binary)
-
-    if binary:
-        # Show before/after version when we have a baseline. Best-effort.
-        try:
-            before = subprocess.run(
-                [driver_cmd, "--version"],
-                capture_output=True, text=True, timeout=5,
-            ).stdout.strip()
-        except Exception:
-            before = ""
-    else:
-        before = ""
-
-    ok = _run_cua_driver_installer(label="Refreshing", verbose=False)
-    if ok and before:
-        try:
-            after = subprocess.run(
-                [driver_cmd, "--version"],
-                capture_output=True, text=True, timeout=5,
-            ).stdout.strip()
-            if after and after != before:
-                _print_success(f"    {driver_cmd} upgraded: {before} → {after}")
-            elif after:
-                _print_info(f"    {driver_cmd} up to date: {after}")
-        except Exception:
-            pass
-    return ok
-
-
-def _run_cua_driver_installer(label: str = "Installing", verbose: bool = True) -> bool:
-    """Run the upstream cua-driver install.sh. Returns True on success.
-
-    The script is idempotent: it always downloads the latest release, so
-    re-running it on an already-installed system performs an upgrade.
-    """
-    import shutil
-    import subprocess
-
-    install_cmd = (
-        "/bin/bash -c \"$(curl -fsSL "
-        "https://raw.githubusercontent.com/trycua/cua/main/"
-        "libs/cua-driver/scripts/install.sh)\""
-    )
-    if verbose:
-        _print_info(f"    {label} cua-driver (macOS background computer-use)...")
-    else:
-        _print_info(f"    {label} cua-driver...")
-    driver_cmd = _cua_driver_cmd()
-    try:
-        result = subprocess.run(install_cmd, shell=True, timeout=300)
-        if result.returncode == 0 and shutil.which(driver_cmd):
-            if verbose:
-                _print_success(f"    {driver_cmd} installed.")
-                _print_info("    IMPORTANT — grant macOS permissions now:")
-                _print_info("      System Settings > Privacy & Security > Accessibility")
-                _print_info("      System Settings > Privacy & Security > Screen Recording")
-                _print_info("    Both must allow the terminal / Marlow process.")
-            return True
-        _print_warning(f"    cua-driver {label.lower()} did not complete. Re-run manually:")
-        _print_info(f"      {install_cmd}")
-        return False
-    except subprocess.TimeoutExpired:
-        _print_warning(f"    cua-driver {label.lower()} timed out. Re-run manually.")
-        return False
-    except Exception as e:
-        _print_warning(f"    cua-driver {label.lower()} failed: {e}")
-        return False
-
 
 def _configure_mcp_tools_interactive(config: dict):
     """Discover and select tools exposed by configured MCP servers."""

@@ -638,9 +638,9 @@ def run_doctor(args):
         if lines:
             check_ok(f"{_DHH}/SOUL.md exists (persona configured)")
         else:
-            check_info(f"{_DHH}/SOUL.md exists but is empty — edit it to customize personality")
+            check_info(f"{_DHH}/SOUL.md exists but is empty — edit it to set profile instructions")
     else:
-        check_warn(f"{_DHH}/SOUL.md not found", "(create it to give Marlow a custom personality)")
+        check_warn(f"{_DHH}/SOUL.md not found", "(create it to set profile instructions)")
         if should_fix:
             soul_path.parent.mkdir(parents=True, exist_ok=True)
             soul_path.write_text(
@@ -1007,6 +1007,8 @@ def run_doctor(args):
         check_warn("Could not check tool availability", f"({e})")
     
     _section("Memory Provider")
+    from plugins.memory import RETIRED_MEMORY_PROVIDER, RETIRED_MEMORY_PROVIDER_MESSAGE
+
     _active_memory_provider = ""
     try:
         import yaml as _yaml
@@ -1057,22 +1059,12 @@ def run_doctor(args):
             )
         except Exception as _e:
             check_warn("Honcho check failed", str(_e))
-    elif _active_memory_provider == "holographic":
-        try:
-            from plugins.memory import load_memory_provider
-            _provider = load_memory_provider(_active_memory_provider)
-            if _provider and _provider.is_available():
-                check_ok("Holographic memory provider active")
-            elif _provider:
-                check_warn("Holographic memory configured but not available", "run: marlow memory status")
-            else:
-                check_warn("Holographic memory plugin not found", "run: marlow memory setup")
-        except Exception as _e:
-            check_warn("Holographic memory check failed", str(_e))
+    elif _active_memory_provider == RETIRED_MEMORY_PROVIDER:
+        check_warn(RETIRED_MEMORY_PROVIDER_MESSAGE)
     else:
         check_warn(
             f"Unsupported memory provider '{_active_memory_provider}'",
-            "choose holographic or honcho",
+            "run: marlow memory setup",
         )
 
     try:

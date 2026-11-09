@@ -1,12 +1,11 @@
 """Oneshot (-z) mode: send a prompt, get the final content block, exit.
 
-Bypasses cli.py entirely.  No banner, no spinner, no session_id line,
-no stderr chatter.  Just the agent's final text to stdout.
+Prints only the agent's final text to stdout.
 
 Toolsets = explicit --toolsets when provided, otherwise whatever the user has
 configured for "cli" in `marlow tools`.
 Rules / memory / AGENTS.md / local skill runtime = same as a normal chat turn.
-Approvals = auto-bypassed (MARLOW_YOLO_MODE=1 is set for the call).
+Actions needing an interactive approval are blocked unless explicitly authorized.
 Working directory = the user's CWD (AGENTS.md etc. resolve from there as usual).
 
 Model / provider selection mirrors `marlow chat`:
@@ -127,6 +126,8 @@ def run_oneshot(
     model: Optional[str] = None,
     provider: Optional[str] = None,
     toolsets: object = None,
+    *,
+    yolo: bool = False,
 ) -> int:
     """Execute a single prompt and print only the final content block.
 
@@ -137,15 +138,13 @@ def run_oneshot(
         provider: Optional provider override. Falls back to config.yaml's
             model.provider, then "auto".
         toolsets: Optional comma-separated string or iterable of toolsets.
+        yolo: Explicitly permit actions covered by ordinary approval prompts.
 
     Returns the exit code.  Caller should sys.exit() with the return.
     """
-    # Silence every stdlib logger for the duration.  AIAgent, tools, and
-    # provider adapters all log to stderr through the root logger; file
-    # handlers added by setup_logging() keep working (they're attached to
-    # the root logger's handler list, not affected by level), but no
-    # bytes reach the terminal.
-    logging.disable(logging.CRITICAL)
+    from marlow_cli.config import load_config
+    from marlow_cli.query import local_query_approvals
+    from plugins.memory import RETIRED_MEMORY_PROVIDER, RETIRED_MEMORY_PROVIDER_MESSAGE
 
     # --provider without --model is ambiguous: carrying the user's configured
     # model across to a different provider is usually wrong (that provider may
@@ -165,11 +164,9 @@ def run_oneshot(
         sys.stderr.write(toolsets_error)
         return 2
     use_config_toolsets = _normalize_toolsets(toolsets) is None
-
-    # Auto-approve any shell / tool approvals.  Non-interactive by
-    # definition — a prompt would hang forever.
-    os.environ["MARLOW_YOLO_MODE"] = "1"
-    os.environ["MARLOW_ACCEPT_HOOKS"] = "1"
+    memory = load_config().get("memory") or {}
+    if isinstance(memory, dict) and str(memory.get("provider", "")).strip().lower() == RETIRED_MEMORY_PROVIDER:
+        sys.stderr.write(RETIRED_MEMORY_PROVIDER_MESSAGE + "\n")
 
     # Redirect stderr AND stdout to devnull for the entire call tree.
     # We'll print the final response to the real stdout at the end.
@@ -179,8 +176,10 @@ def run_oneshot(
 
     response: Optional[str] = None
     failure: BaseException | None = None
+    previous_log_disable = logging.root.manager.disable
+    logging.disable(logging.CRITICAL)
     try:
-        with redirect_stdout(devnull), redirect_stderr(devnull):
+        with redirect_stdout(devnull), redirect_stderr(devnull), local_query_approvals(can_prompt=False, yolo=yolo):
             try:
                 response = _run_agent(
                     prompt,
@@ -190,15 +189,10 @@ def run_oneshot(
                     use_config_toolsets=use_config_toolsets,
                 )
             except BaseException as exc:  # noqa: BLE001
-                # Capture anything that escapes the agent (including OSError
-                # from prompt_toolkit/Vt100 when stdout is a non-TTY pipe,
-                # KeyboardInterrupt, SystemExit, etc.) so we can surface it on
-                # the real stderr instead of crashing past the redirect with a
-                # traceback that the caller never sees. A silent exit in a
-                # cron / SSH / subprocess context is the worst failure mode.
-                # See #30623.
+                # Surface failures after the stdout and stderr redirects exit.
                 failure = exc
     finally:
+        logging.disable(previous_log_disable)
         try:
             devnull.close()
         except Exception:
@@ -242,24 +236,11 @@ def _create_session_db_for_oneshot():
         return None
 
 
-def _run_agent(
-    prompt: str,
-    model: Optional[str] = None,
-    provider: Optional[str] = None,
-    toolsets: object = None,
-    use_config_toolsets: bool = True,
-) -> str:
-    """Build an AIAgent exactly like a normal CLI chat turn would, then
-    run a single conversation.  Returns the final response string."""
-    # Imports are local so they don't run when marlow is invoked for
-    # other commands (keeps top-level CLI startup cheap).
-    from marlow_cli.config import load_config
-    from marlow_cli.models import detect_provider_for_model
+def _resolve_query_runtime(cfg: dict, model: str | None, provider: str | None) -> tuple[str, dict]:
+    """Resolve the model and runtime shared by the two single-query commands."""
+    from marlow_cli.models import detect_provider_for_model, get_default_model_for_provider
+    from marlow_cli.model_normalize import normalize_model_for_provider
     from marlow_cli.runtime_provider import resolve_runtime_provider
-    from marlow_cli.tools_config import _get_platform_tools
-    from run_agent import AIAgent
-
-    cfg = load_config()
 
     # Resolve effective model: explicit arg → env var → config.
     model_cfg = cfg.get("model") or {}
@@ -320,6 +301,37 @@ def _run_agent(
         explicit_base_url=explicit_base_url_from_alias,
     )
 
+    resolved_provider = runtime.get("provider") or ""
+    if not effective_model or effective_model in {effective_provider, runtime.get("name")}:
+        effective_model = runtime.get("model") or effective_model
+    if not effective_model:
+        effective_model = get_default_model_for_provider(resolved_provider) or ""
+    if effective_model and resolved_provider == "openai-codex":
+        effective_model = normalize_model_for_provider(effective_model, resolved_provider)
+    return effective_model, runtime
+
+
+def _run_agent(
+    prompt: str,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    toolsets: object = None,
+    use_config_toolsets: bool = True,
+) -> str:
+    """Build an AIAgent exactly like a normal CLI chat turn would, then
+    run a single conversation.  Returns the final response string."""
+    # Imports are local so they don't run when marlow is invoked for
+    # other commands (keeps top-level CLI startup cheap).
+    from marlow_cli.config import load_config
+    from marlow_cli.mcp_startup import wait_for_mcp_discovery
+    from marlow_cli.tools_config import _get_platform_tools
+    from run_agent import AIAgent
+
+    cfg = load_config()
+    wait_for_mcp_discovery()
+
+    effective_model, runtime = _resolve_query_runtime(cfg, model, provider)
+
     # Pull in explicit toolsets when provided; otherwise use whatever the user
     # has enabled for "cli". sorted() gives stable ordering for config-derived
     # sets; explicit values preserve user order.
@@ -332,6 +344,7 @@ def _run_agent(
     # honour the same merge semantics as interactive CLI and gateway sessions.
     _fb = get_fallback_chain(cfg)
 
+    ignore_rules = os.environ.get("MARLOW_IGNORE_RULES") == "1"
     agent = AIAgent(
         api_key=runtime.get("api_key"),
         base_url=runtime.get("base_url"),
@@ -341,19 +354,11 @@ def _run_agent(
         enabled_toolsets=toolsets_list,
         quiet_mode=True,
         platform="cli",
+        skip_context_files=ignore_rules,
+        skip_memory=ignore_rules,
         session_db=session_db,
         fallback_providers=_fb or None,
-        # Interactive callbacks are intentionally NOT wired beyond this
-        # one.  In oneshot mode there's no user sitting at a terminal:
-        #   - clarify  → returns a synthetic "pick a default" instruction
-        #                so the agent continues instead of stalling on
-        #                the tool's built-in "not available" error
-        #   - sudo password prompt → terminal_tool gates on
-        #                MARLOW_INTERACTIVE which we never set
-        #   - shell-hook approval → auto-approved via MARLOW_ACCEPT_HOOKS=1
-        #                (set above); also falls back to deny on non-tty
-        #   - dangerous-command approval → bypassed via MARLOW_YOLO_MODE=1
-        #   - skill secret capture → returns gracefully when no callback set
+        # Let the model proceed when no user can answer clarifying questions.
         clarify_callback=_oneshot_clarify_callback,
     )
 
@@ -363,7 +368,17 @@ def _run_agent(
     agent.stream_delta_callback = None
     agent.tool_gen_callback = None
 
-    return agent.chat(prompt) or ""
+    try:
+        return agent.chat(prompt) or ""
+    finally:
+        try:
+            agent.shutdown_memory_provider(agent._session_messages)
+        finally:
+            try:
+                agent.close()
+            finally:
+                if session_db is not None:
+                    session_db.close()
 
 
 def _oneshot_clarify_callback(question: str, choices=None) -> str:

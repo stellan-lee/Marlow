@@ -85,7 +85,7 @@ _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 #   ``PYTHONUSERBASE`` — Python interpreter init. Marlow itself starts
 #   from one of these on every restart.
 # * ``NODE_OPTIONS`` / ``NODE_PATH`` — Node interpreter; affects npm,
-#   ``marlow update``, the TUI build.
+#   ``marlow update``, browser setup.
 # * ``PATH`` — too broad to allow. Configuration writers never need to
 #   rewrite the operator's PATH; if a tool can't be found, add an
 #   absolute path in the integration config, not to mutate PATH globally.
@@ -417,6 +417,24 @@ def get_config_path() -> Path:
     """Get the main config file path."""
     return get_marlow_home() / "config.yaml"
 
+def save_config_value(key_path: str, value: Any) -> bool:
+    """Atomically update one typed value in the active profile's configuration."""
+    from utils import atomic_roundtrip_yaml_update
+
+    config_path = get_config_path()
+    try:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_roundtrip_yaml_update(config_path, key_path, value)
+        try:
+            config_path.chmod(0o600)
+        except (OSError, NotImplementedError):
+            pass
+        return True
+    except Exception as exc:
+        logger.warning("Could not save configuration key %s: %s", key_path, type(exc).__name__)
+        return False
+
+
 def get_env_path() -> Path:
     """Get the .env file path (for API keys)."""
     return get_marlow_home() / ".env"
@@ -561,7 +579,7 @@ def ensure_marlow_home():
     home.mkdir(parents=True, exist_ok=True)
     _secure_dir(home)
     for subdir in (
-        "cron", "sessions", "logs", "logs/curator", "memories",
+        "cron", "sessions", "logs", "memories",
         "pairing", "hooks", "image_cache", "audio_cache", "skills",
     ):
         d = home / subdir
@@ -682,7 +700,7 @@ DEFAULT_CONFIG = {
         #              (see run_agent._prepare_messages_for_api).
         #   "text"   — always pre-analyze with vision_analyze and prepend the
         #              description as text; the main model never sees pixels.
-        # Affects gateway platforms, the TUI, and CLI /attach.  vision_analyze
+        # Affects gateway platforms, and single-query CLI image input.  vision_analyze
         # remains available as a tool regardless of this setting — the routing
         # only controls how inbound user images are presented.
         "image_input_mode": "auto",
@@ -857,7 +875,7 @@ DEFAULT_CONFIG = {
 
     # Tool loop guardrails nudge models when they repeat failed or
     # non-progressing tool calls. Soft warnings are always-on by default;
-    # hard stops are opt-in so interactive CLI/TUI sessions keep flowing.
+    # hard stops are opt-in so agent sessions keep flowing.
     "tool_loop_guardrails": {
         "warnings_enabled": True,
         "hard_stop_enabled": False,
@@ -973,24 +991,10 @@ DEFAULT_CONFIG = {
             "timeout": 60,
             "extra_body": {},
         },
-        # Curator — skill-usage review fork. Timeout is generous because the
-        # review pass can take several minutes on reasoning models (umbrella
-        # building over hundreds of candidate skills). "auto" = use main chat
-        # model; override via `marlow model` → auxiliary → Curator to route
-        # to a dedicated Codex or compatible local model.
-        "curator": {
-            "provider": "auto",
-            "model": "",
-            "base_url": "",
-            "api_key": "",
-            "timeout": 600,
-            "extra_body": {},
-        },
     },
     
     "display": {
         "compact": False,
-        "personality": "",
         "resume_display": "full",
         # Recap tuning for /resume and startup resume. The defaults match the
         # historical hardcoded values; expose them as config so power users can
@@ -1006,26 +1010,11 @@ DEFAULT_CONFIG = {
         # behavior of showing tool-call summaries inline.
         "resume_skip_tool_only": True,
         "busy_input_mode": "interrupt",  # interrupt | queue | steer
-        # When true, `marlow --tui` auto-resumes the most recent human-
-        # facing session on launch instead of forging a fresh one.
-        # Mirrors `marlow -c` muscle memory.  Default off so existing
-        # users aren't surprised.  MARLOW_TUI_RESUME=<id> always wins.
-        "tui_auto_resume_recent": False,
-        # When true (default), `marlow --tui` drops a one-time hint
-        # ("subagents working · /agents to watch live") the first time a turn
-        # starts delegating, nudging the user toward the live spawn-tree
-        # agent monitor. Set false to suppress the hint.
-        "tui_agents_nudge": True,
         "bell_on_complete": False,
         "show_reasoning": False,
         "streaming": False,
         "timestamps": False,      # Show [HH:MM] on user and assistant labels
         "final_response_markdown": "strip",  # render | strip | raw
-        # Preserve recent classic CLI output across Ctrl+L, /redraw, and
-        # terminal resize full-screen clears. Disable if a terminal emulator
-        # behaves badly with replayed scrollback.
-        "persistent_output": True,
-        "persistent_output_max_lines": 200,
         "inline_diffs": True,     # Show inline diff previews for write actions (write_file, patch, skill_manage)
         # File-mutation verifier footer.  When true (default), the agent
         # appends a one-line advisory to its final response whenever a
@@ -1043,19 +1032,11 @@ DEFAULT_CONFIG = {
         # failure isn't silent from the UI's perspective.  Set false to suppress.
         "turn_completion_explainer": True,
         "show_cost": False,       # Show $ cost in the status bar (off by default)
-        "skin": "default",
         # UI language for static user-facing messages (approval prompts, a
         # handful of gateway slash-command replies).  Does NOT affect agent
         # responses, log lines, tool outputs, or slash-command descriptions.
         # Marlow Lite ships English UI strings.
         "language": "en",
-        # TUI busy indicator style: kaomoji (default), emoji, unicode (braille
-        # spinner), or ascii.  Live-swappable via `/indicator <style>`.
-        "tui_status_indicator": "kaomoji",
-        "user_message_preview": {  # CLI: how many submitted user-message lines to echo back in scrollback
-            "first_lines": 2,
-            "last_lines": 2,
-        },
         "interim_assistant_messages": True,  # Gateway: show natural mid-turn assistant status messages
         "tool_progress_command": False,  # Enable /verbose command in messaging gateway
         "tool_preview_length": 0,  # Max chars for tool call previews (0 = no limit, show full paths/commands)
@@ -1096,93 +1077,11 @@ DEFAULT_CONFIG = {
             "enabled": False,
             "fields": ["model", "context_pct", "cwd"],  # Order shown; drop any to hide
         },
-        "copy_shortcut": "auto",  # "auto" (platform default) | "ctrl_c" | "ctrl_shift_c" | "disabled"
     },
 
     # Privacy settings
     "privacy": {
         "redact_pii": False,  # When True, hash user IDs and strip phone numbers from LLM context
-    },
-    
-    # Text-to-speech configuration
-    # Each provider supports an optional `max_text_length:` override for the
-    # per-request input-character cap. Omit it to use the provider's documented
-    # limit (OpenAI 4096, xAI 15000, MiniMax 10000, ElevenLabs 5k-40k model-aware,
-    # Gemini 5000, Edge 5000, Mistral 4000, NeuTTS/KittenTTS 2000).
-    "tts": {
-        "provider": "edge",  # "edge" (free) | "elevenlabs" (premium) | "openai" | "xai" | "minimax" | "mistral" | "gemini" | "neutts" (local) | "kittentts" (local) | "piper" (local)
-        "edge": {
-            "voice": "en-US-AriaNeural",
-            # Popular: AriaNeural, JennyNeural, AndrewNeural, BrianNeural, SoniaNeural
-        },
-        "elevenlabs": {
-            "voice_id": "pNInz6obpgDQGcFmaJgB",  # Adam
-            "model_id": "eleven_multilingual_v2",
-        },
-        "openai": {
-            "model": "gpt-4o-mini-tts",
-            "voice": "alloy",
-            # Voices: alloy, echo, fable, onyx, nova, shimmer
-        },
-        "xai": {
-            "voice_id": "eve",  # or custom voice ID — see https://docs.x.ai/developers/model-capabilities/audio/custom-voices
-            "language": "en",
-            "sample_rate": 24000,
-            "bit_rate": 128000,
-        },
-        "mistral": {
-            "model": "voxtral-mini-tts-2603",
-            "voice_id": "c69964a6-ab8b-4f8a-9465-ec0925096ec8",  # Paul - Neutral
-        },
-        "neutts": {
-            "ref_audio": "",  # Path to reference voice audio (empty = bundled default)
-            "ref_text": "",   # Path to reference voice transcript (empty = bundled default)
-            "model": "neuphonic/neutts-air-q4-gguf",  # HuggingFace model repo
-            "device": "cpu",  # cpu, cuda, or mps
-        },
-        "piper": {
-            # Voice name (e.g. "en_US-lessac-medium") downloaded on first
-            # use, OR an absolute path to a pre-downloaded .onnx file.
-            # Full voice list: https://github.com/OHF-Voice/piper1-gpl/blob/main/docs/VOICES.md
-            "voice": "en_US-lessac-medium",
-            # "voices_dir": "",        # Override voice cache dir; default = ~/.marlow/cache/piper-voices/
-            # "use_cuda": False,       # Requires onnxruntime-gpu
-            # "length_scale": 1.0,     # 2.0 = twice as slow
-            # "noise_scale": 0.667,
-            # "noise_w_scale": 0.8,
-            # "volume": 1.0,
-            # "normalize_audio": True,
-        },
-    },
-    
-    "stt": {
-        "enabled": True,
-        "provider": "local",  # "local" (free, faster-whisper) | "groq" | "openai" (Whisper API) | "mistral" (Voxtral Transcribe) | "elevenlabs" (Scribe)
-        "local": {
-            "model": "base",  # tiny, base, small, medium, large-v3
-            "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
-        },
-        "openai": {
-            "model": "whisper-1",  # whisper-1, gpt-4o-mini-transcribe, gpt-4o-transcribe
-        },
-        "mistral": {
-            "model": "voxtral-mini-latest",  # voxtral-mini-latest, voxtral-mini-2602
-        },
-        "elevenlabs": {
-            "model_id": "scribe_v2",  # scribe_v2, scribe_v1
-            "language_code": "",  # auto-detect by default; set to "eng", "spa", "fra", etc. to force
-            "tag_audio_events": False,
-            "diarize": False,
-        },
-    },
-
-    "voice": {
-        "record_key": "ctrl+b",
-        "max_recording_seconds": 120,
-        "auto_tts": False,
-        "beep_enabled": True,         # Play record start/stop beeps in CLI voice mode
-        "silence_threshold": 200,     # RMS below this = silence (0-32767)
-        "silence_duration": 3.0,      # Seconds of silence before auto-stop
     },
     
     "human_delay": {
@@ -1208,7 +1107,7 @@ DEFAULT_CONFIG = {
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
         # External memory provider plugin (empty = built-in only).
-        # Supported bundled providers are "holographic" and "honcho".
+        # The bundled external provider is "honcho".
         # Only ONE external provider is allowed at a time.
         "provider": "",
         # Legacy warmer for the completed turn's query. Disabled by
@@ -1317,7 +1216,7 @@ DEFAULT_CONFIG = {
         "max_spawn_depth": 1,        # depth cap (1 = flat [default], 2 = orchestrator→leaf, 3 = three-level)
         "orchestrator_enabled": True,  # kill switch for role="orchestrator"
         # When a subagent hits a dangerous-command approval prompt, the parent's
-        # prompt_toolkit TUI owns stdin — a thread-local input() call from the
+        # single-query terminal approval owns stdin — a thread-local input() call from the
         # subagent worker would deadlock the parent UI. To avoid the deadlock,
         # subagent threads ALWAYS resolve approvals non-interactively:
         #   false (default) → auto-deny with a logger.warning audit line (safe)
@@ -1426,48 +1325,6 @@ DEFAULT_CONFIG = {
         },
     },
 
-    # Curator — background skill maintenance.
-    #
-    # Periodically reviews AGENT-CREATED skills (never bundled or
-    # locally created) and keeps the collection tidy: marks long-unused skills
-    # as stale, archives genuinely obsolete ones (archive only, never
-    # deletes), and spawns a forked aux-model agent to consolidate overlaps
-    # and patch drift. Runs inactivity-triggered from session start — no
-    # cron daemon.
-    #
-    # See `marlow curator status` for the last run summary.
-    "curator": {
-        "enabled": True,
-        # How long to wait between curator runs (hours).  Default: 7 days.
-        "interval_hours": 24 * 7,
-        # Only run when the agent has been idle at least this long (hours).
-        "min_idle_hours": 2,
-        # Mark a skill as "stale" after this many days without use.
-        "stale_after_days": 30,
-        # Archive a skill (move to skills/.archive/) after this many days
-        # without use. Archived skills are recoverable — no auto-deletion.
-        "archive_after_days": 90,
-        # Also prune (archive) bundled built-in skills after the inactivity
-        # period, not just agent-created ones. ON by default. Built-ins are
-        # normally restored on every `marlow update`, so pruning them only
-        # sticks because a suppression list tells the re-seeder to leave them
-        # archived. Hub-installed skills are NEVER pruned here — they have an
-        # external upstream owner. Built-ins accrue usage telemetry and their
-        # inactivity clock starts the first time the curator sees them, so a
-        # long-unused built-in is archived only after archive_after_days of
-        # genuine non-use (never a mass-prune on the first run). Set to false
-        # to keep all bundled built-ins permanently.
-        "prune_builtins": True,
-        # Pre-run backup: before every real curator pass (dry-run is
-        # skipped), snapshot ~/.marlow/skills/ into
-        # ~/.marlow/skills/.curator_backups/<utc-iso>/skills.tar.gz so the
-        # user can roll back with `marlow curator rollback`.
-        "backup": {
-            "enabled": True,
-            "keep": 5,  # retain last N regular snapshots
-        },
-    },
-
     # Honcho AI-native memory -- reads ~/.honcho/config.json as single source of truth.
     # This section is only needed for marlow-specific overrides; everything else
     # (apiKey, workspace, peerName, sessions, enabled) comes from the global config.
@@ -1570,8 +1427,7 @@ DEFAULT_CONFIG = {
         # through tools.slash_confirm — native yes/no buttons on Telegram,
         # Discord, and Slack; text fallback elsewhere.  Users click "Always
         # Approve" to silence the prompt permanently; that flips this key to
-        # false.  TUI has its own modal overlay (MARLOW_TUI_NO_CONFIRM=1 to
-        # opt out there).
+        # false.
         "destructive_slash_confirm": True,
     },
 
@@ -1594,11 +1450,6 @@ DEFAULT_CONFIG = {
     # Gateway / cron / non-interactive runs need this (or one of the other
     # channels) to pick up newly-added hooks.
     "hooks_auto_accept": False,
-    # Custom personalities — add your own entries here
-    # Supports string format: {"name": "system prompt"}
-    # Or dict format: {"name": {"description": "...", "system_prompt": "...", "tone": "...", "style": "..."}}
-    "personalities": {},
-
     # Pre-exec security scanning via tirith
     "security": {
         "allow_private_urls": False,  # Allow requests to private/internal IPs (for OpenWrt, proxies, VPNs)
@@ -1621,8 +1472,7 @@ DEFAULT_CONFIG = {
         "acked_advisories": [],
         # Allow Marlow to lazy-install opt-in backend packages from PyPI
         # the first time the user enables a backend that needs them
-        # (e.g. installing ``elevenlabs`` when the user picks ElevenLabs as
-        # their TTS provider). Set to false to require explicit
+        # as needed by the configured backend. Set to false to require explicit
         # ``pip install`` for everything beyond the base set — appropriate
         # for restricted networks, audited environments, or air-gapped
         # systems where any runtime install is unacceptable.
@@ -1839,28 +1689,6 @@ DEFAULT_CONFIG = {
         "seen": {},
     },
 
-    # Paste collapse thresholds (TUI + CLI).
-    #
-    # paste_collapse_threshold (default 5)
-    #   Bracketed-paste handler. Pastes with this many newlines or more
-    #   collapse to a file reference. Set 0 to disable.
-    #
-    # paste_collapse_threshold_fallback (default 5)
-    #   Fallback heuristic for terminals without bracketed paste support.
-    #   Same line count test but heuristically gated by chars-added /
-    #   newlines-added to avoid false positives from normal typing.
-    #   Set 0 to disable.
-    #
-    # paste_collapse_char_threshold (default 2000)
-    #   Long single-line paste guard. Pastes whose total char length
-    #   reaches this value collapse to a file reference even if line
-    #   count is below the line threshold. Catches the "8000 chars of
-    #   minified JSON / log output on one line" case. Set 0 to disable.
-    "paste_collapse_threshold": 5,
-    "paste_collapse_threshold_fallback": 5,
-    "paste_collapse_char_threshold": 2000,
-
-
     # Config schema version - bump this when adding new required fields
     "_config_version": 25,
 }
@@ -1918,59 +1746,6 @@ OPTIONAL_ENV_VARS = {'MARLOW_MCP_BEARER_TOKEN': {'description': 'Bearer token fo
                           'password': False,
                           'category': 'tool',
                           'advanced': True},
- 'VOICE_TOOLS_OPENAI_KEY': {'description': 'OpenAI API key for voice transcription (Whisper) and '
-                                           'OpenAI TTS',
-                            'prompt': 'OpenAI API Key (for Whisper STT + TTS)',
-                            'url': 'https://platform.openai.com/api-keys',
-                            'tools': ['voice_transcription', 'openai_tts'],
-                            'password': True,
-                            'category': 'tool'},
- 'ELEVENLABS_API_KEY': {'description': 'ElevenLabs API key for premium text-to-speech voices and '
-                                       'Scribe transcription',
-                        'prompt': 'ElevenLabs API key',
-                        'url': 'https://elevenlabs.io/',
-                        'tools': ['elevenlabs_tts', 'voice_transcription'],
-                        'password': True,
-                        'category': 'tool'},
- 'MISTRAL_API_KEY': {'description': 'Mistral API key for Voxtral TTS and transcription (STT)',
-                     'prompt': 'Mistral API key',
-                     'url': 'https://console.mistral.ai/',
-                     'password': True,
-                     'category': 'tool'},
- 'GROQ_API_KEY': {'description': 'Groq API key for speech-to-text',
-                  'prompt': 'Groq API key for STT',
-                  'url': 'https://console.groq.com/keys',
-                  'tools': ['voice_transcription'],
-                  'password': True,
-                  'category': 'tool'},
- 'XAI_API_KEY': {'description': 'xAI API key for retained speech backends',
-                 'prompt': 'xAI API key for STT/TTS',
-                 'url': 'https://console.x.ai/',
-                 'tools': ['voice_transcription', 'xai_tts'],
-                 'password': True,
-                 'category': 'tool'},
- 'XAI_BASE_URL': {'description': 'xAI speech API base URL override',
-                  'prompt': 'xAI speech base URL',
-                  'password': False,
-                  'category': 'tool',
-                  'advanced': True},
- 'MINIMAX_API_KEY': {'description': 'MiniMax API key for text-to-speech',
-                     'prompt': 'MiniMax TTS API key',
-                     'url': 'https://www.minimax.io/',
-                     'tools': ['minimax_tts'],
-                     'password': True,
-                     'category': 'tool'},
- 'MINIMAX_GROUP_ID': {'description': 'Optional MiniMax TTS group identifier',
-                      'prompt': 'MiniMax TTS group ID',
-                      'password': False,
-                      'category': 'tool',
-                      'advanced': True},
- 'GEMINI_API_KEY': {'description': 'Google Gemini API key for text-to-speech',
-                    'prompt': 'Gemini TTS API key',
-                    'url': 'https://aistudio.google.com/app/apikey',
-                    'tools': ['gemini_tts'],
-                    'password': True,
-                    'category': 'tool'},
  'HONCHO_API_KEY': {'description': 'Honcho API key for AI-native persistent memory',
                     'prompt': 'Honcho API key',
                     'url': 'https://app.honcho.dev',
@@ -2606,8 +2381,7 @@ def _deep_merge(base: dict, override: dict) -> dict:
     """Recursively merge *override* into *base*, preserving nested defaults.
 
     Keys in *override* take precedence. If both values are dicts the merge
-    recurses, so a user who overrides only ``tts.elevenlabs.voice_id`` will
-    keep the default ``tts.elevenlabs.model_id`` intact.
+    recurses, preserving defaults for nested keys the user did not set.
     """
     result = base.copy()
     for key, value in override.items():
@@ -2768,6 +2542,11 @@ def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> A
 
 
 
+def is_user_config_ignored() -> bool:
+    """Whether the current local CLI invocation requests built-in settings."""
+    return os.environ.get("MARLOW_IGNORE_USER_CONFIG") == "1" and os.environ.get("_MARLOW_GATEWAY") != "1"
+
+
 def read_raw_config() -> Dict[str, Any]:
     """Read ~/.marlow/config.yaml as-is, without merging defaults or migrating.
 
@@ -2780,6 +2559,8 @@ def read_raw_config() -> Dict[str, Any]:
     ``load_config()``. Returns a deepcopy on every call since some callers
     mutate the result before passing to ``save_config()``.
     """
+    if is_user_config_ignored():
+        return {}
     with _CONFIG_LOCK:
         try:
             config_path = get_config_path()
@@ -2849,6 +2630,9 @@ def load_config_readonly() -> Dict[str, Any]:
 def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
     with _CONFIG_LOCK:
         ensure_marlow_home()
+        if is_user_config_ignored():
+            # Do not consult or replace the ordinary profile cache.
+            return _expand_env_vars(DEFAULT_CONFIG)
         config_path = get_config_path()
         path_key = str(config_path)
 
@@ -3324,13 +3108,6 @@ def show_config():
     keys = [
         ("LM_API_KEY", "LM Studio"),
         ("BRAVE_SEARCH_API_KEY", "Brave Search"),
-        ("VOICE_TOOLS_OPENAI_KEY", "OpenAI audio"),
-        ("ELEVENLABS_API_KEY", "ElevenLabs"),
-        ("MISTRAL_API_KEY", "Mistral audio"),
-        ("GROQ_API_KEY", "Groq STT"),
-        ("XAI_API_KEY", "xAI audio"),
-        ("MINIMAX_API_KEY", "MiniMax TTS"),
-        ("GEMINI_API_KEY", "Gemini TTS"),
         ("HONCHO_API_KEY", "Honcho"),
     ]
     
@@ -3347,13 +3124,8 @@ def show_config():
     print()
     print(color("◆ Display", Colors.CYAN, Colors.BOLD))
     display = config.get('display', {})
-    print(f"  Personality:  {display.get('personality') or 'none'}")
     print(f"  Reasoning:    {'on' if display.get('show_reasoning', False) else 'off'}")
     print(f"  Bell:         {'on' if display.get('bell_on_complete', False) else 'off'}")
-    ump = display.get('user_message_preview', {}) if isinstance(display.get('user_message_preview', {}), dict) else {}
-    ump_first = ump.get('first_lines', 2)
-    ump_last = ump.get('last_lines', 2)
-    print(f"  User preview: first {ump_first} line(s), last {ump_last} line(s)")
 
     # Terminal
     print()
@@ -3513,7 +3285,7 @@ def set_config_value(key: str, value: str):
         except Exception:
             user_config = {}
     
-    # Handle nested keys (e.g., "tts.provider") including numeric list
+    # Handle nested keys (e.g., "terminal.backend") including numeric list
     # indices. Delegates to
     # _set_nested which preserves list-typed nodes; before #17876 the
     # inline navigation here silently overwrote lists with dicts.

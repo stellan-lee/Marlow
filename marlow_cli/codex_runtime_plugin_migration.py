@@ -690,7 +690,7 @@ def migrate(
     # Inject Marlow' own tool surface as an MCP server so the spawned
     # codex subprocess can call back into Marlow for the tools codex
     # doesn't ship with — web_search, browser_*, delegate_task, vision,
-    # memory, skills, session_search, image_generate, text_to_speech.
+    # memory, skills, session_search.
     # The server itself is agent/transports/marlow_tools_mcp_server.py
     # and is launched on demand by codex (stdio MCP).
     if expose_marlow_tools:

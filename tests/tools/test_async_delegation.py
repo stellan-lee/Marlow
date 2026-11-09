@@ -507,16 +507,6 @@ def test_rejected_background_dispatch_reattaches_child_for_sync_interrupts():
     assert result["results"][0]["status"] == "completed"
 
 
-def test_cli_completion_ack_waits_for_successful_synthetic_turn(monkeypatch):
-    import cli
-
-    calls = []
-    monkeypatch.setattr(ad, "mark_completion_delivered", lambda ident: calls.append(ident) or True)
-
-    assert cli._acknowledge_completion_after_turn("deleg-1", False) is False
-    assert calls == []
-    assert cli._acknowledge_completion_after_turn("deleg-1", True) is True
-    assert calls == ["deleg-1"]
 
 
 def test_interrupt_for_session_matches_compression_lineage_only():
@@ -543,50 +533,8 @@ def test_interrupt_for_session_matches_compression_lineage_only():
     assert set(interrupted) == {"ancestor", "tip"}
 
 
-def test_cli_queue_requires_parent_session_ownership(monkeypatch):
-    import cli
-
-    events = [
-        (_make_async_evt(parent_session_id="old"), "old result"),
-        (_make_async_evt(delegation_id="deleg-current", parent_session_id="current"), "current result"),
-    ]
-    monkeypatch.setattr(process_registry, "drain_notifications", lambda: events)
-    pending = queue.Queue()
-
-    assert cli._queue_cli_process_notifications(pending, "current") == 1
-    item = pending.get_nowait()
-    assert item.text == "current result"
-    assert item.delegation_id == "deleg-current"
 
 
-def test_cli_queue_accepts_marked_compression_parent_not_unrelated_child(
-    monkeypatch, tmp_path
-):
-    import cli
-    from marlow_state import SessionDB
-
-    db = SessionDB(db_path=tmp_path / "state.db")
-    db.create_session("parent", source="cli")
-    db.create_session(
-        "unrelated-child", source="delegate", parent_session_id="parent"
-    )
-    db.rotate_session_for_compression(
-        "parent", "continuation", source="cli"
-    )
-    event = (_make_async_evt(parent_session_id="parent"), "continued result")
-    monkeypatch.setattr(process_registry, "drain_notifications", lambda: [event])
-    pending = queue.Queue()
-
-    assert cli._queue_cli_process_notifications(
-        pending, "continuation", db
-    ) == 1
-    item = pending.get_nowait()
-    assert item.text == "continued result"
-
-    assert cli._queue_cli_process_notifications(
-        pending, "unrelated-child", db
-    ) == 0
-    assert pending.empty()
 
 
 def test_concurrent_dispatch_respects_capacity():

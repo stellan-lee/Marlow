@@ -2,7 +2,6 @@
 
 import json
 import os
-import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -129,27 +128,6 @@ def test_check_for_updates_fallback_to_project_root(tmp_path, monkeypatch):
         result = banner.check_for_updates()
     # Should have fallen back to project root and run git commands
     assert mock_run.call_count >= 1
-
-
-def test_prefetch_non_blocking():
-    """prefetch_update_check() should return immediately without blocking."""
-    import marlow_cli.banner as banner
-
-    # Reset module state
-    banner._update_result = None
-    banner._update_check_done = threading.Event()
-
-    with patch.object(banner, "check_for_updates", return_value=5):
-        start = time.monotonic()
-        banner.prefetch_update_check()
-        elapsed = time.monotonic() - start
-
-        # Should return almost immediately (well under 1 second)
-        assert elapsed < 1.0
-
-        # Wait for the background thread to finish
-        banner._update_check_done.wait(timeout=5)
-        assert banner._update_result == 5
 
 
 def test_invalidate_update_cache_clears_all_profiles(tmp_path):

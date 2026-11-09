@@ -3,7 +3,7 @@
 This is the biggest single chunk pulled out of ``run_agent.py``: the
 roughly 3,900-line :func:`run_conversation` body that drives one user
 turn through the agent (model call, tool dispatch, retries, fallbacks,
-compression, post-turn hooks, background memory/skill review nudges).
+compression, post-turn hooks, and background memory review).
 
 The function takes the parent ``AIAgent`` instance as its first
 argument (``agent``) and accesses its state via attribute lookup.
@@ -426,14 +426,13 @@ def run_conversation(
         conversation_history (List[Dict]): Previous conversation messages (optional)
         task_id (str): Unique identifier for this task to isolate VMs between concurrent tasks (optional, auto-generated if not provided)
         stream_callback: Optional callback invoked with each text delta during streaming.
-            Used by the TTS pipeline to start audio generation before the full response.
             When None (default), API calls use the standard non-streaming path.
         persist_user_message: Optional clean user message to store in
             transcripts/history when user_message contains API-only
             synthetic prefixes.
                 or queuing follow-up prefetch work.
         raw_user_message: Exact user-authored request text captured before
-            attachment, context-reference, voice, or system-note expansion.
+            attachment, context-reference, or system-note expansion.
             This is a separate trust boundary and never aliases
             ``persist_user_message``.
         turn_origin: Explicit frontend/runtime identity. Unknown callers are
@@ -549,9 +548,7 @@ def run_conversation(
         agent._replay_compression_warning()
         agent._compression_warning = None  # send once
 
-    # NOTE: _turns_since_memory and _iters_since_skill are NOT reset here.
-    # They are initialized in __init__ and must persist across run_conversation
-    # calls so that nudge logic accumulates correctly in CLI mode.
+    # Keep the memory review counter initialized in __init__ across turns.
     agent.iteration_budget = IterationBudget(agent.max_iterations)
 
     # Log conversation turn start for debugging/observability. Never log raw
@@ -628,8 +625,6 @@ def run_conversation(
     original_user_message = persist_user_message if persist_user_message is not None else user_message
 
     # Track memory nudge trigger (turn-based, checked here).
-    # Skill trigger is checked AFTER the agent loop completes, based on
-    # how many tool iterations THIS turn used.
     _should_review_memory = False
     if (agent._memory_nudge_interval > 0
             and "memory" in agent.valid_tool_names
@@ -1161,12 +1156,6 @@ def run_conversation(
             except Exception as _step_err:
                 logger.debug("step_callback error (iteration %s): %s", api_call_count, _step_err)
 
-        # Track tool-calling iterations for skill nudge.
-        # Counter resets whenever skill_manage is actually used.
-        if (agent._skill_nudge_interval > 0
-                and "skill_manage" in agent.valid_tool_names):
-            agent._iters_since_skill += 1
-        
         # ── Pre-API-call /steer drain ──────────────────────────────────
         # If a /steer arrived during the previous API call (while the model
         # was thinking), drain it now — before we build api_messages — so
@@ -1427,8 +1416,7 @@ def run_conversation(
             face = random.choice(KawaiiSpinner.get_thinking_faces())
             verb = random.choice(KawaiiSpinner.get_thinking_verbs())
             if agent.thinking_callback:
-                # CLI TUI mode: use prompt_toolkit widget instead of raw spinner
-                # (works in both streaming and non-streaming modes)
+                # Let the caller render thinking activity.
                 agent.thinking_callback(f"{face} {verb}...")
             elif not agent._has_stream_consumers() and agent._should_start_quiet_spinner():
                 # Raw KawaiiSpinner only when no streaming consumers and the
@@ -1627,7 +1615,7 @@ def run_conversation(
                 if getattr(agent, "_disable_streaming", False):
                     _use_streaming = False
                 elif not agent._has_stream_consumers():
-                    # No display/TTS consumer. Still prefer streaming for
+                    # No stream consumer. Still prefer streaming for
                     # health checking, but skip for Mock clients in tests
                     # (mocks return SimpleNamespace, not stream iterators).
                     from unittest.mock import Mock
@@ -3864,8 +3852,8 @@ def run_conversation(
                 # box) before tool execution begins.  Intermediate turns may
                 # have streamed early content that opened the response box;
                 # flushing here prevents it from wrapping tool feed lines.
-                # Only signal the display callback — TTS (_stream_callback)
-                # should NOT receive None (it uses None as end-of-stream).
+                # Signal the display callback only. The per-turn text
+                # callback receives text deltas.
                 if agent.stream_delta_callback:
                     try:
                         agent.stream_delta_callback(None)
@@ -4643,14 +4631,6 @@ def run_conversation(
     # Clear stream callback so it doesn't leak into future calls
     agent._stream_callback = None
 
-    # Check skill trigger NOW — based on how many tool iterations THIS turn used.
-    _should_review_skills = False
-    if (agent._skill_nudge_interval > 0
-            and agent._iters_since_skill >= agent._skill_nudge_interval
-            and "skill_manage" in agent.valid_tool_names):
-        _should_review_skills = True
-        agent._iters_since_skill = 0
-
     # External memory provider: sync the completed turn + queue next prefetch.
     agent._sync_external_memory_for_turn(
         original_user_message=original_user_message,
@@ -4659,14 +4639,12 @@ def run_conversation(
         messages=messages,
     )
 
-    # Background memory/skill review — runs AFTER the response is delivered
+    # Background memory review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
-    if final_response and not interrupted and (_should_review_memory or _should_review_skills):
+    if final_response and not interrupted and _should_review_memory:
         try:
             agent._spawn_background_review(
                 messages_snapshot=list(messages),
-                review_memory=_should_review_memory,
-                review_skills=_should_review_skills,
             )
         except Exception:
             pass  # Background review is best-effort

@@ -32,6 +32,12 @@ from marlow_cli.config import cfg_get
 logger = logging.getLogger(__name__)
 
 _MEMORY_PLUGINS_DIR = Path(__file__).parent
+RETIRED_MEMORY_PROVIDER = "holographic"
+RETIRED_MEMORY_PROVIDER_MESSAGE = (
+    "Holographic memory is no longer supported. Its data stays on disk. "
+    "Run 'marlow memory off' to clear the provider selection or "
+    "'marlow memory setup' to configure a supported provider."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -70,7 +76,7 @@ def _iter_provider_dirs() -> List[Tuple[str, Path]]:
     Scans bundled first, then user-installed.  Bundled takes precedence
     on name collisions (first-seen wins via ``seen`` set).
     """
-    seen: set = set()
+    seen = {RETIRED_MEMORY_PROVIDER}
     dirs: List[Tuple[str, Path]] = []
 
     # 1. Bundled providers (plugins/memory/<name>/)
@@ -78,7 +84,7 @@ def _iter_provider_dirs() -> List[Tuple[str, Path]]:
         for child in sorted(_MEMORY_PLUGINS_DIR.iterdir()):
             if not child.is_dir() or child.name.startswith(("_", ".")):
                 continue
-            if not (child / "__init__.py").exists():
+            if child.name in seen or not (child / "__init__.py").exists():
                 continue
             seen.add(child.name)
             dirs.append((child.name, child))
@@ -103,6 +109,8 @@ def find_provider_dir(name: str) -> Optional[Path]:
 
     Checks bundled first, then user-installed.
     """
+    if name == RETIRED_MEMORY_PROVIDER:
+        return None
     # Bundled
     bundled = _MEMORY_PLUGINS_DIR / name
     if bundled.is_dir() and (bundled / "__init__.py").exists():
@@ -166,6 +174,10 @@ def load_memory_provider(name: str) -> Optional["MemoryProvider"]:
 
     Returns None if the provider is not found or fails to load.
     """
+    if name == RETIRED_MEMORY_PROVIDER:
+        logger.warning(RETIRED_MEMORY_PROVIDER_MESSAGE)
+        return None
+
     provider_dir = find_provider_dir(name)
     if not provider_dir:
         logger.debug("Memory provider '%s' not found in bundled or user plugins", name)
@@ -236,7 +248,7 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
         sys.modules[module_name] = mod
 
         # Register submodules so relative imports work
-        # e.g., "from .store import MemoryStore" in holographic plugin
+        # e.g., "from .store import MemoryStore" inside a provider plugin
         for sub_file in provider_dir.glob("*.py"):
             if sub_file.name == "__init__.py":
                 continue

@@ -1,9 +1,0 @@
-{
-  "extends": "./tsconfig.json",
-  "compilerOptions": {
-    "baseUrl": ".",
-    "paths": {
-      "@marlow/ink": ["src/types/marlow-ink.d.ts"]
-    }
-  }
-}

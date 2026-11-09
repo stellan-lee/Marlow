@@ -131,7 +131,7 @@ VALID_HOOKS: Set[str] = {
     "transform_tool_result",
     # Transform LLM output before it's returned to the user.
     # Plugins return a string to replace the response text, or None/empty to leave unchanged.
-    # First non-None string wins. Useful for vocabulary/personality transformation.
+    # First non-None string wins. Useful for vocabulary transformation.
     "transform_llm_output",
     "pre_llm_call",
     "post_llm_call",
@@ -247,7 +247,7 @@ class PluginManifest:
     # ``standalone`` (default): hooks/tools of its own; opt-in via
     #                           ``plugins.enabled``.
     # ``backend``: pluggable backend for an existing core tool (e.g.
-    #              image_gen). Built-in (bundled) backends auto-load;
+    #              web search). Built-in (bundled) backends auto-load;
     #              user-installed still gated by ``plugins.enabled``.
     # ``exclusive``: category with exactly one active provider (memory).
     #              Selection via ``<category>.provider`` config key; the
@@ -262,8 +262,8 @@ class PluginManifest:
     # Registry key — path-derived, used by ``plugins.enabled``/``disabled``
     # lookups and by ``marlow plugins list``. For a flat plugin at
     # ``plugins/disk-cleanup/`` the key is ``disk-cleanup``; for a nested
-    # category plugin at ``plugins/image_gen/openai/`` the key is
-    # ``image_gen/openai``. When empty, falls back to ``name``.
+    # category plugin at ``plugins/web/ddgs/`` the key is
+    # ``web/ddgs``. When empty, falls back to ``name``.
     key: str = ""
 
 
@@ -533,33 +533,6 @@ class PluginContext:
             self.manifest.name, engine.name,
         )
 
-    # -- image gen provider registration ------------------------------------
-
-    def register_image_gen_provider(self, provider) -> None:
-        """Register an image generation backend.
-
-        ``provider`` must be an instance of
-        :class:`agent.image_gen_provider.ImageGenProvider`. The
-        ``provider.name`` attribute is what ``image_gen.provider`` in
-        ``config.yaml`` matches against when routing ``image_generate``
-        tool calls.
-        """
-        from agent.image_gen_provider import ImageGenProvider
-        from agent.image_gen_registry import register_provider
-
-        if not isinstance(provider, ImageGenProvider):
-            logger.warning(
-                "Plugin '%s' tried to register an image_gen provider that does "
-                "not inherit from ImageGenProvider. Ignoring.",
-                self.manifest.name,
-            )
-            return
-        register_provider(provider)
-        logger.info(
-            "Plugin '%s' registered image_gen provider: %s",
-            self.manifest.name, provider.name,
-        )
-
     # -- web search/extract provider registration ----------------------------
 
     def register_web_search_provider(self, provider) -> None:
@@ -590,88 +563,6 @@ class PluginContext:
 
     # -- browser provider registration ---------------------------------------
 
-
-    # -- TTS provider registration -------------------------------------------
-
-    def register_tts_provider(self, provider) -> None:
-        """Register a text-to-speech backend.
-
-        ``provider`` must be an instance of
-        :class:`agent.tts_provider.TTSProvider`. The ``provider.name``
-        attribute is what ``tts.provider`` in ``config.yaml`` matches
-        against when routing ``text_to_speech`` tool calls — **but
-        only when**:
-
-        1. ``provider.name`` is NOT a built-in TTS provider name
-           (``edge``, ``openai``, ``elevenlabs``, …). Built-ins always
-           win — the registry rejects shadowing names with a warning.
-        2. There is NO ``tts.providers.<name>: type: command`` entry
-           with the same name. Command-providers (PR #17843) win on
-           name collision because config is more local than plugin
-           install.
-
-        Coexists with the command-provider registry rather than
-        replacing it — see issue #30398 for the full design rationale.
-        """
-        from agent.tts_provider import TTSProvider
-        from agent.tts_registry import register_provider as _register_tts_provider
-
-        if not isinstance(provider, TTSProvider):
-            logger.warning(
-                "Plugin '%s' tried to register a TTS provider that does "
-                "not inherit from TTSProvider. Ignoring.",
-                self.manifest.name,
-            )
-            return
-        _register_tts_provider(provider)
-        logger.info(
-            "Plugin '%s' registered TTS provider: %s",
-            self.manifest.name, provider.name,
-        )
-
-    # -- transcription (STT) provider registration ---------------------------
-
-    def register_transcription_provider(self, provider) -> None:
-        """Register a speech-to-text backend.
-
-        ``provider`` must be an instance of
-        :class:`agent.transcription_provider.TranscriptionProvider`.
-        The ``provider.name`` attribute is what ``stt.provider`` in
-        ``config.yaml`` matches against when routing
-        :func:`tools.transcription_tools.transcribe_audio` calls —
-        **but only when**:
-
-        1. ``provider.name`` is NOT a built-in STT provider name
-           (``local``, ``local_command``, ``groq``, ``openai``,
-           ``mistral``, ``xai``). Built-ins always win — the registry
-           rejects shadowing names with a warning.
-        2. There is NO ``stt.providers.<name>: type: command`` entry
-           with the same name. Command-providers win on name
-           collision because config is more local than plugin install
-           — same precedence rule as TTS.
-
-        Coexists with the in-tree dispatcher and the STT
-        command-provider registry rather than replacing them. The 6
-        built-in STT backends keep their native implementations in
-        ``tools/transcription_tools.py``; this hook is for *new* Python
-        engines (OpenRouter, SenseAudio, Gemini-STT, custom proprietary
-        backends).
-        """
-        from agent.transcription_provider import TranscriptionProvider
-        from agent.transcription_registry import register_provider as _register_stt_provider
-
-        if not isinstance(provider, TranscriptionProvider):
-            logger.warning(
-                "Plugin '%s' tried to register a transcription provider that "
-                "does not inherit from TranscriptionProvider. Ignoring.",
-                self.manifest.name,
-            )
-            return
-        _register_stt_provider(provider)
-        logger.info(
-            "Plugin '%s' registered transcription provider: %s",
-            self.manifest.name, provider.name,
-        )
 
     # -- platform adapter registration ---------------------------------------
 
@@ -964,7 +855,7 @@ class PluginManager:
         # supported (see ``_scan_directory`` for details):
         #
         #   - flat: ``plugins/disk-cleanup/plugin.yaml`` (standalone)
-        #   - category: ``plugins/image_gen/openai/plugin.yaml`` (backend)
+        #   - category: ``plugins/web/ddgs/plugin.yaml`` (backend)
         #
         # ``memory/``, ``context_engine/``, and ``model-providers/`` are
         # skipped at the top level — they have their own discovery systems
@@ -1014,8 +905,8 @@ class PluginManager:
         # Later sources override earlier ones on key collision — user
         # plugins take precedence over bundled, project plugins take
         # precedence over user. Dedup here so we only load the final
-        # winner. Keys are path-derived (``image_gen/openai``,
-        # ``disk-cleanup``) so ``tts/openai`` and ``image_gen/openai``
+        # winner. Keys are path-derived (``web/ddgs``,
+        # ``disk-cleanup``) so ``example/openai`` and ``web/ddgs``
         # don't collide even when both manifests say ``name: openai``.
         disabled = _get_disabled_plugins()
         enabled = _get_enabled_plugins()  # None = opt-in default (nothing enabled)
@@ -1065,9 +956,7 @@ class PluginManager:
                 continue
 
             # Built-in backends auto-load — they ship with marlow and must
-            # just work. Selection among them (e.g. which image_gen backend
-            # services calls) is driven by ``<category>.provider`` config,
-            # enforced by the tool wrapper.
+            # just work. The tool wrapper selects among available backends.
             #
             # Bundled platform plugins (gateway adapters like IRC) auto-load
             # for the same reason: every platform Marlow ships must be
@@ -1122,7 +1011,7 @@ class PluginManager:
           ``<plugin-name>`` (e.g. ``disk-cleanup``).
         * **Category** — ``<root>/<category>/<plugin-name>/plugin.yaml``,
           where the ``<category>`` directory itself has no ``plugin.yaml``.
-          Key is ``<category>/<plugin-name>`` (e.g. ``image_gen/openai``).
+          Key is ``<category>/<plugin-name>`` (e.g. ``web/ddgs``).
           Depth is capped at two segments.
 
         *skip_names* is an optional allow-list of names to ignore at the
@@ -1145,7 +1034,7 @@ class PluginManager:
         """Recursive implementation of :meth:`_scan_directory`.
 
         ``prefix`` is the category path already accumulated ("" at root,
-        "image_gen" one level in). ``depth`` is the recursion depth; we
+        "web" one level in). ``depth`` is the recursion depth; we
         cap at 2 so ``<root>/a/b/c/`` is ignored.
         """
         manifests: List[PluginManifest] = []
@@ -1387,9 +1276,9 @@ class PluginManager:
         """Import a directory-based plugin as ``marlow_plugins.<slug>``.
 
         The module slug is derived from ``manifest.key`` so category-namespaced
-        plugins (``image_gen/openai``) import as
-        ``marlow_plugins.image_gen__openai`` without colliding with any
-        future ``tts/openai``.
+        plugins (``web/ddgs``) import as
+        ``marlow_plugins.web__ddgs`` without colliding with any
+        future ``example/openai``.
         """
         plugin_dir = Path(manifest.path)  # type: ignore[arg-type]
         init_file = plugin_dir / "__init__.py"

@@ -1,9 +1,8 @@
-"""Projects codex app-server events into Marlow' messages list.
+"""Projects Codex app-server events into Marlow's messages list.
 
-The translator that lets Marlow' memory/skill review keep working under the
-Codex runtime: it converts Codex `item/*` notifications into the standard
-OpenAI-shaped `{role, content, tool_calls, tool_call_id}` entries that
-`agent/curator.py` already knows how to read.
+Converts Codex `item/*` notifications into the standard
+OpenAI-shaped `{role, content, tool_calls, tool_call_id}` entries used in
+session history and background memory review.
 
 Codex emits items with a discriminator field `type`:
   - userMessage         → {role: "user", content}
@@ -21,9 +20,7 @@ Marlow' message-alternation invariants (system → user → assistant → user/t
 multiple consecutive (assistant, tool) pairs, which is the same shape Marlow
 already produces for parallel tool calls.
 
-Counters tracked alongside projection:
-  - tool_iterations: ticks once per completed tool-shaped item. Used by
-    AIAgent._iters_since_skill (skill nudge gate, default threshold 10).
+The tool iteration counter ticks once per completed tool-shaped item.
 """
 
 from __future__ import annotations

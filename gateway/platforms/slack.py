@@ -1804,33 +1804,6 @@ class SlackAdapter(BasePlatformAdapter):
                 metadata=metadata,
             )
 
-    async def send_voice(
-        self,
-        chat_id: str,
-        audio_path: str,
-        caption: Optional[str] = None,
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        **kwargs,
-    ) -> SendResult:
-        """Send an audio file to Slack."""
-        try:
-            return await self._upload_file(
-                chat_id, audio_path, caption, reply_to, metadata
-            )
-        except FileNotFoundError:
-            return SendResult(
-                success=False, error=f"Audio file not found: {audio_path}"
-            )
-        except Exception as e:  # pragma: no cover - defensive logging
-            logger.error(
-                "[Slack] Failed to send audio file %s: %s",
-                audio_path,
-                e,
-                exc_info=True,
-            )
-            return SendResult(success=False, error=str(e))
-
     async def send_video(
         self,
         chat_id: str,
@@ -2357,6 +2330,8 @@ class SlackAdapter(BasePlatformAdapter):
                     for t in to_remove:
                         self._mentioned_threads.discard(t)
 
+        has_message_text = bool(text.strip())
+
         # When entering a thread for the first time (no existing session),
         # fetch thread context so the agent understands the conversation.
         if is_thread_reply and not self._has_active_session_for_thread(
@@ -2383,6 +2358,7 @@ class SlackAdapter(BasePlatformAdapter):
         media_types = []
         attachment_notices: List[str] = []
         files = event.get("files", [])
+        has_voice_note = False
         for f in files:
             # Slack Connect channels return stub file objects with
             # file_access="check_file_info" and no URL fields. We must
@@ -2425,6 +2401,10 @@ class SlackAdapter(BasePlatformAdapter):
                             exc_info=True,
                         )
                     continue
+
+            if f.get("subtype") == "slack_audio":
+                has_voice_note = True
+                continue
 
             mimetype = f.get("mimetype", "unknown")
             url = f.get("url_private_download") or f.get("url_private", "")
@@ -2566,9 +2546,12 @@ class SlackAdapter(BasePlatformAdapter):
             if any(m.startswith("image/") for m in media_types):
                 msg_type = MessageType.PHOTO
             elif any(m.startswith("audio/") for m in media_types):
-                msg_type = MessageType.VOICE
+                msg_type = MessageType.AUDIO
             else:
                 msg_type = MessageType.DOCUMENT
+        elif has_voice_note and not has_message_text and not attachment_notices:
+            msg_type = MessageType.VOICE
+            text = ""
 
         # Resolve user display name (cached after first lookup)
         user_name = await self._resolve_user_name(user_id, chat_id=channel_id)

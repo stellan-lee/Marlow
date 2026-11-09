@@ -10,7 +10,7 @@ fork inherits the cached prompt verbatim.
 Three tiers are joined with ``\\n\\n``:
 
 * ``stable``   — identity (SOUL.md or DEFAULT_AGENT_IDENTITY), tool
-  guidance, computer-use guidance, tool-use enforcement guidance,
+  guidance, tool-use enforcement guidance,
   skills prompt, environment hints, and platform hints.
 * ``context``  — caller-supplied ``system_message`` plus context files
   (AGENTS.md / .cursorrules / etc.) discovered under ``TERMINAL_CWD``.
@@ -34,7 +34,6 @@ from agent.prompt_builder import (
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     PLATFORM_HINTS,
     SESSION_SEARCH_GUIDANCE,
-    SKILLS_GUIDANCE,
     TASK_COMPLETION_GUIDANCE,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
@@ -120,15 +119,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if "request_admin_approval" in agent.valid_tool_names:
         tool_guidance.append(ADMIN_APPROVAL_GUIDANCE)
     if "skill_manage" in agent.valid_tool_names:
-        tool_guidance.append(SKILLS_GUIDANCE)
+        tool_guidance.append("Create or modify skills only when the user explicitly asks.")
     if tool_guidance:
         stable_parts.append(" ".join(tool_guidance))
-
-    # Computer-use (macOS) — goes in as its own block rather than being
-    # merged into tool_guidance because the content is multi-paragraph.
-    if "computer_use" in agent.valid_tool_names:
-        from agent.prompt_builder import COMPUTER_USE_GUIDANCE
-        stable_parts.append(COMPUTER_USE_GUIDANCE)
 
     # Tool-use enforcement: tells the model to actually call tools instead
     # of describing intended actions.  Controlled by config.yaml

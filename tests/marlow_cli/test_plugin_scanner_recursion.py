@@ -272,86 +272,14 @@ class TestBackendGate:
 
 
 class TestBundledBackendAutoLoad:
-    def test_bundled_image_gen_codex_autoloads(self, tmp_path, monkeypatch):
-        """The bundled ``plugins/image_gen/openai-codex/`` plugin loads without
+    def test_bundled_web_backend_autoloads(self):
+        """The bundled ``plugins/web/ddgs/`` plugin loads without
         any opt-in — it's ``kind: backend`` and shipped in-repo."""
-        import os
-        marlow_home = Path(os.environ["MARLOW_HOME"])  # set by hermetic conftest fixture
-
         mgr = PluginManager()
         mgr.discover_and_load()
 
-        assert "image_gen/openai-codex" in mgr._plugins
-        loaded = mgr._plugins["image_gen/openai-codex"]
+        assert "web/ddgs" in mgr._plugins
+        loaded = mgr._plugins["web/ddgs"]
         assert loaded.manifest.source == "bundled"
         assert loaded.manifest.kind == "backend"
         assert loaded.enabled is True, f"error: {loaded.error}"
-
-
-# ── PluginContext.register_image_gen_provider ───────────────────────────────
-
-
-class TestRegisterImageGenProvider:
-    def test_accepts_valid_provider(self, tmp_path, monkeypatch):
-        from agent import image_gen_registry
-        from agent.image_gen_provider import ImageGenProvider
-
-        image_gen_registry._reset_for_tests()
-
-        class FakeProvider(ImageGenProvider):
-            @property
-            def name(self) -> str:
-                return "fake-test"
-
-            def generate(self, prompt, aspect_ratio="landscape", **kw):
-                return {"success": True, "image": "test://fake"}
-
-        import os
-        marlow_home = Path(os.environ["MARLOW_HOME"])  # set by hermetic conftest fixture
-        plugin_dir = _write_plugin(
-            marlow_home / "plugins",
-            ["my-img-plugin"],
-            register_body=(
-                "from agent.image_gen_provider import ImageGenProvider\n"
-                "    class P(ImageGenProvider):\n"
-                "        @property\n"
-                "        def name(self): return 'fake-ctx'\n"
-                "        def generate(self, prompt, aspect_ratio='landscape', **kw):\n"
-                "            return {'success': True, 'image': 'x://y'}\n"
-                "    ctx.register_image_gen_provider(P())"
-            ),
-        )
-        _enable(marlow_home, "my-img-plugin")
-
-        mgr = PluginManager()
-        mgr.discover_and_load()
-
-        assert mgr._plugins["my-img-plugin"].enabled is True
-        assert image_gen_registry.get_provider("fake-ctx") is not None
-
-        image_gen_registry._reset_for_tests()
-
-    def test_rejects_non_provider(self, tmp_path, monkeypatch, caplog):
-        from agent import image_gen_registry
-
-        image_gen_registry._reset_for_tests()
-
-        import os
-        marlow_home = Path(os.environ["MARLOW_HOME"])  # set by hermetic conftest fixture
-        _write_plugin(
-            marlow_home / "plugins",
-            ["bad-img-plugin"],
-            register_body="ctx.register_image_gen_provider('not a provider')",
-        )
-        _enable(marlow_home, "bad-img-plugin")
-
-        with caplog.at_level("WARNING"):
-            mgr = PluginManager()
-            mgr.discover_and_load()
-
-        # Plugin loaded (register returned normally) but nothing was
-        # registered in the provider registry.
-        assert mgr._plugins["bad-img-plugin"].enabled is True
-        assert image_gen_registry.get_provider("not a provider") is None
-
-        image_gen_registry._reset_for_tests()

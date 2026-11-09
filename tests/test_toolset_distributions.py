@@ -23,7 +23,7 @@ class TestGetDistribution:
 
     def test_all_named_distributions_exist(self):
         expected = [
-            "default", "image_gen", "research", "science", "development",
+            "default", "research", "science", "development",
             "safe", "balanced", "minimal", "terminal_only", "terminal_web",
             "creative", "reasoning", "browser_use", "browser_only",
             "browser_tasks", "terminal_tasks", "mixed_tasks",

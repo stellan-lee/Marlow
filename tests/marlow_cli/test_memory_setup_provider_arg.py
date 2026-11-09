@@ -48,3 +48,13 @@ class TestMemorySetupProviderRouting:
         out = capsys.readouterr().out
         assert "not found" in out
         assert "marlow memory setup" in out
+
+
+def test_status_reports_retired_provider_without_opening_it(capsys):
+    config = {"memory": {"provider": "holographic"}}
+    with patch("marlow_cli.config.load_config", return_value=config), \
+         patch.object(memory_setup, "_get_available_providers") as discover:
+        memory_setup.cmd_status(SimpleNamespace())
+
+    assert "Holographic memory is no longer supported" in capsys.readouterr().out
+    discover.assert_not_called()

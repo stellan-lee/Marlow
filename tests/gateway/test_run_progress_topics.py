@@ -206,7 +206,7 @@ def _make_runner(adapter):
     runner._session_run_generation = {}
     runner.hooks = SimpleNamespace(loaded_hooks=False)
     runner.config = SimpleNamespace(
-        thread_sessions_per_user=False, group_sessions_per_user=False, stt_enabled=False
+        thread_sessions_per_user=False, group_sessions_per_user=False
     )
     return runner
 

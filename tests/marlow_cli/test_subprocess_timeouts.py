@@ -9,7 +9,6 @@ import pytest
 _CLI_MODULES = [
     "marlow_cli/doctor.py",
     "marlow_cli/status.py",
-    "marlow_cli/clipboard.py",
     "marlow_cli/banner.py",
 ]
 

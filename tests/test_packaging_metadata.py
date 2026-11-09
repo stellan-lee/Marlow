@@ -59,14 +59,16 @@ def test_every_on_disk_subpackage_is_covered_by_packages_find():
     )
 
 
-def test_faster_whisper_is_not_a_base_dependency():
+def test_retired_extras_and_packages_are_absent():
     data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    deps = data["project"]["dependencies"]
-
-    assert not any(dep.startswith("faster-whisper") for dep in deps)
-
-    voice_extra = data["project"]["optional-dependencies"]["voice"]
-    assert any(dep.startswith("faster-whisper") for dep in voice_extra)
+    extras = data["project"]["optional-dependencies"]
+    assert {"voice", "edge-tts", "tts-premium", "mistral", "computer-use"}.isdisjoint(extras)
+    assert "discord.py==2.7.1" in extras["messaging"]
+    assert not any("tui_gateway" in entry for entry in _packages_find_include())
+    assert "cli" not in data["tool"]["setuptools"]["py-modules"]
+    lock = tomllib.loads((REPO_ROOT / "uv.lock").read_text(encoding="utf-8"))
+    packages = {package["name"] for package in lock["package"]}
+    assert {"faster-whisper", "edge-tts", "sounddevice", "mistralai", "pynacl"}.isdisjoint(packages)
 
 
 def test_manifest_includes_bundled_skills():
@@ -119,7 +121,7 @@ def test_bundled_plugin_manifests_ship_in_both_wheel_and_sdist():
 # 1.0.1. Anything below that lets a malformed Host header desync
 # ``request.url.path`` from the dispatched ASGI path, bypassing path-based
 # authz in middleware/endpoints that gate on ``request.url``. Starlette is a
-# transitive dep (fastapi in [web]; sse-starlette/mcp in [mcp]/[computer-use]/
+# transitive dep (fastapi in [web]; sse-starlette/mcp in [mcp]/
 # [dev]) so we pin it directly in every extra that exposes a server surface and
 # enforce the floor in both pyproject and the committed lockfile.
 _STARLETTE_CVE_FLOOR = (1, 0, 1)
@@ -158,7 +160,7 @@ def test_starlette_pinned_above_cve_2026_48710_floor_in_pyproject():
                 found[extra] = ver
 
     # Every retained server-surface extra must carry the direct pin.
-    for extra in ("mcp", "computer-use", "dev"):
+    for extra in ("mcp", "dev"):
         assert extra in found, (
             f"[{extra}] no longer pins starlette directly — CVE-2026-48710 "
             f"regression risk (mcp/fastapi pull it transitively with no upper bound)"

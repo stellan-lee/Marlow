@@ -82,10 +82,7 @@ def _containing_skills_root(skill_path: Path) -> Path:
 def _pinned_guard(name: str) -> Optional[str]:
     """Return a refusal message if *name* is pinned, else None.
 
-    Pin protects a skill from **deletion** — both the curator's auto-archive
-    passes and the agent's ``skill_manage(action="delete")`` tool call. The
-    agent can still patch/edit pinned skills; pin only guards against
-    irrecoverable loss, not against content evolution.
+    Honor legacy pins on deletion. Owners can still edit their skills.
 
     Best-effort: if the sidecar is unreadable we let the delete through
     rather than block on a broken telemetry file.
@@ -96,8 +93,8 @@ def _pinned_guard(name: str) -> Optional[str]:
         if rec.get("pinned"):
             return (
                 f"Skill '{name}' is pinned and cannot be deleted by "
-                f"skill_manage. Ask the user to run "
-                f"`marlow curator unpin {name}` if they want to delete it. "
+                "skill_manage. Its owner can remove the skill directly "
+                "from the profile skill directory. "
                 f"Patches and edits are allowed on pinned skills; only "
                 f"deletion is blocked."
             )
@@ -584,9 +581,7 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
     """Delete a skill.
 
     ``absorbed_into`` declares intent:
-      - ``None`` / missing  → caller didn't declare (legacy / non-curator path);
-        accepted for backward compat but logs a warning because the curator
-        classification pipeline can't tell consolidation from pruning without it.
+      - ``None`` / missing  → caller didn't declare a target.
       - ``""`` (empty)      → explicit "truly pruned, no forwarding target".
       - ``"<skill-name>"``  → content was absorbed into that umbrella; the
         target must exist on disk. Validated here so the model can't claim an
@@ -783,7 +778,7 @@ def skill_manage(
             clear_skills_system_prompt_cache(clear_snapshot=True)
         except Exception:
             pass
-        # Curator telemetry: bump mutation counts and forget deleted skills.
+        # Track explicit skill edits and forget deleted skills.
         try:
             from tools.skill_usage import bump_patch, forget
             if action in {"patch", "edit", "write_file", "remove_file"}:
@@ -810,27 +805,10 @@ SKILL_MANAGE_SCHEMA = {
         "patch (old_string/new_string — preferred for fixes), "
         "edit (full SKILL.md rewrite — major overhauls only), "
         "delete, write_file, remove_file.\n\n"
-        "On delete, pass `absorbed_into=<umbrella>` when you're merging this "
-        "skill's content into another one, or `absorbed_into=\"\"` when you're "
-        "pruning it with no forwarding target. This lets the curator tell "
-        "consolidation from pruning without guessing, so downstream consumers "
-        "(cron jobs that reference the old skill name, etc.) get updated "
-        "correctly. The target you name in `absorbed_into` must already "
-        "exist — create/patch the umbrella first, then delete.\n\n"
-        "Create when: complex task succeeded (5+ calls), errors overcome, "
-        "user-corrected approach worked, non-trivial workflow discovered, "
-        "or user asks you to remember a procedure.\n"
-        "Update when: instructions stale/wrong, OS-specific failures, "
-        "missing steps or pitfalls found during use. "
-        "If you used a skill and hit issues not covered by it, patch it immediately.\n\n"
-        "After difficult/iterative tasks, offer to save as a skill. "
-        "Skip for simple one-offs. Confirm with user before creating/deleting.\n\n"
+        "Use this tool only for changes the user explicitly requests.\n\n"
         "Good skills: trigger conditions, numbered steps with exact commands, "
         "pitfalls section, verification steps. Use skill_view() to see format examples.\n\n"
-        "Pinned skills are protected from deletion only — skill_manage(action='delete') "
-        "will refuse with a message pointing the user to `marlow curator unpin <name>`. "
-        "Patches and edits go through on pinned skills so you can still improve them as "
-        "pitfalls come up; pin only guards against irrecoverable loss."
+        "Existing pinned skills can be edited but are protected from deletion."
     ),
     "parameters": {
         "type": "object",
@@ -894,20 +872,6 @@ SKILL_MANAGE_SCHEMA = {
             "file_content": {
                 "type": "string",
                 "description": "Content for the file. Required for 'write_file'."
-            },
-            "absorbed_into": {
-                "type": "string",
-                "description": (
-                    "For 'delete' only — declares intent so the curator can "
-                    "tell consolidation from pruning without guessing. "
-                    "Pass the umbrella skill name when this skill's content "
-                    "was merged into another (the target must already exist). "
-                    "Pass an empty string when the skill is truly stale and "
-                    "being pruned with no forwarding target. Omitting the arg "
-                    "on delete is supported for backward compatibility but "
-                    "downstream tooling (e.g. cron-job skill reference "
-                    "rewriting) will have to guess at intent."
-                )
             },
         },
         "required": ["action", "name"],

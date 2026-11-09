@@ -716,7 +716,7 @@ class TestExternalSkillMutations:
 # ---------------------------------------------------------------------------
 # Pinned-skill guard — skill_manage refuses only `delete` on pinned skills.
 # Patches and edits go through so pinned skills can still evolve as pitfalls
-# come up. The user unpins via `marlow curator unpin <name>` to delete.
+# come up. A pinned skill can be deleted directly by its owner.
 # ---------------------------------------------------------------------------
 
 class TestPinnedGuard:
@@ -771,7 +771,7 @@ class TestPinnedGuard:
         assert result["success"] is False
         assert "pinned" in result["error"].lower()
         assert "cannot be deleted" in result["error"]
-        assert "marlow curator unpin my-skill" in result["error"]
+        assert "profile skill directory" in result["error"]
         # Skill still exists
         assert (tmp_path / "my-skill" / "SKILL.md").exists()
 

@@ -151,17 +151,6 @@ gateway:
     invalid_days:          "Invalid --days value: {value}"
     error:                 "Error generating insights: {error}"
 
-  personality:
-    none_configured:       "No personalities configured in `{path}/config.yaml`"
-    header:                "🎭 **Available Personalities**\n"
-    none_option:           "• `none` — (no personality overlay)"
-    item:                  "• `{name}` — {preview}"
-    usage:                 "\nUsage: `/personality <name>`"
-    save_failed:           "⚠️ Failed to save personality change: {error}"
-    cleared:               "🎭 Personality cleared — using base agent behavior.\n_(takes effect on next message)_"
-    set_to:                "🎭 Personality set to **{name}**\n_(takes effect on next message)_"
-    unknown:               "Unknown personality: `{name}`\n\nAvailable: {available}"
-
   profile:
     header:                "👤 **Profile:** `{profile}`"
     home:                  "📂 **Home:** `{home}`"
@@ -329,21 +318,6 @@ gateway:
     mode_verbose:          "⚙️ Tool progress: **VERBOSE** — every tool call with full arguments."
     saved_suffix:          "_(saved for **{platform}** — takes effect on next message)_"
     save_failed:           "_(could not save to config: {error})_"
-
-  voice:
-    enabled_voice_only:    "Voice mode enabled.\nI'll reply with voice when you send voice messages.\nUse /voice tts to get voice replies for all messages."
-    disabled_text:         "Voice mode disabled. Text-only replies."
-    tts_enabled:           "Auto-TTS enabled.\nAll replies will include a voice message."
-    status_mode:           "Voice mode: {label}"
-    status_channel:        "Voice channel: #{channel}"
-    status_participants:   "Participants: {count}"
-    status_member:         "  - {name}{status}"
-    speaking:              " (speaking)"
-    enabled_short:         "Voice mode enabled."
-    disabled_short:        "Voice mode disabled."
-    label_off:             "Off (text only)"
-    label_voice_only:      "On (voice reply to voice messages)"
-    label_all:             "TTS (voice reply to all messages)"
 
   yolo:
     disabled:                   "⚠️ YOLO mode **OFF** for this session — dangerous commands will require approval."

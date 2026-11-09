@@ -1,6 +1,6 @@
 # Approved Selective Marlow Cleanup
 
-Status: approved by the user's checked feature inventory on 2026-07-18.
+Historical record of the cleanup approved on 2026-07-18. The later Phase 1 scope reduction supersedes its retention decisions for the retired components.
 
 The user-defined convention is authoritative: checked items are removed;
 unchecked items remain supported.

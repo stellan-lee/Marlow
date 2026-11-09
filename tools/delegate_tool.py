@@ -137,90 +137,6 @@ _MIN_SPAWN_DEPTH = 1
 _MAX_SPAWN_DEPTH_CAP = 3
 
 
-# ---------------------------------------------------------------------------
-# Runtime state: pause flag + active subagent registry
-#
-# Consumed by the TUI observability layer (overlay/control surface) and the
-# gateway RPCs `delegation.pause`, `delegation.status`, `subagent.interrupt`.
-# Kept module-level so they span every delegate_task invocation in the
-# process, including nested orchestrator -> worker chains.
-# ---------------------------------------------------------------------------
-
-_spawn_pause_lock = threading.Lock()
-_spawn_paused: bool = False
-
-_active_subagents_lock = threading.Lock()
-# subagent_id -> mutable record tracking the live child agent.  Stays only
-# for the lifetime of the run; _run_single_child is the owner.
-_active_subagents: Dict[str, Dict[str, Any]] = {}
-
-
-def set_spawn_paused(paused: bool) -> bool:
-    """Globally block/unblock new delegate_task spawns.
-
-    Active children keep running; only NEW calls to delegate_task fail fast
-    with a "spawning paused" error until unblocked.  Returns the new state.
-    """
-    global _spawn_paused
-    with _spawn_pause_lock:
-        _spawn_paused = bool(paused)
-        return _spawn_paused
-
-
-def is_spawn_paused() -> bool:
-    with _spawn_pause_lock:
-        return _spawn_paused
-
-
-def _register_subagent(record: Dict[str, Any]) -> None:
-    sid = record.get("subagent_id")
-    if not sid:
-        return
-    with _active_subagents_lock:
-        _active_subagents[sid] = record
-
-
-def _unregister_subagent(subagent_id: str) -> None:
-    with _active_subagents_lock:
-        _active_subagents.pop(subagent_id, None)
-
-
-def interrupt_subagent(subagent_id: str) -> bool:
-    """Request that a single running subagent stop at its next iteration boundary.
-
-    Does not hard-kill the worker thread (Python can't); sets the child's
-    interrupt flag which propagates to in-flight tools and recurses into
-    grandchildren via AIAgent.interrupt().  Returns True if a matching
-    subagent was found.
-    """
-    with _active_subagents_lock:
-        record = _active_subagents.get(subagent_id)
-    if not record:
-        return False
-    agent = record.get("agent")
-    if agent is None:
-        return False
-    try:
-        agent.interrupt(f"Interrupted via TUI ({subagent_id})")
-    except Exception as exc:
-        logger.debug("interrupt_subagent(%s) failed: %s", subagent_id, exc)
-        return False
-    return True
-
-
-def list_active_subagents() -> List[Dict[str, Any]]:
-    """Snapshot of the currently running subagent tree.
-
-    Each record: {subagent_id, parent_id, depth, goal, model, started_at,
-    tool_count, status}.  Safe to call from any thread — returns a copy.
-    """
-    with _active_subagents_lock:
-        return [
-            {k: v for k, v in r.items() if k != "agent"}
-            for r in _active_subagents.values()
-        ]
-
-
 def _extract_output_tail(
     result: Dict[str, Any],
     *,
@@ -850,12 +766,6 @@ def _build_child_progress_callback(
 
         # TASK_TOOL_STARTED — display and batch for parent relay
         _tool_count[0] += 1
-        if subagent_id is not None:
-            with _active_subagents_lock:
-                rec = _active_subagents.get(subagent_id)
-                if rec is not None:
-                    rec["tool_count"] = _tool_count[0]
-                    rec["last_tool"] = tool_name or ""
         if spinner:
             short = (
                 (preview[:35] + "...")
@@ -934,9 +844,9 @@ def _build_child_agent(
     orchestrator_ok = _get_orchestrator_enabled() and child_depth < max_spawn
     effective_role = role if (role == "orchestrator" and orchestrator_ok) else "leaf"
 
-    # ── Subagent identity (stable across events, 0-indexed for TUI) ─────
+    # ── Subagent identity (stable across events, 0-indexed) ─────
     # subagent_id is generated here so the progress callback, the
-    # spawn_requested event, and the _active_subagents registry all share
+    # spawn_requested event share
     # one key.  parent_id is non-None when THIS parent is itself a subagent
     # (nested orchestrator -> worker chain).
     subagent_id = f"sa-{task_index}-{_uuid.uuid4().hex[:8]}"
@@ -1107,8 +1017,7 @@ def _build_child_agent(
     # Stash the post-degrade role for introspection (leaf if the
     # kill switch or depth bounded the caller's requested role).
     child._delegate_role = effective_role
-    # Stash subagent identity for nested-delegation event propagation and
-    # for _run_single_child / interrupt_subagent to look up by id.
+    # Stash the identity for nested-delegation events and file-state tracking.
     child._subagent_id = subagent_id
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
@@ -1385,34 +1294,8 @@ def _run_single_child(
 
     _heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
 
-    # Register the live agent in the module-level registry so the TUI can
-    # target it by subagent_id (kill, pause, status queries).  Unregistered
-    # in the finally block, even when the child raises.  Test doubles that
-    # hand us a MagicMock don't carry stable ids; skip registration then.
     _raw_sid = getattr(child, "_subagent_id", None)
     _subagent_id = _raw_sid if isinstance(_raw_sid, str) else None
-    if _subagent_id:
-        _raw_depth = getattr(child, "_delegate_depth", 1)
-        _tui_depth = max(0, _raw_depth - 1) if isinstance(_raw_depth, int) else 0
-        _parent_sid = getattr(child, "_parent_subagent_id", None)
-        _register_subagent(
-            {
-                "subagent_id": _subagent_id,
-                "parent_id": _parent_sid if isinstance(_parent_sid, str) else None,
-                "depth": _tui_depth,
-                "goal": goal,
-                "model": (
-                    getattr(child, "model", None)
-                    if isinstance(getattr(child, "model", None), str)
-                    else None
-                ),
-                "started_at": time.time(),
-                "status": "running",
-                "tool_count": 0,
-                "agent": child,
-            }
-        )
-
     try:
         _heartbeat_thread.start()
         if child_progress_cb:
@@ -1422,8 +1305,8 @@ def _run_single_child(
                 logger.debug("Progress callback start failed: %s", e)
 
         # File-state coordination: reuse the stable subagent_id as the child's
-        # task_id so file_state writes, active-subagents registry, and TUI
-        # events all share one key.  Falls back to a fresh uuid only if the
+        # task_id so file-state writes and delegation events share one key.
+        # Falls back to a fresh uuid only if the
         # pre-built id is somehow missing.
         import uuid as _uuid
 
@@ -1797,11 +1680,6 @@ def _run_single_child(
         if _heartbeat_thread.ident is not None:
             _heartbeat_thread.join(timeout=5)
 
-        # Drop the TUI-facing registry entry.  Safe to call even if the
-        # child was never registered (e.g. ID missing on test doubles).
-        if _subagent_id:
-            _unregister_subagent(_subagent_id)
-
         # Restore the parent's tool names so the process-global is correct
         # for any subsequent execute_code calls or other consumers.
         import model_tools
@@ -1883,15 +1761,6 @@ def delegate_task(
     """
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
-
-    # Operator-controlled kill switch — lets the TUI freeze new fan-out
-    # when a runaway tree is detected, without interrupting already-running
-    # children.  Cleared via the matching `delegation.pause` RPC.
-    if is_spawn_paused():
-        return tool_error(
-            "Delegation spawning is paused. Clear the pause via the TUI "
-            "(`p` in /agents) or the `delegation.pause` RPC before retrying."
-        )
 
     # Normalise the top-level role once; per-task overrides re-normalise.
     top_role = _normalize_role(role)
@@ -2467,21 +2336,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
 
 
 def _load_config() -> dict:
-    """Load delegation config from CLI_CONFIG or persistent config.
-
-    Checks the runtime config (cli.py CLI_CONFIG) first, then falls back
-    to the persistent config (marlow_cli/config.py load_config()) so that
-    ``delegation.model`` / ``delegation.provider`` are picked up regardless
-    of the entry point (CLI, gateway, cron).
-    """
-    try:
-        from cli import CLI_CONFIG
-
-        cfg = CLI_CONFIG.get("delegation") or {}
-        if cfg:
-            return cfg
-    except Exception:
-        pass
+    """Load delegation settings from the active profile."""
     try:
         from marlow_cli.config import load_config
 

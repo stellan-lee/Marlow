@@ -840,8 +840,7 @@ async def test_send_dm_topic_reply_not_found_fails_closed():
         ("send_image_file", "send_photo", "image_path", "photo.png", b"png-data"),
         ("send_document", "send_document", "file_path", "report.txt", b"report-data"),
         ("send_video", "send_video", "video_path", "clip.mp4", b"video-data"),
-        ("send_voice", "send_voice", "audio_path", "clip.ogg", b"ogg-data"),
-        ("send_voice", "send_audio", "audio_path", "clip.mp3", b"mp3-data"),
+        ("send_document", "send_document", "file_path", "clip.ogg", b"ogg-data"),
     ],
 )
 async def test_native_media_dm_topic_reply_not_found_retry_drops_thread_id(

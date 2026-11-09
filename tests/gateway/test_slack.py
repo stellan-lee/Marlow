@@ -1217,6 +1217,44 @@ class TestIncomingDocumentHandling:
         }
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("caption", ["", "Here is the clip"])
+    async def test_native_audio_clip_keeps_only_caption(self, adapter, caption):
+        event = self._make_event(
+            text=caption,
+            files=[{
+                "subtype": "slack_audio",
+                "mimetype": "audio/webm",
+                "name": "audio_message.webm",
+                "url_private_download": "https://files.slack.com/audio_message.webm",
+            }],
+        )
+        with patch.object(adapter, "_download_slack_file", new_callable=AsyncMock) as download:
+            await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.await_args.args[0]
+        assert msg_event.text == caption
+        assert msg_event.is_voice_only() is (not caption)
+        assert msg_event.media_urls == []
+        download.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_regular_audio_upload_stays_an_attachment(self, adapter):
+        event = self._make_event(files=[{
+            "mimetype": "audio/mpeg",
+            "name": "track.mp3",
+            "url_private_download": "https://files.slack.com/track.mp3",
+        }])
+        with patch.object(
+            adapter, "_download_slack_file", new=AsyncMock(return_value="/tmp/track.mp3")
+        ):
+            await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.await_args.args[0]
+        assert msg_event.message_type == MessageType.AUDIO
+        assert msg_event.media_urls == ["/tmp/track.mp3"]
+        assert msg_event.media_types == ["audio/mpeg"]
+
+    @pytest.mark.asyncio
     async def test_pdf_document_cached(self, adapter):
         """A PDF attachment should be downloaded, cached, and set as DOCUMENT type."""
         pdf_bytes = b"%PDF-1.4 fake content"

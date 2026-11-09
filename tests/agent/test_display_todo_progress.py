@@ -230,20 +230,3 @@ class TestTodoEdgeCases:
         """Completely empty call."""
         msg = get_cute_tool_message("todo", {}, 0.0)
         assert "reading tasks" in msg
-
-
-class TestTodoSkinIntegration:
-    """Verify the skin prefix is applied to todo messages too.
-    This uses the same pattern as test_skin_engine test_tool_message_uses_skin_prefix.
-    """
-
-    def test_default_skin_prefix(self):
-        from marlow_cli.skin_engine import get_active_skin_name, set_active_skin
-
-        previous = get_active_skin_name()
-        try:
-            set_active_skin("default")
-            msg = get_cute_tool_message("todo", {}, 0.5)
-            assert msg.startswith("┊")
-        finally:
-            set_active_skin(previous)

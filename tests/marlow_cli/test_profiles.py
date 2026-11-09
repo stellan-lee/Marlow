@@ -154,7 +154,7 @@ class TestCreateProfile:
     def test_creates_directory_with_subdirs(self, profile_env):
         profile_dir = create_profile("coder", no_alias=True)
         assert profile_dir.is_dir()
-        for subdir in ["memories", "sessions", "skills", "skins", "logs",
+        for subdir in ["memories", "sessions", "skills", "logs",
                         "plans", "workspace", "cron"]:
             assert (profile_dir / subdir).is_dir(), f"Missing subdir: {subdir}"
 

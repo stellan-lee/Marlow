@@ -135,8 +135,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # Reset nudge counters
         if function_name == "memory":
             agent._turns_since_memory = 0
-        elif function_name == "skill_manage":
-            agent._iters_since_skill = 0
 
         try:
             function_args = json.loads(tool_call.function.arguments)
@@ -644,8 +642,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 )
         elif function_name == "memory":
             agent._turns_since_memory = 0
-        elif function_name == "skill_manage":
-            agent._iters_since_skill = 0
 
         if not agent.quiet_mode:
             args_str = json.dumps(function_args, ensure_ascii=False)
