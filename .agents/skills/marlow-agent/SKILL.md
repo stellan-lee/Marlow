@@ -11,14 +11,19 @@ metadata:
 
 This skill is for developers working in the Marlow source checkout.
 
-Marlow Agent is an open-source AI agent framework that runs in your terminal and messaging platforms. It provides autonomous coding and task execution through tool calling, using Codex OAuth or a custom/local OpenAI-compatible endpoint on Linux and macOS.
+Marlow Agent is an open-source AI agent framework that runs in your terminal and messaging platforms. It provides autonomous coding and task execution through tool calling, using the sole managed Codex app-server adapter on Linux and macOS. The current supported CLI version is 0.159.2.
+
+Runtime implementation and limits: see `docs/architecture/phase-2-codex-runtime.md`
+and `docs/architecture/phase-2-validation.md`. Marlow owns business authorization,
+identity, memory and history; Codex owns reasoning, model retries and compaction.
+Do not add auxiliary clients, provider fallback or a second tool reasoning loop.
 
 What makes Marlow different:
 
 - **Reusable skills** — request `/learn` to save a procedure for future sessions. Existing skills can be loaded and edited on request.
 - **Persistent memory across sessions** — remembers who you are, your preferences, environment details, and lessons learned through local memory or Honcho.
 - **Multi-platform gateway** — the same agent runs on Telegram, Discord, Slack, Feishu/Lark, Email, and signed webhooks with full tool access.
-- **Flexible inference** — use Codex OAuth or point Marlow at Ollama, vLLM, LM Studio, or another custom OpenAI-compatible endpoint.
+- **Flexible inference** — configure a Responses provider with tools in the profile’s native Codex TOML. Chat Completions-only endpoints are unsupported.
 - **Profiles** — run multiple independent Marlow instances with isolated configs, sessions, skills, and memory.
 - **Extensible** — plugins, MCP servers, custom tools, webhook triggers, cron scheduling, and the full Python ecosystem.
 

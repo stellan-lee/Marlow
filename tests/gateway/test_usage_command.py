@@ -31,12 +31,8 @@ def _make_mock_agent(**overrides):
     rl.has_data = True
     agent.get_rate_limit_state.return_value = rl
 
-    # Context compressor
-    ctx = MagicMock()
-    ctx.last_prompt_tokens = 30_000
-    ctx.context_length = 200_000
-    ctx.compression_count = 1
-    agent.context_compressor = ctx
+    agent.context_length = 200_000
+    agent.compression_count = 1
 
     return agent
 
@@ -88,8 +84,8 @@ class TestUsageCachedAgent:
         assert "2,000" in result   # cache write
         assert "50,000" in result  # total
         assert "$0.1234" in result
-        assert "30,000" in result  # context
-        assert "Compressions: 1" in result
+        assert "35,000" in result  # native input usage
+        assert "Codex compactions requested: 1" in result
 
     @pytest.mark.asyncio
     async def test_running_agent_preferred_over_cache(self):
@@ -105,7 +101,7 @@ class TestUsageCachedAgent:
             result = await runner._handle_usage_command(event)
 
         assert "80,000" in result   # running agent's total
-        assert "API calls: 10" in result
+        assert "Codex turns: 10" in result
 
     @pytest.mark.asyncio
     async def test_sentinel_skipped_uses_cache(self):

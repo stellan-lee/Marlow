@@ -52,7 +52,7 @@ steer provider, model, agent, or auth-profile selection. The trust
 gate is fail-closed: a missing config block means "no overrides,"
 not "anything goes."
 
-Backed by :func:`agent.auxiliary_client.call_llm`, which already
+Backed by :func:`agent.codex_tasks.call_llm`, which already
 handles every provider, fallback chain, and per-task override Marlow
 supports.
 """
@@ -570,7 +570,7 @@ def _resolve_attribution(
         provider = provider_override
     else:
         try:
-            from agent.auxiliary_client import _read_main_provider
+            from agent.codex_tasks import _read_main_provider
             provider = (_read_main_provider() or "").strip() or "auto"
         except Exception:  # pragma: no cover — defensive
             provider = "auto"
@@ -582,7 +582,7 @@ def _resolve_attribution(
         model = model_override
     else:
         try:
-            from agent.auxiliary_client import _read_main_model
+            from agent.codex_tasks import _read_main_model
             model = (_read_main_model() or "").strip() or "default"
         except Exception:  # pragma: no cover — defensive
             model = "default"
@@ -929,7 +929,7 @@ class PluginLlm:
         extra_body: Optional[Dict[str, Any]] = None,
     ) -> tuple[str, str, Any]:
         """Invoke the host's ``call_llm``. Lazy-imports
-        ``agent.auxiliary_client`` to avoid circular deps at plugin
+        ``agent.codex_tasks`` to avoid circular deps at plugin
         discovery time."""
         if self._sync_caller is not None:
             return self._sync_caller(
@@ -942,12 +942,13 @@ class PluginLlm:
                 timeout=timeout,
                 extra_body=extra_body,
             )
-        from agent.auxiliary_client import call_llm
+        from agent.codex_tasks import call_llm
         merged_extra = dict(extra_body or {})
         if profile_override:
             merged_extra.setdefault("metadata", {})["auth_profile"] = profile_override
         response = call_llm(
-            task=None,
+            task='plugin:' + self._plugin_id,
+            profile_override=profile_override,
             provider=provider_override,
             model=model_override,
             messages=messages,
@@ -986,12 +987,13 @@ class PluginLlm:
                 timeout=timeout,
                 extra_body=extra_body,
             )
-        from agent.auxiliary_client import async_call_llm
+        from agent.codex_tasks import async_call_llm
         merged_extra = dict(extra_body or {})
         if profile_override:
             merged_extra.setdefault("metadata", {})["auth_profile"] = profile_override
         response = await async_call_llm(
-            task=None,
+            task='plugin:' + self._plugin_id,
+            profile_override=profile_override,
             provider=provider_override,
             model=model_override,
             messages=messages,

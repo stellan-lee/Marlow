@@ -57,7 +57,7 @@ async def test_voice_caption_proceeds_without_voice_attachment():
 async def test_audio_attachment_keeps_file_path_and_caption(message_type, monkeypatch):
     runner = _make_runner()
     event = _event(message_type, "An example track.", path="/tmp/cache_123_my_song.ogg")
-    monkeypatch.setattr("tools.credential_files.to_agent_visible_cache_path", lambda path: path)
+    monkeypatch.setattr(runner, "_stage_runtime_attachment", lambda source, path: path)
 
     result = await runner._prepare_inbound_message_text(
         event=event, source=event.source, history=[]
@@ -71,22 +71,18 @@ async def test_audio_attachment_keeps_file_path_and_caption(message_type, monkey
 @pytest.mark.asyncio
 async def test_mixed_photo_and_audio_attachment_route_independently(monkeypatch):
     runner = _make_runner()
-    runner._decide_image_input_mode = lambda: "text"
-    runner._enrich_message_with_vision = AsyncMock(return_value="Photo description")
     event = _event(MessageType.PHOTO, "Here are two files.")
     event.media_urls = ["/tmp/photo.png", "/tmp/track.ogg"]
     event.media_types = ["image/png", "audio/ogg"]
-    monkeypatch.setattr("tools.credential_files.to_agent_visible_cache_path", lambda path: path)
+    monkeypatch.setattr(runner, "_stage_runtime_attachment", lambda source, path: path)
 
     result = await runner._prepare_inbound_message_text(
         event=event, source=event.source, history=[]
     )
 
-    runner._enrich_message_with_vision.assert_awaited_once_with(
-        "Here are two files.", ["/tmp/photo.png"]
-    )
+    assert list(runner._pending_native_image_paths_by_session.values()) == [["/tmp/photo.png"]]
     assert "/tmp/track.ogg" in result
-    assert "Photo description" in result
+    assert "Here are two files." in result
 
 
 def test_gateway_ignores_retired_stt_config():

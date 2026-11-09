@@ -49,7 +49,7 @@ TIPS = [
     "Set compression.threshold to control automatic context compression.",
     "Set security.website_blocklist.enabled to block domains from web tools.",
     "Set display.platforms for per-gateway presentation overrides.",
-    "Set fallback_providers to fail over between retained model routes.",
+    "Configure the profile Codex model provider in runtime/codex/config.toml.",
     "The gateway supports typing indicators, streaming edits, and progress updates.",
     "Gateway profiles can run as independent services.",
     "Filesystem checkpoints use shadow repositories and never modify project Git history.",

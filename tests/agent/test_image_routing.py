@@ -1,24 +1,18 @@
 """Tests for retained per-turn image routing."""
 from agent.image_routing import (
-    _coerce_capability_bool, _coerce_mode, _explicit_aux_vision_override,
+    _coerce_capability_bool, decide_image_input_mode,
     build_native_content_parts, extract_image_refs,
 )
 
 
-def test_coerce_modes():
-    assert _coerce_mode(" NATIVE ")=="native"
-    assert _coerce_mode("bad")=="auto"
+def test_images_are_attached_to_the_codex_model():
+    assert decide_image_input_mode('fixture', 'model', {}) == 'native'
 
 
 def test_capability_bool_parses_yaml_values():
     assert _coerce_capability_bool("true") is True
     assert _coerce_capability_bool("off") is False
     assert _coerce_capability_bool("maybe") is None
-
-
-def test_custom_aux_vision_endpoint_is_explicit():
-    cfg={"auxiliary":{"vision":{"provider":"custom","base_url":"http://localhost:8080/v1"}}}
-    assert _explicit_aux_vision_override(cfg) is True
 
 
 def test_extract_image_refs_from_media_tags(tmp_path):

@@ -33,18 +33,9 @@ class TestApprovalModeParsing:
 
 
 class TestSmartApproval:
-    def test_smart_approval_uses_call_llm(self):
-        response = SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="APPROVE"))]
-        )
-        with mock_patch("agent.auxiliary_client.call_llm", return_value=response) as mock_call:
-            result = _smart_approve("python -c \"print('hello')\"", "script execution via -c flag")
-
-        assert result == "approve"
-        mock_call.assert_called_once()
-        assert mock_call.call_args.kwargs["task"] == "approval"
-        assert mock_call.call_args.kwargs["temperature"] == 0
-        assert mock_call.call_args.kwargs["max_tokens"] == 16
+    def test_uncertain_operation_requires_human_channel(self):
+        from tools.approval import _smart_approve
+        assert _smart_approve("rm -rf ./data", "delete data") == "escalate"
 
 
 class TestDetectDangerousRm:

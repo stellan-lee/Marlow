@@ -442,21 +442,15 @@ def _read_distribution_meta(profile_dir: Path) -> tuple:
 
 
 def _read_config_model(profile_dir: Path) -> tuple:
-    """Read model/provider from a profile's config.yaml. Returns (model, provider)."""
-    config_path = profile_dir / "config.yaml"
-    if not config_path.exists():
-        return None, None
+    """Read canonical model settings without creating state or touching credentials."""
     try:
-        import yaml
-        with open(config_path, "r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
-        model_cfg = cfg.get("model", {})
-        if isinstance(model_cfg, str):
-            return model_cfg, None
-        if isinstance(model_cfg, dict):
-            return model_cfg.get("default") or model_cfg.get("model"), model_cfg.get("provider")
-        return None, None
-    except Exception:
+        import tomllib
+        path = profile_dir / "runtime" / "codex" / "config.toml"
+        if path.is_symlink():
+            return None, None
+        cfg = tomllib.loads(path.read_text(encoding="utf-8"))
+        return cfg.get("model"), cfg.get("model_provider", "openai")
+    except (OSError, ValueError):
         return None, None
 
 

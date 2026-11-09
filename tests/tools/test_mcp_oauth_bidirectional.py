@@ -33,6 +33,14 @@ import pytest
 
 pytest.importorskip("mcp.client.auth.oauth2", reason="MCP SDK 1.26.0+ required")
 
+@pytest.fixture(autouse=True)
+def no_external_discovery_for_state_tests(monkeypatch):
+    """Discovery has its own fixtures; these contracts inspect stored state."""
+    from unittest.mock import AsyncMock
+    from tools.mcp_oauth_manager import _MARLOW_PROVIDER_CLS
+    monkeypatch.setattr(_MARLOW_PROVIDER_CLS, "_prefetch_oauth_metadata", AsyncMock())
+
+
 
 @pytest.mark.asyncio
 async def test_marlow_provider_forwards_asend_values(tmp_path, monkeypatch):

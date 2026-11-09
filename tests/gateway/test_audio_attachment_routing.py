@@ -1,3 +1,4 @@
+from pathlib import Path
 """Verify that ordinary audio files follow document attachment delivery."""
 
 from types import SimpleNamespace
@@ -52,6 +53,9 @@ def _allowed_media_path(tmp_path, monkeypatch, name):
         "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS",
         (root,),
     )
+    monkeypatch.setattr("marlow_cli.config.load_config", lambda: {
+        "runtime": {"codex": {"project": str(root), "projects": [{"path": str(root), "writable": True}]}}
+    })
     return media_file.resolve()
 
 
@@ -65,9 +69,12 @@ async def test_base_adapter_routes_telegram_flac_media_tag_to_document_sender(tm
 
     await adapter._process_message_background(event, build_session_key(event.source))
 
+    adapter.send_document.assert_awaited_once()
+    frozen = Path(adapter.send_document.call_args.kwargs["file_path"])
+    assert frozen.name == media_file.name and frozen.read_bytes() == media_file.read_bytes()
     adapter.send_document.assert_awaited_once_with(
         chat_id="chat-1",
-        file_path=str(media_file),
+        file_path=str(frozen),
         metadata=None,
     )
 
@@ -82,9 +89,12 @@ async def test_base_adapter_routes_non_voice_telegram_ogg_media_tag_to_document_
 
     await adapter._process_message_background(event, build_session_key(event.source))
 
+    adapter.send_document.assert_awaited_once()
+    frozen = Path(adapter.send_document.call_args.kwargs["file_path"])
+    assert frozen.name == media_file.name and frozen.read_bytes() == media_file.read_bytes()
     adapter.send_document.assert_awaited_once_with(
         chat_id="chat-1",
-        file_path=str(media_file),
+        file_path=str(frozen),
         metadata=None,
     )
 
@@ -101,9 +111,12 @@ async def test_base_adapter_routes_legacy_voice_tagged_audio_to_document_sender(
 
     await adapter._process_message_background(event, build_session_key(event.source))
 
+    adapter.send_document.assert_awaited_once()
+    frozen = Path(adapter.send_document.call_args.kwargs["file_path"])
+    assert frozen.name == media_file.name and frozen.read_bytes() == media_file.read_bytes()
     adapter.send_document.assert_awaited_once_with(
         chat_id="chat-1",
-        file_path=str(media_file),
+        file_path=str(frozen),
         metadata=None,
     )
 
@@ -139,9 +152,12 @@ async def test_streaming_delivery_routes_telegram_flac_media_tag_to_document_sen
         adapter,
     )
 
+    adapter.send_document.assert_awaited_once()
+    frozen = Path(adapter.send_document.call_args.kwargs["file_path"])
+    assert frozen.name == media_file.name and frozen.read_bytes() == media_file.read_bytes()
     adapter.send_document.assert_awaited_once_with(
         chat_id="chat-1",
-        file_path=str(media_file),
+        file_path=str(frozen),
         metadata={"thread_id": "topic-1"},
     )
 
@@ -167,9 +183,12 @@ async def test_streaming_delivery_routes_non_voice_telegram_ogg_media_tag_to_doc
         adapter,
     )
 
+    adapter.send_document.assert_awaited_once()
+    frozen = Path(adapter.send_document.call_args.kwargs["file_path"])
+    assert frozen.name == media_file.name and frozen.read_bytes() == media_file.read_bytes()
     adapter.send_document.assert_awaited_once_with(
         chat_id="chat-1",
-        file_path=str(media_file),
+        file_path=str(frozen),
         metadata={"thread_id": "topic-1"},
     )
 
@@ -195,9 +214,12 @@ async def test_streaming_delivery_routes_telegram_mp3_media_tag_to_document_send
         adapter,
     )
 
+    adapter.send_document.assert_awaited_once()
+    frozen = Path(adapter.send_document.call_args.kwargs["file_path"])
+    assert frozen.name == media_file.name and frozen.read_bytes() == media_file.read_bytes()
     adapter.send_document.assert_awaited_once_with(
         chat_id="chat-1",
-        file_path=str(media_file),
+        file_path=str(frozen),
         metadata={"thread_id": "topic-1"},
     )
 

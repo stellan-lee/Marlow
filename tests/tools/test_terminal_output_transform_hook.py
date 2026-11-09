@@ -191,7 +191,7 @@ def test_terminal_output_transform_integration_with_real_plugin(monkeypatch, tmp
     )
 
     # Force a fresh plugin manager so the new config is picked up.
-    plugins_mod._plugin_manager = plugins_mod.PluginManager()
+    plugins_mod._plugin_managers = {str(__import__("marlow_constants").get_marlow_home().absolute()): plugins_mod.PluginManager()}
     plugins_mod.discover_plugins()
 
     long_output = "X" * 60000

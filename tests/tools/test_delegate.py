@@ -38,10 +38,15 @@ def _make_mock_parent(depth=0):
     parent = MagicMock()
     parent.base_url = "https://openrouter.ai/api/v1"
     parent.api_key="***"
-    parent.provider = "openrouter"
-    parent.api_mode = "chat_completions"
+    parent.provider = "openai"
+    parent.api_mode = "codex_app_server"
     parent.model = "anthropic/claude-sonnet-4"
     parent.platform = "cli"
+    parent._workspace_scope = None
+    parent._conversation_shared = False
+    from agent.codex_environment import CodexEnvironment
+    parent.environment = CodexEnvironment.build()
+    parent.session_cwd = str(parent.environment.workspace)
     parent.providers_allowed = None
     parent.providers_ignored = None
     parent.providers_order = None
@@ -51,6 +56,8 @@ def _make_mock_parent(depth=0):
     parent._active_children = []
     parent._active_children_lock = threading.Lock()
     parent._print_fn = None
+    for name in ('user_id','user_id_alt','user_name','chat_id','chat_type','thread_id','gateway_session_key'):
+        setattr(parent, '_' + name, None)
     parent.tool_progress_callback = None
     parent.thinking_callback = None
     return parent
@@ -343,29 +350,6 @@ class TestDelegateTask(unittest.TestCase):
             delegate_task(goal="Test tracking", parent_agent=parent)
             self.assertEqual(len(parent._active_children), 0)
 
-    def test_child_inherits_runtime_credentials(self):
-        parent = _make_mock_parent(depth=0)
-        parent.base_url = "https://chatgpt.com/backend-api/codex"
-        parent.api_key="***"
-        parent.provider = "openai-codex"
-        parent.api_mode = "codex_responses"
-
-        with patch("run_agent.AIAgent") as MockAgent:
-            mock_child = MagicMock()
-            mock_child.run_conversation.return_value = {
-                "final_response": "ok",
-                "completed": True,
-                "api_calls": 1,
-            }
-            MockAgent.return_value = mock_child
-
-            delegate_task(goal="Test runtime inheritance", parent_agent=parent)
-
-            _, kwargs = MockAgent.call_args
-            self.assertEqual(kwargs["base_url"], parent.base_url)
-            self.assertEqual(kwargs["api_key"], parent.api_key)
-            self.assertEqual(kwargs["provider"], parent.provider)
-            self.assertEqual(kwargs["api_mode"], parent.api_mode)
 
     def test_child_inherits_parent_print_fn(self):
         parent = _make_mock_parent(depth=0)
@@ -847,416 +831,8 @@ class TestBlockedTools(unittest.TestCase):
         self.assertEqual(_MAX_SPAWN_DEPTH_CAP, 3)
 
 
-class TestDelegationCredentialResolution(unittest.TestCase):
-    """Tests for provider:model credential resolution in delegation config."""
-
-    def test_no_provider_returns_none_credentials(self):
-        """When delegation.provider is empty, all credentials are None (inherit parent)."""
-        parent = _make_mock_parent(depth=0)
-        cfg = {"model": "", "provider": ""}
-        creds = _resolve_delegation_credentials(cfg, parent)
-        self.assertIsNone(creds["provider"])
-        self.assertIsNone(creds["base_url"])
-        self.assertIsNone(creds["api_key"])
-        self.assertIsNone(creds["api_mode"])
-        self.assertIsNone(creds["model"])
-
-    def test_model_only_no_provider(self):
-        """When only model is set (no provider), model is returned but credentials are None."""
-        parent = _make_mock_parent(depth=0)
-        cfg = {"model": "google/gemini-3-flash-preview", "provider": ""}
-        creds = _resolve_delegation_credentials(cfg, parent)
-        self.assertEqual(creds["model"], "google/gemini-3-flash-preview")
-        self.assertIsNone(creds["provider"])
-        self.assertIsNone(creds["base_url"])
-        self.assertIsNone(creds["api_key"])
 
 
-
-    def test_direct_endpoint_uses_configured_base_url_and_api_key(self):
-        parent = _make_mock_parent(depth=0)
-        cfg = {
-            "model": "qwen2.5-coder",
-            "provider": "openrouter",
-            "base_url": "http://localhost:1234/v1",
-            "api_key": "local-key",
-        }
-        creds = _resolve_delegation_credentials(cfg, parent)
-        self.assertEqual(creds["model"], "qwen2.5-coder")
-        self.assertEqual(creds["provider"], "custom")
-        self.assertEqual(creds["base_url"], "http://localhost:1234/v1")
-        self.assertEqual(creds["api_key"], "local-key")
-        self.assertEqual(creds["api_mode"], "chat_completions")
-
-    def test_direct_endpoint_explicit_api_mode_overrides_url_detection(self):
-        # Explicit api_mode in config always wins over auto-detection.
-        parent = _make_mock_parent(depth=0)
-        cfg = {
-            "model": "claude-opus-4-6",
-            "provider": "custom",
-            "base_url": "https://myfoundry.services.ai.azure.com/anthropic",
-            "api_key": "foundry-key",
-            "api_mode": "chat_completions",
-        }
-        creds = _resolve_delegation_credentials(cfg, parent)
-        self.assertEqual(creds["api_mode"], "chat_completions")
-
-    def test_direct_endpoint_returns_none_api_key_when_not_configured(self):
-        # When base_url is set without api_key, api_key should be None so
-        # _build_child_agent inherits the parent's key (effective_api_key = override or parent).
-        parent = _make_mock_parent(depth=0)
-        cfg = {
-            "model": "qwen2.5-coder",
-            "base_url": "http://localhost:1234/v1",
-        }
-        with patch.dict(os.environ, {"OPENAI_API_KEY": "env-openai-key"}, clear=False):
-            creds = _resolve_delegation_credentials(cfg, parent)
-        self.assertIsNone(creds["api_key"])
-        self.assertEqual(creds["provider"], "custom")
-
-    def test_direct_endpoint_no_raise_when_only_provider_env_key_present(self):
-        # Even if OPENAI_API_KEY is absent, no ValueError — _build_child_agent uses parent key.
-        parent = _make_mock_parent(depth=0)
-        cfg = {
-            "model": "qwen2.5-coder",
-            "base_url": "http://localhost:1234/v1",
-        }
-        with patch.dict(
-            os.environ,
-            {
-                "OPENROUTER_API_KEY": "env-openrouter-key",
-                "OPENAI_API_KEY": "",
-            },
-            clear=False,
-        ):
-            creds = _resolve_delegation_credentials(cfg, parent)
-        self.assertIsNone(creds["api_key"])
-        self.assertEqual(creds["provider"], "custom")
-
-
-    @patch("marlow_cli.runtime_provider.resolve_runtime_provider")
-    def test_provider_resolution_failure_raises_valueerror(self, mock_resolve):
-        """When provider resolution fails, ValueError is raised with helpful message."""
-        mock_resolve.side_effect = RuntimeError("OPENROUTER_API_KEY not set")
-        parent = _make_mock_parent(depth=0)
-        cfg = {"model": "some-model", "provider": "openrouter"}
-        with self.assertRaises(ValueError) as ctx:
-            _resolve_delegation_credentials(cfg, parent)
-        self.assertIn("openrouter", str(ctx.exception).lower())
-        self.assertIn("Cannot resolve", str(ctx.exception))
-
-    @patch("marlow_cli.runtime_provider.resolve_runtime_provider")
-    def test_provider_resolves_but_no_api_key_raises(self, mock_resolve):
-        """When provider resolves but has no API key, ValueError is raised."""
-        mock_resolve.return_value = {
-            "provider": "openrouter",
-            "base_url": "https://openrouter.ai/api/v1",
-            "api_key": "",
-            "api_mode": "chat_completions",
-        }
-        parent = _make_mock_parent(depth=0)
-        cfg = {"model": "some-model", "provider": "openrouter"}
-        with self.assertRaises(ValueError) as ctx:
-            _resolve_delegation_credentials(cfg, parent)
-        self.assertIn("no API key", str(ctx.exception))
-
-    def test_missing_config_keys_inherit_parent(self):
-        """When config dict has no model/provider keys at all, inherits parent."""
-        parent = _make_mock_parent(depth=0)
-        cfg = {"max_iterations": 45}
-        creds = _resolve_delegation_credentials(cfg, parent)
-        self.assertIsNone(creds["model"])
-        self.assertIsNone(creds["provider"])
-
-    @patch("marlow_cli.runtime_provider.resolve_runtime_provider")
-    def test_named_custom_provider_preserves_provider_name(self, mock_resolve):
-        """Named custom provider (e.g. crof.ai) resolves to 'custom' at runtime level
-        but the subagent must retain the original provider identity so that
-        resolve_provider_client routes to the correct endpoint on retry/fallback.
-        Regression test for #26954.
-        """
-        mock_resolve.return_value = {
-            "provider": "custom",  # runtime marks it as "custom" type
-            "model": "deepseek-v4-pro-CEER",
-            "base_url": "https://api.crof.ai/v1",
-            "api_key": "crof-key-abc",
-            "api_mode": "chat_completions",
-        }
-        parent = _make_mock_parent(depth=0)
-        cfg = {"model": "deepseek-v4-pro-CEER", "provider": "crof.ai"}
-        creds = _resolve_delegation_credentials(cfg, parent)
-        # The key assertion: subagent must keep "crof.ai", NOT "custom"
-        self.assertEqual(creds["provider"], "crof.ai")
-        self.assertEqual(creds["model"], "deepseek-v4-pro-CEER")
-        self.assertEqual(creds["base_url"], "https://api.crof.ai/v1")
-        self.assertEqual(creds["api_key"], "crof-key-abc")
-        # Verify resolve_runtime_provider was called with the configured name
-        mock_resolve.assert_called_once_with(
-            requested="crof.ai", target_model="deepseek-v4-pro-CEER"
-        )
-
-    @patch("marlow_cli.runtime_provider.resolve_runtime_provider")
-    def test_custom_provider_with_empty_configured_provider_falls_back_to_runtime(self, mock_resolve):
-        """When configured_provider is empty/None, the early return kicks in and
-        we return provider=None regardless of what runtime resolved. The runtime
-        path is only reached when configured_provider is a non-empty string.
-        """
-        mock_resolve.return_value = {
-            "provider": "custom",
-            "model": "some-model",
-            "base_url": "https://fallback.example.com/v1",
-            "api_key": "key-fallback",
-            "api_mode": "chat_completions",
-        }
-        parent = _make_mock_parent(depth=0)
-        cfg = {"model": "some-model", "provider": ""}
-        creds = _resolve_delegation_credentials(cfg, parent)
-        # Empty provider → early return with None (child inherits parent)
-        self.assertIsNone(creds["provider"])
-
-    @patch("marlow_cli.runtime_provider.resolve_runtime_provider")
-    def test_runtime_missing_provider_key_returns_none(self, mock_resolve):
-        """When resolve_runtime_provider returns a dict without 'provider' key,
-        the result must be None regardless of configured_provider.
-        This protects against malformed runtime responses.
-        """
-        mock_resolve.return_value = {
-            # deliberately missing "provider"
-            "model": "some-model",
-            "base_url": "https://example.com/v1",
-            "api_key": "key-123",
-            "api_mode": "chat_completions",
-        }
-        parent = _make_mock_parent(depth=0)
-        cfg = {"model": "some-model", "provider": "crof.ai"}
-        creds = _resolve_delegation_credentials(cfg, parent)
-        self.assertIsNone(creds["provider"])
-
-
-class TestDelegationProviderIntegration(unittest.TestCase):
-    """Integration tests: delegation config → _run_single_child → AIAgent construction."""
-
-    @patch("tools.delegate_tool._load_config")
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
-    def test_config_provider_credentials_reach_child_agent(self, mock_creds, mock_cfg):
-        """When delegation.provider is configured, child agent gets resolved credentials."""
-        mock_cfg.return_value = {
-            "max_iterations": 45,
-            "model": "child-model",
-            "provider": "custom-child",
-        }
-        mock_creds.return_value = {
-            "model": "child-model",
-            "provider": "custom-child",
-            "base_url": "https://child.example.com/v1",
-            "api_key": "child-key",
-            "api_mode": "chat_completions",
-        }
-        parent = _make_mock_parent(depth=0)
-
-        with patch("run_agent.AIAgent") as MockAgent:
-            mock_child = MagicMock()
-            mock_child.run_conversation.return_value = {
-                "final_response": "done", "completed": True, "api_calls": 1
-            }
-            MockAgent.return_value = mock_child
-
-            delegate_task(goal="Test provider routing", parent_agent=parent)
-
-            _, kwargs = MockAgent.call_args
-            self.assertEqual(kwargs["model"], "child-model")
-            self.assertEqual(kwargs["provider"], "custom-child")
-            self.assertEqual(kwargs["base_url"], "https://child.example.com/v1")
-            self.assertEqual(kwargs["api_key"], "child-key")
-            self.assertEqual(kwargs["api_mode"], "chat_completions")
-
-    @patch("tools.delegate_tool._load_config")
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
-    def test_cross_provider_delegation(self, mock_creds, mock_cfg):
-        """Subagent switches between two explicitly configured endpoints."""
-        mock_cfg.return_value = {
-            "max_iterations": 45,
-            "model": "child-model",
-            "provider": "custom-child",
-        }
-        mock_creds.return_value = {
-            "model": "child-model",
-            "provider": "custom-child",
-            "base_url": "https://child.example.com/v1",
-            "api_key": "child-key",
-            "api_mode": "chat_completions",
-        }
-        parent = _make_mock_parent(depth=0)
-        parent.provider = "custom-parent"
-        parent.base_url = "https://parent.example.com/v1"
-        parent.api_key = "parent-key"
-
-        with patch("run_agent.AIAgent") as MockAgent:
-            mock_child = MagicMock()
-            mock_child.run_conversation.return_value = {
-                "final_response": "done", "completed": True, "api_calls": 1
-            }
-            MockAgent.return_value = mock_child
-
-            delegate_task(goal="Cross-provider test", parent_agent=parent)
-
-            _, kwargs = MockAgent.call_args
-            self.assertEqual(kwargs["provider"], "custom-child")
-            self.assertEqual(kwargs["base_url"], "https://child.example.com/v1")
-            self.assertEqual(kwargs["api_key"], "child-key")
-            self.assertNotEqual(kwargs["base_url"], parent.base_url)
-            self.assertNotEqual(kwargs["api_key"], parent.api_key)
-
-    @patch("tools.delegate_tool._load_config")
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
-    def test_direct_endpoint_credentials_reach_child_agent(self, mock_creds, mock_cfg):
-        mock_cfg.return_value = {
-            "max_iterations": 45,
-            "model": "qwen2.5-coder",
-            "base_url": "http://localhost:1234/v1",
-            "api_key": "local-key",
-        }
-        mock_creds.return_value = {
-            "model": "qwen2.5-coder",
-            "provider": "custom",
-            "base_url": "http://localhost:1234/v1",
-            "api_key": "local-key",
-            "api_mode": "chat_completions",
-        }
-        parent = _make_mock_parent(depth=0)
-
-        with patch("run_agent.AIAgent") as MockAgent:
-            mock_child = MagicMock()
-            mock_child.run_conversation.return_value = {
-                "final_response": "done", "completed": True, "api_calls": 1
-            }
-            MockAgent.return_value = mock_child
-
-            delegate_task(goal="Direct endpoint test", parent_agent=parent)
-
-            _, kwargs = MockAgent.call_args
-            self.assertEqual(kwargs["model"], "qwen2.5-coder")
-            self.assertEqual(kwargs["provider"], "custom")
-            self.assertEqual(kwargs["base_url"], "http://localhost:1234/v1")
-            self.assertEqual(kwargs["api_key"], "local-key")
-            self.assertEqual(kwargs["api_mode"], "chat_completions")
-
-    @patch("tools.delegate_tool._load_config")
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
-    def test_empty_config_inherits_parent(self, mock_creds, mock_cfg):
-        """When delegation config is empty, child inherits parent credentials."""
-        mock_cfg.return_value = {"max_iterations": 45, "model": "", "provider": ""}
-        mock_creds.return_value = {
-            "model": None,
-            "provider": None,
-            "base_url": None,
-            "api_key": None,
-            "api_mode": None,
-        }
-        parent = _make_mock_parent(depth=0)
-
-        with patch("run_agent.AIAgent") as MockAgent:
-            mock_child = MagicMock()
-            mock_child.run_conversation.return_value = {
-                "final_response": "done", "completed": True, "api_calls": 1
-            }
-            MockAgent.return_value = mock_child
-
-            delegate_task(goal="Test inherit", parent_agent=parent)
-
-            _, kwargs = MockAgent.call_args
-            self.assertEqual(kwargs["model"], parent.model)
-            self.assertEqual(kwargs["provider"], parent.provider)
-            self.assertEqual(kwargs["base_url"], parent.base_url)
-
-    @patch("tools.delegate_tool._load_config")
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
-    def test_credential_error_returns_json_error(self, mock_creds, mock_cfg):
-        """When credential resolution fails, delegate_task returns a JSON error."""
-        mock_cfg.return_value = {"model": "bad-model", "provider": "nonexistent"}
-        mock_creds.side_effect = ValueError(
-            "Cannot resolve delegation provider 'nonexistent': Unknown provider"
-        )
-        parent = _make_mock_parent(depth=0)
-
-        result = json.loads(delegate_task(goal="Should fail", parent_agent=parent))
-        self.assertIn("error", result)
-        self.assertIn("Cannot resolve", result["error"])
-        self.assertIn("nonexistent", result["error"])
-
-    @patch("tools.delegate_tool._load_config")
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
-    def test_batch_mode_all_children_get_credentials(self, mock_creds, mock_cfg):
-        """In batch mode, all children receive the resolved credentials."""
-        mock_cfg.return_value = {
-            "max_iterations": 45,
-            "model": "meta-llama/llama-4-scout",
-            "provider": "openrouter",
-        }
-        mock_creds.return_value = {
-            "model": "meta-llama/llama-4-scout",
-            "provider": "openrouter",
-            "base_url": "https://openrouter.ai/api/v1",
-            "api_key": "sk-or-batch",
-            "api_mode": "chat_completions",
-        }
-        parent = _make_mock_parent(depth=0)
-
-        # Patch _build_child_agent since credentials are now passed there
-        # (agents are built in the main thread before being handed to workers)
-        with patch("tools.delegate_tool._build_child_agent") as mock_build, \
-             patch("tools.delegate_tool._run_single_child") as mock_run:
-            mock_child = MagicMock()
-            mock_build.return_value = mock_child
-            mock_run.return_value = {
-                "task_index": 0, "status": "completed",
-                "summary": "Done", "api_calls": 1, "duration_seconds": 1.0
-            }
-
-            tasks = [{"goal": "Task A"}, {"goal": "Task B"}]
-            delegate_task(tasks=tasks, parent_agent=parent)
-
-            self.assertEqual(mock_build.call_count, 2)
-            for call in mock_build.call_args_list:
-                self.assertEqual(call.kwargs.get("model"), "meta-llama/llama-4-scout")
-                self.assertEqual(call.kwargs.get("override_provider"), "openrouter")
-                self.assertEqual(call.kwargs.get("override_base_url"), "https://openrouter.ai/api/v1")
-                self.assertEqual(call.kwargs.get("override_api_key"), "sk-or-batch")
-                self.assertEqual(call.kwargs.get("override_api_mode"), "chat_completions")
-
-    @patch("tools.delegate_tool._load_config")
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
-    def test_model_only_no_provider_inherits_parent_credentials(self, mock_creds, mock_cfg):
-        """Setting only model (no provider) changes model but keeps parent credentials."""
-        mock_cfg.return_value = {
-            "max_iterations": 45,
-            "model": "google/gemini-3-flash-preview",
-            "provider": "",
-        }
-        mock_creds.return_value = {
-            "model": "google/gemini-3-flash-preview",
-            "provider": None,
-            "base_url": None,
-            "api_key": None,
-            "api_mode": None,
-        }
-        parent = _make_mock_parent(depth=0)
-
-        with patch("run_agent.AIAgent") as MockAgent:
-            mock_child = MagicMock()
-            mock_child.run_conversation.return_value = {
-                "final_response": "done", "completed": True, "api_calls": 1
-            }
-            MockAgent.return_value = mock_child
-
-            delegate_task(goal="Model only test", parent_agent=parent)
-
-            _, kwargs = MockAgent.call_args
-            # Model should be overridden
-            self.assertEqual(kwargs["model"], "google/gemini-3-flash-preview")
-            # But provider/base_url/api_key should inherit from parent
-            self.assertEqual(kwargs["provider"], parent.provider)
-            self.assertEqual(kwargs["base_url"], parent.base_url)
 
 
 class TestChildCredentialPoolResolution(unittest.TestCase):
@@ -2210,12 +1786,6 @@ class TestSubagentApprovalCallback(unittest.TestCase):
             "deny",
         )
 
-    def test_auto_approve_returns_once(self):
-        from tools.delegate_tool import _subagent_auto_approve
-        self.assertEqual(
-            _subagent_auto_approve("rm -rf /tmp/x", "dangerous"),
-            "once",
-        )
 
     @patch("tools.delegate_tool._load_config", return_value={})
     def test_getter_defaults_to_deny(self, _mock_cfg):
@@ -2236,28 +1806,7 @@ class TestSubagentApprovalCallback(unittest.TestCase):
         )
         self.assertIs(_get_subagent_approval_callback(), _subagent_auto_deny)
 
-    @patch(
-        "tools.delegate_tool._load_config",
-        return_value={"subagent_auto_approve": True},
-    )
-    def test_getter_true_is_approve(self, _mock_cfg):
-        from tools.delegate_tool import (
-            _get_subagent_approval_callback,
-            _subagent_auto_approve,
-        )
-        self.assertIs(_get_subagent_approval_callback(), _subagent_auto_approve)
 
-    @patch(
-        "tools.delegate_tool._load_config",
-        return_value={"subagent_auto_approve": "yes"},
-    )
-    def test_getter_truthy_string_is_approve(self, _mock_cfg):
-        """is_truthy_value accepts 'yes'/'1'/'true' as truthy."""
-        from tools.delegate_tool import (
-            _get_subagent_approval_callback,
-            _subagent_auto_approve,
-        )
-        self.assertIs(_get_subagent_approval_callback(), _subagent_auto_approve)
 
     def test_executor_initializer_installs_callback_in_worker(self):
         """The initializer sets the callback on the worker thread's TLS,
@@ -2291,52 +1840,14 @@ class TestSubagentApprovalCallback(unittest.TestCase):
         self.assertIsNone(_get_approval_callback())
 
 
-class TestFallbackModelInheritance(unittest.TestCase):
-    """Subagents must inherit the parent's fallback provider chain."""
-
-    def test_child_inherits_fallback_chain(self):
-        """_build_child_agent passes the parent's fallback provider chain."""
-        parent = _make_mock_parent(depth=0)
-        fallback_entry = {"provider": "openrouter", "model": "gpt-4o-mini", "api_key": "sk-or-x"}
-        parent._fallback_chain = [fallback_entry]
-
-        with patch("run_agent.AIAgent") as MockAgent:
-            MockAgent.return_value = MagicMock()
-            _build_child_agent(
-                task_index=0,
-                goal="test fallback inheritance",
-                context=None,
-                toolsets=None,
-                model=None,
-                max_iterations=10,
-                parent_agent=parent,
-                task_count=1,
-            )
-
-        _, kwargs = MockAgent.call_args
-        self.assertEqual(kwargs["fallback_providers"], [fallback_entry])
-
-    def test_child_gets_no_fallback_when_parent_chain_empty(self):
-        """When the parent fallback chain is empty, fallback_providers is None."""
-        parent = _make_mock_parent(depth=0)
-        parent._fallback_chain = []
-
-        with patch("run_agent.AIAgent") as MockAgent:
-            MockAgent.return_value = MagicMock()
-            _build_child_agent(
-                task_index=0,
-                goal="test no fallback",
-                context=None,
-                toolsets=None,
-                model=None,
-                max_iterations=10,
-                parent_agent=parent,
-                task_count=1,
-            )
-
-        _, kwargs = MockAgent.call_args
-        self.assertIsNone(kwargs["fallback_providers"])
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestNoUnattendedApproval(unittest.TestCase):
+    @patch("tools.delegate_tool._load_config", return_value={"subagent_auto_approve": True})
+    def test_retired_flag_does_not_approve_child_operation(self, _config):
+        from tools.delegate_tool import _get_subagent_approval_callback
+        self.assertEqual(_get_subagent_approval_callback()("rm -rf ./data", "Delete"), "deny")

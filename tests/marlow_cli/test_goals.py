@@ -117,8 +117,8 @@ class TestJudgeGoal:
         from marlow_cli import goals
 
         with patch(
-            "agent.auxiliary_client.get_text_auxiliary_client",
-            return_value=(None, None),
+            "agent.codex_tasks.call_llm",
+            side_effect=RuntimeError("Codex unavailable"),
         ):
             verdict, _, _ = goals.judge_goal("my goal", "my response")
         assert verdict == "continue"
@@ -130,8 +130,8 @@ class TestJudgeGoal:
         fake_client = MagicMock()
         fake_client.chat.completions.create.side_effect = RuntimeError("boom")
         with patch(
-            "agent.auxiliary_client.get_text_auxiliary_client",
-            return_value=(fake_client, "judge-model"),
+            "agent.codex_tasks.call_llm",
+            side_effect=fake_client.chat.completions.create,
         ):
             verdict, reason, _ = goals.judge_goal("goal", "response")
         assert verdict == "continue"
@@ -149,8 +149,8 @@ class TestJudgeGoal:
             ]
         )
         with patch(
-            "agent.auxiliary_client.get_text_auxiliary_client",
-            return_value=(fake_client, "judge-model"),
+            "agent.codex_tasks.call_llm",
+            side_effect=fake_client.chat.completions.create,
         ):
             verdict, reason, _ = goals.judge_goal("goal", "agent response")
         assert verdict == "done"
@@ -168,8 +168,8 @@ class TestJudgeGoal:
             ]
         )
         with patch(
-            "agent.auxiliary_client.get_text_auxiliary_client",
-            return_value=(fake_client, "judge-model"),
+            "agent.codex_tasks.call_llm",
+            side_effect=fake_client.chat.completions.create,
         ):
             verdict, reason, _ = goals.judge_goal("goal", "agent response")
         assert verdict == "continue"
@@ -402,8 +402,8 @@ class TestJudgeParseFailureAutoPause:
         fake_client = MagicMock()
         fake_client.chat.completions.create.side_effect = RuntimeError("connection reset")
         with patch(
-            "agent.auxiliary_client.get_text_auxiliary_client",
-            return_value=(fake_client, "judge-model"),
+            "agent.codex_tasks.call_llm",
+            side_effect=fake_client.chat.completions.create,
         ):
             verdict, _, parse_failed = goals.judge_goal("goal", "response")
         assert verdict == "continue"
@@ -418,8 +418,8 @@ class TestJudgeParseFailureAutoPause:
             choices=[MagicMock(message=MagicMock(content=""))]
         )
         with patch(
-            "agent.auxiliary_client.get_text_auxiliary_client",
-            return_value=(fake_client, "judge-model"),
+            "agent.codex_tasks.call_llm",
+            side_effect=fake_client.chat.completions.create,
         ):
             verdict, _, parse_failed = goals.judge_goal("goal", "response")
         assert verdict == "continue"
@@ -669,10 +669,7 @@ class TestJudgeGoalWithSubgoals:
                           return_value=(_FakeClient, "fake-model"), create=True), \
              patch.object(goals, "get_auxiliary_extra_body",
                           return_value=None, create=True), \
-             patch("agent.auxiliary_client.get_text_auxiliary_client",
-                   return_value=(_FakeClient, "fake-model")), \
-             patch("agent.auxiliary_client.get_auxiliary_extra_body",
-                   return_value=None):
+             patch("agent.codex_tasks.call_llm", side_effect=_FakeClient.chat.completions.create):
             verdict, reason, parse_failed = goals.judge_goal(
                 "ship the feature",
                 "ok shipped",
@@ -708,10 +705,7 @@ class TestJudgeGoalWithSubgoals:
                         captured.update(kwargs)
                         return _FakeResp()
 
-        with patch("agent.auxiliary_client.get_text_auxiliary_client",
-                   return_value=(_FakeClient, "fake-model")), \
-             patch("agent.auxiliary_client.get_auxiliary_extra_body",
-                   return_value=None):
+        with patch("agent.codex_tasks.call_llm", side_effect=_FakeClient.chat.completions.create):
             goals.judge_goal("ship it", "done", subgoals=None)
 
         sent_messages = captured.get("messages") or []

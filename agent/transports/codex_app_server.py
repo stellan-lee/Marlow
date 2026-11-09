@@ -9,9 +9,7 @@ This module is the wire-level speaker only. Higher-level concerns (event
 projection into Marlow' display, approval bridging, transcript projection into
 AIAgent.messages, plugin migration) live in sibling modules.
 
-Status: optional opt-in runtime gated behind `model.openai_runtime ==
-"codex_app_server"`. Marlow' default tool dispatch is unchanged when this
-runtime is not selected.
+All inference uses this transport in a managed profile environment.
 """
 
 from __future__ import annotations
@@ -19,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import signal
 import subprocess
 import threading
 import time
@@ -27,7 +26,7 @@ from typing import Any, Optional
 
 # Default minimum codex version we test against. The PR sets this from the
 # `codex --version` parsed at install time; bumping is a one-line change here.
-MIN_CODEX_VERSION = (0, 125, 0)
+MIN_CODEX_VERSION = (0, 159, 2)
 
 
 @dataclass
@@ -70,21 +69,39 @@ class CodexAppServerClient:
         self,
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
-        extra_args: Optional[list[str]] = None,
+        mcp_servers: Optional[dict] = None,
         env: Optional[dict[str, str]] = None,
+        environment=None,
     ) -> None:
         self._codex_bin = codex_bin
-        spawn_env = os.environ.copy()
-        if env:
-            spawn_env.update(env)
-        if codex_home:
-            spawn_env["CODEX_HOME"] = codex_home
+        from agent.codex_environment import CodexEnvironment
 
-        app_server_args = list(extra_args or [])
+        if env is not None or codex_home is not None:
+            raise ValueError("Use a managed CodexEnvironment, not raw env/CODEX_HOME")
+        self.environment = environment or CodexEnvironment.build()
+        ok, message = check_codex_binary(codex_bin, environment=self.environment.env)
+        if not ok:
+            raise ValueError(message)
+        spawn_env = dict(self.environment.env)
+        cmd = [codex_bin, "app-server", "--stdio", "--strict-config"]
+        import shutil
+        from agent.codex_environment import _toml
+        from pathlib import Path
 
-        cmd = [codex_bin, "app-server"] + app_server_args
-        # Codex emits tracing to stderr; default WARN keeps it quiet for users.
-        spawn_env.setdefault("RUST_LOG", "warn")
+        binary_path = Path(shutil.which(codex_bin) or codex_bin).absolute()
+        overrides = self.environment.overrides()
+        filesystem = overrides["permissions"]["marlow"]["filesystem"]
+        for dependency in {binary_path, binary_path.resolve()}:
+            filesystem[str(dependency)] = "read"
+        cmd += [
+            arg
+            for key, value in overrides.items()
+            for arg in ("-c", f"{key}={_toml(value)}")
+        ]
+        if mcp_servers:
+            if set(mcp_servers) != {"marlow-tools"}:
+                raise ValueError("Only the host-scoped Marlow bridge may be configured")
+            cmd += ["-c", "mcp_servers=" + _toml(mcp_servers)]
 
         self._proc = subprocess.Popen(
             cmd,
@@ -93,12 +110,16 @@ class CodexAppServerClient:
             stderr=subprocess.PIPE,
             bufsize=0,
             env=spawn_env,
+            cwd=str(self.environment.workspace),
+            start_new_session=True,
         )
         self._next_id = 1
+        self._id_lock = threading.Lock()
         self._pending: dict[int, _Pending] = {}
         self._pending_lock = threading.Lock()
-        self._notifications: queue.Queue = queue.Queue()
-        self._server_requests: queue.Queue = queue.Queue()
+        self._write_lock = threading.Lock()
+        self._notifications: queue.Queue = queue.Queue(maxsize=4096)
+        self._server_requests: queue.Queue = queue.Queue(maxsize=128)
         self._stderr_lines: list[str] = []
         self._stderr_lock = threading.Lock()
         self._closed = False
@@ -147,14 +168,23 @@ class CodexAppServerClient:
         except Exception:
             pass
         try:
-            self._proc.terminate()
+            os.killpg(self._proc.pid, signal.SIGTERM)
             self._proc.wait(timeout=timeout)
+        except ProcessLookupError:
+            pass
         except subprocess.TimeoutExpired:
             try:
-                self._proc.kill()
+                os.killpg(self._proc.pid, signal.SIGKILL)
                 self._proc.wait(timeout=1.0)
             except Exception:
                 pass
+
+        for reader in (self._reader, self._stderr_reader):
+            if reader is not threading.current_thread():
+                reader.join(timeout=1)
+        for stream in (self._proc.stdout, self._proc.stderr):
+            if stream:
+                stream.close()
 
     def __enter__(self) -> "CodexAppServerClient":
         return self
@@ -176,8 +206,8 @@ class CodexAppServerClient:
         q: queue.Queue = queue.Queue(maxsize=1)
         with self._pending_lock:
             self._pending[rid] = _Pending(queue=q, method=method)
-        self._send({"id": rid, "method": method, "params": params or {}})
         try:
+            self._send({"id": rid, "method": method, "params": params or {}})
             msg = q.get(timeout=timeout)
         except queue.Empty:
             with self._pending_lock:
@@ -185,6 +215,9 @@ class CodexAppServerClient:
             raise TimeoutError(
                 f"codex app-server method {method!r} timed out after {timeout}s"
             )
+        finally:
+            with self._pending_lock:
+                self._pending.pop(rid, None)
         if "error" in msg:
             err = msg["error"]
             raise CodexAppServerError(
@@ -248,9 +281,10 @@ class CodexAppServerClient:
         # JSON-RPC ids only need to be unique per-connection. A simple
         # monotonically increasing int is the common choice and matches what
         # codex's own clients use.
-        rid = self._next_id
-        self._next_id += 1
-        return rid
+        with self._id_lock:
+            rid = self._next_id
+            self._next_id += 1
+            return rid
 
     def _send(self, obj: dict) -> None:
         if self._closed:
@@ -258,8 +292,9 @@ class CodexAppServerClient:
         if self._proc.stdin is None:
             raise RuntimeError("codex app-server stdin not available")
         try:
-            self._proc.stdin.write((json.dumps(obj) + "\n").encode("utf-8"))
-            self._proc.stdin.flush()
+            with self._write_lock:
+                self._proc.stdin.write((json.dumps(obj) + "\n").encode("utf-8"))
+                self._proc.stdin.flush()
         except (BrokenPipeError, ValueError) as exc:
             raise RuntimeError(
                 f"codex app-server stdin closed unexpectedly: {exc}"
@@ -288,7 +323,26 @@ class CodexAppServerClient:
                 self._dispatch(msg)
         except Exception as exc:
             with self._stderr_lock:
-                self._stderr_lines.append(f"<stdout reader error> {exc}")
+                self._stderr_lines.append(f"<stdout reader error> {type(exc).__name__}")
+            try:
+                self._proc.terminate()
+            except OSError:
+                pass
+
+        finally:
+            with self._pending_lock:
+                pending = list(self._pending.values())
+                self._pending.clear()
+            for request in pending:
+                try:
+                    request.queue.put_nowait({
+                        "error": {
+                            "code": -32000,
+                            "message": "Codex connection closed; operation status requires verification",
+                        }
+                    })
+                except queue.Full:
+                    pass
 
     def _dispatch(self, msg: dict) -> None:
         # Reply (has id + result/error, no method)
@@ -303,11 +357,11 @@ class CodexAppServerClient:
             return
         # Server-initiated request (has id + method)
         if "id" in msg and "method" in msg:
-            self._server_requests.put(msg)
+            self._server_requests.put_nowait(msg)
             return
         # Notification (no id)
         if "method" in msg:
-            self._notifications.put(msg)
+            self._notifications.put_nowait(msg)
 
     def _read_stderr(self) -> None:
         if self._proc.stderr is None:
@@ -317,9 +371,7 @@ class CodexAppServerClient:
                 if not line:
                     break
                 with self._stderr_lock:
-                    self._stderr_lines.append(
-                        line.decode("utf-8", "replace").rstrip()
-                    )
+                    self._stderr_lines.append(line.decode("utf-8", "replace").rstrip())
                     # Bound memory: keep last 500 lines.
                     if len(self._stderr_lines) > 500:
                         self._stderr_lines = self._stderr_lines[-500:]
@@ -339,7 +391,10 @@ def parse_codex_version(output: str) -> Optional[tuple[int, int, int]]:
 
 
 def check_codex_binary(
-    codex_bin: str = "codex", min_version: tuple[int, int, int] = MIN_CODEX_VERSION
+    codex_bin: str = "codex",
+    min_version: tuple[int, int, int] = MIN_CODEX_VERSION,
+    *,
+    environment=None,
 ) -> tuple[bool, str]:
     """Verify codex CLI is installed and meets minimum version.
 
@@ -350,6 +405,7 @@ def check_codex_binary(
             capture_output=True,
             text=True,
             timeout=10,
+            env=environment,
         )
     except FileNotFoundError:
         return False, (
@@ -363,9 +419,9 @@ def check_codex_binary(
     version = parse_codex_version(proc.stdout)
     if version is None:
         return False, f"could not parse codex version from: {proc.stdout!r}"
-    if version < min_version:
+    if version != MIN_CODEX_VERSION:
         return False, (
-            f"codex {'.'.join(map(str, version))} is older than required "
-            f"{'.'.join(map(str, min_version))}. Run: npm i -g @openai/codex"
+            f"Unsupported Codex {'.'.join(map(str, version))}; this release supports "
+            "0.159.2 only. Install: npm i -g @openai/codex@0.159.2"
         )
     return True, ".".join(map(str, version))

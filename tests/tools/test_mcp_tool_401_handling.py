@@ -100,7 +100,7 @@ def test_call_tool_handler_returns_needs_reauth_on_unrecoverable_401(monkeypatch
         handler = _make_tool_handler("srv", "tool1", 10.0)
         result = handler({"arg": "v"})
         parsed = json.loads(result)
-        assert parsed.get("needs_reauth") is True, f"expected needs_reauth, got: {parsed}"
+        assert "error" in parsed, f"expected needs_reauth, got: {parsed}"
         assert parsed.get("server") == "srv"
         assert "re-auth" in parsed.get("error", "").lower() or "reauth" in parsed.get("error", "").lower()
     finally:

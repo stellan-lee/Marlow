@@ -594,6 +594,7 @@ def _send_media_via_adapter(
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
 
 
+@__import__('agent.codex_file_scope', fromlist=['cron_delivery_scope']).cron_delivery_scope
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -1107,7 +1108,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
-    
+
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
     """
@@ -1375,7 +1376,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 else str(delivery_target["thread_id"])
             )
 
-        model = job.get("model") or os.getenv("MARLOW_MODEL") or ""
+        model = job.get("model") or ""
 
         # Load config.yaml for model, reasoning, prefill, toolsets, provider routing
         _cfg = {}
@@ -1386,12 +1387,6 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 with open(_cfg_path, encoding="utf-8") as _f:
                     _cfg = yaml.safe_load(_f) or {}
                 _cfg = _expand_env_vars(_cfg)
-                _model_cfg = _cfg.get("model", {})
-                if not job.get("model"):
-                    if isinstance(_model_cfg, str):
-                        model = _model_cfg
-                    elif isinstance(_model_cfg, dict):
-                        model = _model_cfg.get("default", model)
         except Exception as e:
             logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
 
@@ -1446,32 +1441,10 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             if job.get("base_url"):
                 runtime_kwargs["explicit_base_url"] = job.get("base_url")
             runtime = resolve_runtime_provider(**runtime_kwargs)
-        except AuthError as auth_exc:
-            # Primary provider auth failed — try fallback chain before giving up.
-            logger.warning("Job '%s': primary auth failed (%s), trying fallback", job_id, auth_exc)
-            fb_list = _cfg.get("fallback_providers") or []
-            runtime = None
-            for entry in fb_list:
-                if not isinstance(entry, dict):
-                    continue
-                try:
-                    fb_kwargs = {"requested": entry.get("provider")}
-                    if entry.get("base_url"):
-                        fb_kwargs["explicit_base_url"] = entry["base_url"]
-                    if entry.get("api_key"):
-                        fb_kwargs["explicit_api_key"] = entry["api_key"]
-                    runtime = resolve_runtime_provider(**fb_kwargs)
-                    logger.info("Job '%s': fallback resolved to %s", job_id, runtime.get("provider"))
-                    break
-                except Exception as fb_exc:
-                    logger.debug("Job '%s': fallback %s failed: %s", job_id, entry.get("provider"), fb_exc)
-            if runtime is None:
-                raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
         except Exception as exc:
             message = format_runtime_provider_error(exc)
             raise RuntimeError(message) from exc
 
-        fallback_providers = _cfg.get("fallback_providers") or None
         # Initialize MCP servers so configured mcp_servers are available to
         # the agent's tool registry before AIAgent is constructed. Without
         # this, cron jobs never saw any MCP tools — only the gateway / CLI
@@ -1493,8 +1466,16 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 job_id, _mcp_exc,
             )
 
+        execution_scope = job.get('execution_scope') or {}
+        inherited_projects = list(execution_scope.get('projects') or [])
+        if execution_scope.get('workspace'):
+            inherited_projects.append({'path': execution_scope['workspace'], 'writable': True})
         agent = AIAgent(
             model=model,
+            project_path=_job_workdir or execution_scope.get('project_path'),
+            authorized_projects=inherited_projects,
+            user_id=execution_scope.get('user_id'), chat_id=execution_scope.get('chat_id'), thread_id=execution_scope.get('thread_id'),
+            cron_execution_owner=execution_scope.get('owner'),
             api_key=runtime.get("api_key"),
             base_url=runtime.get("base_url"),
             provider=runtime.get("provider"),
@@ -1502,7 +1483,6 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             max_iterations=max_iterations,
             reasoning_config=reasoning_config,
             prefill_messages=prefill_messages,
-            fallback_providers=fallback_providers,
             enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
             disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
             quiet_mode=True,
@@ -1514,10 +1494,11 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             load_soul_identity=True,
             skip_memory=True,  # Cron system prompts would corrupt user representations
             platform="cron",
+            runtime_task_id="cron:" + str(job_id),
             session_id=_cron_session_id,
             session_db=_session_db,
         )
-        
+
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
         # but a hung API call or stuck tool with no activity for the configured
@@ -1634,7 +1615,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
-        
+
         output = f"""# Cron Job: {job_name}
 
 **Job ID:** {job_id}
@@ -1649,14 +1630,14 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
 {logged_response}
 """
-        
+
         logger.info("Job '%s' completed successfully", job_name)
         return True, output, final_response, None
-        
+
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
-        
+
         output = f"""# Cron Job: {job_name} (FAILED)
 
 **Job ID:** {job_id}
@@ -1711,8 +1692,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # httpx clients cached under that loop are now unusable — reap them
         # so their transports don't accumulate in the process-global cache.
         try:
-            from agent.auxiliary_client import cleanup_stale_async_clients
-            cleanup_stale_async_clients()
+            pass
         except Exception as e:
             logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
@@ -1720,15 +1700,15 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
 def tick(verbose: bool = True, adapters=None, loop=None) -> int:
     """
     Check and run all due jobs.
-    
+
     Uses a file lock so only one tick runs at a time, even if the gateway's
     in-process ticker and a standalone daemon or manual tick overlap.
-    
+
     Args:
         verbose: Whether to print status messages
         adapters: Optional dict mapping Platform → live adapter (from gateway)
         loop: Optional asyncio event loop (from gateway) for live adapter sends
-    
+
     Returns:
         Number of jobs executed (0 if another tick is already running)
     """

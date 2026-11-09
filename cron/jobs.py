@@ -49,13 +49,13 @@ ONESHOT_GRACE_SECONDS = 120
 # as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
 # updated lets an unsafe value (``../escape``, absolute path, nested) leak
 # into output writes/deletes.
-_IMMUTABLE_JOB_FIELDS = frozenset({"id"})
+_IMMUTABLE_JOB_FIELDS = frozenset({"id", "execution_scope"})
 
 
 def _job_output_dir(job_id: str) -> Path:
     """Resolve a job's output directory, rejecting any path-escape attempt.
 
-    Job IDs are filesystem path components under ``OUTPUT_DIR``. A legacy or
+    Job IDs are filesystem path components under ``_output_path()``. A legacy or
     crafted ID containing ``..``, absolute paths, or nested separators would
     allow output writes/deletes to escape the cron output sandbox. Reject
     anything that isn't a single safe path component.
@@ -65,7 +65,7 @@ def _job_output_dir(job_id: str) -> Path:
         raise ValueError(f"Invalid cron job id for output path: {job_id!r}")
     if Path(text).is_absolute() or Path(text).drive:
         raise ValueError(f"Invalid cron job id for output path: {job_id!r}")
-    return OUTPUT_DIR / text
+    return _output_path() / text
 
 
 def _coerce_job_text(value: Any, fallback: str = "") -> str:
@@ -150,10 +150,10 @@ def _secure_file(path: Path):
 
 def ensure_dirs():
     """Ensure cron directories exist with secure permissions."""
-    CRON_DIR.mkdir(parents=True, exist_ok=True)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    _secure_dir(CRON_DIR)
-    _secure_dir(OUTPUT_DIR)
+    _cron_path().mkdir(parents=True, exist_ok=True)
+    _output_path().mkdir(parents=True, exist_ok=True)
+    _secure_dir(_cron_path())
+    _secure_dir(_output_path())
 
 
 # =============================================================================
@@ -163,7 +163,7 @@ def ensure_dirs():
 def parse_duration(s: str) -> int:
     """
     Parse duration string into minutes.
-    
+
     Examples:
         "30m" → 30
         "2h" → 120
@@ -173,10 +173,10 @@ def parse_duration(s: str) -> int:
     match = re.match(r'^(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)$', s)
     if not match:
         raise ValueError(f"Invalid duration: '{s}'. Use format like '30m', '2h', or '1d'")
-    
+
     value = int(match.group(1))
     unit = match.group(2)[0]  # First char: m, h, or d
-    
+
     multipliers = {'m': 1, 'h': 60, 'd': 1440}
     return value * multipliers[unit]
 
@@ -184,13 +184,13 @@ def parse_duration(s: str) -> int:
 def parse_schedule(schedule: str) -> Dict[str, Any]:
     """
     Parse schedule string into structured format.
-    
+
     Returns dict with:
         - kind: "once" | "interval" | "cron"
         - For "once": "run_at" (ISO timestamp)
         - For "interval": "minutes" (int)
         - For "cron": "expr" (cron expression)
-    
+
     Examples:
         "30m"              → once in 30 minutes
         "2h"               → once in 2 hours
@@ -202,7 +202,7 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
     schedule = schedule.strip()
     original = schedule
     schedule_lower = schedule.lower()
-    
+
     # "every X" pattern → recurring interval
     if schedule_lower.startswith("every "):
         duration_str = schedule[6:].strip()
@@ -212,7 +212,7 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
             "minutes": minutes,
             "display": f"every {minutes}m"
         }
-    
+
     # Check for cron expression (5 or 6 space-separated fields)
     # Cron fields: minute hour day month weekday [year]
     parts = schedule.split()
@@ -231,7 +231,7 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
             "expr": schedule,
             "display": schedule
         }
-    
+
     # ISO timestamp (contains T or looks like date)
     if 'T' in schedule or re.match(r'^\d{4}-\d{2}-\d{2}', schedule):
         try:
@@ -248,7 +248,7 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
             }
         except ValueError as e:
             raise ValueError(f"Invalid timestamp '{schedule}': {e}")
-    
+
     # Duration like "30m", "2h", "1d" → one-shot from now
     try:
         minutes = parse_duration(schedule)
@@ -260,7 +260,7 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
         }
     except ValueError:
         pass
-    
+
     raise ValueError(
         f"Invalid schedule '{original}'. Use:\n"
         f"  - Duration: '30m', '2h', '1d' (one-shot)\n"
@@ -401,19 +401,19 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
 def load_jobs() -> List[Dict[str, Any]]:
     """Load all jobs from storage."""
     ensure_dirs()
-    if not JOBS_FILE.exists():
+    if not _jobs_path().exists():
         return []
 
     _strict_retry = False  # track whether we used the strict=False fallback
 
     try:
-        with open(JOBS_FILE, 'r', encoding='utf-8') as f:
+        with open(_jobs_path(), 'r', encoding='utf-8') as f:
             data = json.load(f)
     except json.JSONDecodeError:
         # Retry with strict=False to handle bare control chars in string values
         _strict_retry = True
         try:
-            with open(JOBS_FILE, 'r', encoding='utf-8') as f:
+            with open(_jobs_path(), 'r', encoding='utf-8') as f:
                 data = json.loads(f.read(), strict=False)
         except Exception as e:
             logger.error("Failed to auto-repair jobs.json: %s", e)
@@ -449,14 +449,14 @@ def load_jobs() -> List[Dict[str, Any]]:
 def save_jobs(jobs: List[Dict[str, Any]]):
     """Save all jobs to storage."""
     ensure_dirs()
-    fd, tmp_path = tempfile.mkstemp(dir=str(JOBS_FILE.parent), suffix='.tmp', prefix='.jobs_')
+    fd, tmp_path = tempfile.mkstemp(dir=str(_jobs_path().parent), suffix='.tmp', prefix='.jobs_')
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump({"jobs": jobs, "updated_at": _marlow_now().isoformat()}, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
-        atomic_replace(tmp_path, JOBS_FILE)
-        _secure_file(JOBS_FILE)
+        atomic_replace(tmp_path, _jobs_path())
+        _secure_file(_jobs_path())
     except BaseException:
         try:
             os.unlink(tmp_path)
@@ -671,6 +671,7 @@ def create_job(
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
         "profile": normalized_profile,
+        "execution_scope": copy.deepcopy(__import__("agent.codex_cron_scope", fromlist=["CURRENT"]).CURRENT.get()),
     }
 
     jobs = load_jobs()
@@ -684,7 +685,7 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     """Get a job by ID."""
     jobs = load_jobs()
     for job in jobs:
-        if job["id"] == job_id:
+        if job["id"] == job_id and __import__("agent.codex_cron_scope", fromlist=["visible"]).visible(job):
             return _normalize_job_record(job)
     return None
 
@@ -712,7 +713,8 @@ def resolve_job_ref(ref: str) -> Optional[Dict[str, Any]]:
     """
     if not ref:
         return None
-    jobs = load_jobs()
+    from agent.codex_cron_scope import visible
+    jobs = [job for job in load_jobs() if visible(job)]
     for job in jobs:
         if job["id"] == ref:
             return _normalize_job_record(job)
@@ -729,7 +731,8 @@ def resolve_job_ref(ref: str) -> Optional[Dict[str, Any]]:
 
 def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     """List all jobs, optionally including disabled ones."""
-    jobs = [_normalize_job_record(j) for j in load_jobs()]
+    from agent.codex_cron_scope import visible
+    jobs = [_normalize_job_record(j) for j in load_jobs() if visible(j)]
     if not include_disabled:
         jobs = [j for j in jobs if j.get("enabled", True)]
     return jobs
@@ -738,7 +741,7 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
 def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Update a job by ID, refreshing derived schedule fields when needed."""
     # Block mutation of immutable fields. ``id`` in particular is a filesystem
-    # path component under OUTPUT_DIR — letting an update change it leaks
+    # path component under _output_path() — letting an update change it leaks
     # path-escape values into output writes/deletes.
     bad_fields = _IMMUTABLE_JOB_FIELDS.intersection(updates or {})
     if bad_fields:
@@ -748,7 +751,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
     jobs = load_jobs()
     for i, job in enumerate(jobs):
-        if job["id"] != job_id:
+        if job["id"] != job_id or not __import__("agent.codex_cron_scope", fromlist=["visible"]).visible(job):
             continue
 
         # Validate / normalize workdir if present in updates.  Empty string or
@@ -874,7 +877,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                  delivery_error: Optional[str] = None):
     """
     Mark a job as having been run.
-    
+
     Updates last_run_at, last_status, increments completed count,
     computes next_run_at, and auto-deletes if repeat limit reached.
 
@@ -891,11 +894,11 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
-                
+
                 # Increment completed count
                 if job.get("repeat"):
                     job["repeat"]["completed"] = job["repeat"].get("completed", 0) + 1
-                    
+
                     # Check if we've hit the repeat limit
                     times = job["repeat"].get("times")
                     completed = job["repeat"]["completed"]
@@ -904,7 +907,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         jobs.pop(i)
                         save_jobs(jobs)
                         return
-                
+
                 # Compute next run
                 job["next_run_at"] = compute_next_run(job["schedule"], now)
 
@@ -1080,10 +1083,10 @@ def save_job_output(job_id: str, output: str):
     job_output_dir = _job_output_dir(job_id)
     job_output_dir.mkdir(parents=True, exist_ok=True)
     _secure_dir(job_output_dir)
-    
+
     timestamp = _marlow_now().strftime("%Y-%m-%d_%H-%M-%S")
     output_file = job_output_dir / f"{timestamp}.md"
-    
+
     fd, tmp_path = tempfile.mkstemp(dir=str(job_output_dir), suffix='.tmp', prefix='.output_')
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -1098,5 +1101,17 @@ def save_job_output(job_id: str, output: str):
         except OSError:
             pass
         raise
-    
+
     return output_file
+
+
+_INITIAL_CRON_DIR, _INITIAL_JOBS_FILE, _INITIAL_OUTPUT_DIR = CRON_DIR, JOBS_FILE, OUTPUT_DIR
+
+def _cron_path():
+    return CRON_DIR if CRON_DIR != _INITIAL_CRON_DIR else get_marlow_home() / 'cron'
+
+def _jobs_path():
+    return JOBS_FILE if JOBS_FILE != _INITIAL_JOBS_FILE else _cron_path() / 'jobs.json'
+
+def _output_path():
+    return OUTPUT_DIR if OUTPUT_DIR != _INITIAL_OUTPUT_DIR else _cron_path() / 'output'

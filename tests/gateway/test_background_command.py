@@ -5,6 +5,7 @@ background session) across gateway messenger platforms.
 """
 
 import asyncio
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -264,7 +265,7 @@ class TestRunBackgroundTask:
         content = call_args[1].get("content", call_args[0][1] if len(call_args[0]) > 1 else "")
         assert "Background task complete" in content
         assert "Hello from background!" in content
-        mock_agent_instance.shutdown_memory_provider.assert_called_once()
+        mock_agent_instance.close.assert_called_once()
         mock_agent_instance.close.assert_called_once()
 
     @pytest.mark.asyncio
@@ -306,6 +307,9 @@ class TestRunBackgroundTask:
             with open(_p, "wb") as _fh:
                 _fh.write(b"x")
         # ogg flagged as voice, mp4 video, png image, pdf doc.
+        monkeypatch.setattr("marlow_cli.config.load_config", lambda: {
+            "runtime": {"codex": {"project": _tmpdir, "projects": [{"path": _tmpdir, "writable": True}]}}
+        })
         media = [
             (_ogg, True),
             (_mp4, False),
@@ -335,14 +339,14 @@ class TestRunBackgroundTask:
             await runner._run_background_task("make stuff", source, "bg_test")
 
             mock_adapter.send_video.assert_called_once()
-            assert _os.path.realpath(mock_adapter.send_video.call_args.kwargs["video_path"]) == _os.path.realpath(_mp4)
+            assert Path(mock_adapter.send_video.call_args.kwargs["video_path"]).name == "render.mp4"
             mock_adapter.send_image_file.assert_called_once()
-            assert _os.path.realpath(mock_adapter.send_image_file.call_args.kwargs["image_path"]) == _os.path.realpath(_png)
+            assert Path(mock_adapter.send_image_file.call_args.kwargs["image_path"]).name == "chart.png"
             document_paths = {
-                _os.path.realpath(call.kwargs["file_path"])
+                Path(call.kwargs["file_path"]).name
                 for call in mock_adapter.send_document.call_args_list
             }
-            assert document_paths == {_os.path.realpath(_ogg), _os.path.realpath(_pdf)}
+            assert document_paths == {"clip.ogg", "report.pdf"}
         finally:
             import shutil as _shutil
             _shutil.rmtree(_tmpdir, ignore_errors=True)
@@ -424,7 +428,7 @@ class TestRunBackgroundTask:
             await runner._run_background_task("say hello", source, "bg_test")
 
         mock_adapter.send.assert_called_once()
-        mock_agent_instance.shutdown_memory_provider.assert_called_once()
+        mock_agent_instance.close.assert_called_once()
         mock_agent_instance.close.assert_called_once()
 
     @pytest.mark.asyncio

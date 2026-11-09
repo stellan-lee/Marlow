@@ -8,7 +8,7 @@ This module provides:
 Usage:
     # Start the gateway
     python -m gateway.run
-    
+
     # Or from CLI
     python cli.py --gateway
 """
@@ -42,7 +42,6 @@ from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.async_utils import safe_schedule_threadsafe
 from agent.i18n import t
 from marlow_cli.config import cfg_get
-from marlow_cli.fallback_config import get_fallback_chain
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -885,47 +884,6 @@ if _config_path.exists():
                         os.environ[_env_var] = json.dumps(_val)
                     else:
                         os.environ[_env_var] = str(_val)
-        # Compression config is read directly from config.yaml by run_agent.py
-        # and auxiliary_client.py — no env var bridging needed.
-        # Auxiliary model/direct-endpoint overrides (vision, web_extract,
-        # approval, plus any plugin-registered auxiliary tasks).
-        # Each task has provider/model/base_url/api_key; bridge non-default
-        # values to env vars named AUXILIARY_<KEY_UPPER>_*. The legacy
-        # hard-coded list (vision/web_extract/approval) is replaced by a
-        # dynamic loop so plugin-registered tasks benefit from the same
-        # config→env bridging without core knowing about each one.
-        _auxiliary_cfg = _cfg.get("auxiliary", {})
-        if _auxiliary_cfg and isinstance(_auxiliary_cfg, dict):
-            # Built-in tasks that previously had explicit env-var bridging.
-            # Kept here as the canonical bridged set; plugin tasks are added
-            # below via the plugin auxiliary registry.
-            _aux_bridged_keys = {"vision", "web_extract", "approval"}
-            try:
-                from marlow_cli.plugins import get_plugin_auxiliary_tasks
-                for _entry in get_plugin_auxiliary_tasks():
-                    _aux_bridged_keys.add(_entry["key"])
-            except Exception:
-                # Plugin discovery failure must not break gateway startup;
-                # built-in bridging stays intact.
-                pass
-
-            for _task_key in _aux_bridged_keys:
-                _task_cfg = _auxiliary_cfg.get(_task_key, {})
-                if not isinstance(_task_cfg, dict):
-                    continue
-                _prov = str(_task_cfg.get("provider", "")).strip()
-                _model = str(_task_cfg.get("model", "")).strip()
-                _base_url = str(_task_cfg.get("base_url", "")).strip()
-                _api_key = str(_task_cfg.get("api_key", "")).strip()
-                _upper = _task_key.upper()
-                if _prov and _prov != "auto":
-                    os.environ[f"AUXILIARY_{_upper}_PROVIDER"] = _prov
-                if _model:
-                    os.environ[f"AUXILIARY_{_upper}_MODEL"] = _model
-                if _base_url:
-                    os.environ[f"AUXILIARY_{_upper}_BASE_URL"] = _base_url
-                if _api_key:
-                    os.environ[f"AUXILIARY_{_upper}_API_KEY"] = _api_key
         # config.yaml is the documented, authoritative source for these
         # settings — it unconditionally wins over .env values. Previously
         # the guards below read `if X not in os.environ` and let stale
@@ -1212,95 +1170,11 @@ def _teams_thread_owns_history_command(canonical: str | None) -> bool:
 
 
 def _resolve_runtime_agent_kwargs() -> dict:
-    """Resolve provider credentials for gateway-created AIAgent instances.
-
-    Provider is read from ``config.yaml`` ``model.provider`` (the single
-    source of truth). ``resolve_runtime_provider()`` falls through to env
-    var lookups internally for legacy compatibility, but the gateway does
-    not consult environment variables for behavioral config — config.yaml
-    is authoritative.
-
-    If the primary provider fails with an authentication error, attempt to
-    resolve credentials using the fallback provider chain from config.yaml
-    before giving up.
-    """
-    from marlow_cli.runtime_provider import (
-        resolve_runtime_provider,
-        format_runtime_provider_error,
-    )
-    from marlow_cli.auth import AuthError, is_rate_limited_auth_error
-
-    try:
-        runtime = resolve_runtime_provider()
-    except AuthError as auth_exc:
-        # Distinguish a transient rate-limit/quota cap (credentials are fine,
-        # re-auth cannot help) from a genuine auth failure (expired/revoked
-        # token). Both fall through to the fallback chain, but the log message
-        # must not mislabel a quota exhaustion as an auth failure (#32790).
-        if is_rate_limited_auth_error(auth_exc):
-            logger.warning("Primary provider rate-limited (429): %s — trying fallback", auth_exc)
-        else:
-            logger.warning("Primary provider auth failed: %s — trying fallback", auth_exc)
-        fb_config = _try_resolve_fallback_provider()
-        if fb_config is not None:
-            return fb_config
-        raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
-    except Exception as exc:
-        raise RuntimeError(format_runtime_provider_error(exc)) from exc
-
-    return {
-        "api_key": runtime.get("api_key"),
-        "base_url": runtime.get("base_url"),
-        "provider": runtime.get("provider"),
-        "api_mode": runtime.get("api_mode"),
-    }
-
-
-def _try_resolve_fallback_provider() -> dict | None:
-    """Attempt to resolve credentials from ``fallback_providers``."""
     from marlow_cli.runtime_provider import resolve_runtime_provider
-    try:
-        import yaml as _y
-        cfg_path = _marlow_home / "config.yaml"
-        if not cfg_path.exists():
-            return None
-        with open(cfg_path, encoding="utf-8") as _f:
-            cfg = _y.safe_load(_f) or {}
-        fb_list = get_fallback_chain(cfg)
-        if not fb_list:
-            return None
-        for entry in fb_list:
-            try:
-                explicit_api_key = entry.get("api_key")
-                if not explicit_api_key:
-                    key_env = str(entry.get("key_env") or "").strip()
-                    if key_env:
-                        explicit_api_key = os.getenv(key_env, "").strip() or None
-                runtime = resolve_runtime_provider(
-                    requested=entry.get("provider"),
-                    explicit_base_url=entry.get("base_url"),
-                    explicit_api_key=explicit_api_key,
-                )
-                # Log the literal `provider` key from config, not the resolved
-                # runtime category, preserving the operator's literal name.
-                logger.info(
-                    "Fallback provider resolved: %s model=%s",
-                    entry.get("provider") or runtime.get("provider"),
-                    entry.get("model"),
-                )
-                return {
-                    "api_key": runtime.get("api_key"),
-                    "base_url": runtime.get("base_url"),
-                    "provider": runtime.get("provider"),
-                    "api_mode": runtime.get("api_mode"),
-                    "model": entry.get("model"),
-                }
-            except Exception as fb_exc:
-                logger.debug("Fallback entry %s failed: %s", entry.get("provider"), fb_exc)
-                continue
-    except Exception:
-        pass
-    return None
+    return resolve_runtime_provider()
+
+
+
 
 
 def _build_media_placeholder(event) -> str:
@@ -1530,20 +1404,10 @@ def _load_gateway_runtime_config() -> dict:
     return expanded if isinstance(expanded, dict) else {}
 
 
-def _resolve_gateway_model(config: dict | None = None) -> str:
-    """Read model from config.yaml — single source of truth.
+def _resolve_gateway_model(user_config=None):
+    from marlow_cli.runtime_provider import resolve_runtime_provider
+    return resolve_runtime_provider()['model']
 
-    Without this, temporary AIAgent instances (e.g. /compress) fall
-    back to the hardcoded default which fails when the active provider is
-    openai-codex.
-    """
-    cfg = config if config is not None else _load_gateway_config()
-    model_cfg = cfg.get("model", {})
-    if isinstance(model_cfg, str):
-        return model_cfg
-    elif isinstance(model_cfg, dict):
-        return model_cfg.get("default") or model_cfg.get("model") or ""
-    return ""
 
 
 def _resolve_marlow_bin() -> Optional[list[str]]:
@@ -1864,7 +1728,6 @@ class GatewayRunner:
         self._busy_input_mode = self._load_busy_input_mode()
         self._busy_text_mode = self._load_busy_text_mode()
         self._restart_drain_timeout = self._load_restart_drain_timeout()
-        self._fallback_providers = self._load_fallback_providers()
 
         # Wire process registry into session store for reset protection
         from tools.process_registry import process_registry
@@ -1888,7 +1751,7 @@ class GatewayRunner:
         self._restart_command_source: Optional[SessionSource] = None
         self._stop_task: Optional[asyncio.Task] = None
         self._mcp_http_server = None
-        
+
         # Track running agents per session for interrupt support
         # Key: session_key, Value: AIAgent instance
         self._running_agents: Dict[str, Any] = {}
@@ -2063,7 +1926,7 @@ class GatewayRunner:
         # Runtime group grants managed by trusted platform administrators.
         from gateway.group_access import GroupAccessStore
         self.group_access_store = GroupAccessStore()
-        
+
         # Event hook system
         from gateway.hooks import HookRegistry
         self.hooks = HookRegistry()
@@ -2594,115 +2457,14 @@ class GatewayRunner:
                 return None
         return None
 
-    def _resolve_session_agent_runtime(
-        self,
-        *,
-        source: Optional[SessionSource] = None,
-        session_key: Optional[str] = None,
-        user_config: Optional[dict] = None,
-    ) -> tuple[str, dict]:
-        """Resolve model/runtime for a session, honoring session-scoped /model overrides.
+    def _resolve_session_agent_runtime(self, *, source=None, session_key=None, user_config=None):
+        from marlow_cli.runtime_provider import resolve_runtime_provider
+        runtime = resolve_runtime_provider()
+        key = session_key or (self._session_key_for_source(source) if source else None)
+        override = self._session_model_overrides.get(key, {}) if key else {}
+        model = runtime.pop('model', '')
+        return override.get('model') or model, runtime
 
-        If the session override already contains a complete provider bundle
-        (provider/api_key/base_url/api_mode), prefer it directly instead of
-        resolving fresh global runtime state first.
-        """
-        resolved_session_key = session_key
-        if not resolved_session_key and source is not None:
-            try:
-                resolved_session_key = self._session_key_for_source(source)
-            except Exception:
-                resolved_session_key = None
-
-        model = _resolve_gateway_model(user_config)
-        if getattr(self, "_stateless_teams_thread_run", False):
-            resolved_session_key = None
-        override = self._session_model_overrides.get(resolved_session_key) if resolved_session_key else None
-        if override:
-            override_model = override.get("model", model)
-            override_runtime = {
-                "provider": override.get("provider"),
-                "api_key": override.get("api_key"),
-                "base_url": override.get("base_url"),
-                "api_mode": override.get("api_mode"),
-            }
-            if override_runtime.get("api_key"):
-                logger.debug(
-                    "Session model override (fast): session=%s config_model=%s -> override_model=%s provider=%s",
-                    resolved_session_key or "", model, override_model,
-                    override_runtime.get("provider"),
-                )
-                return override_model, override_runtime
-            # Override exists but has no api_key — fall through to env-based
-            # resolution and apply model/provider from the override on top.
-            logger.debug(
-                "Session model override (no api_key, fallback): session=%s config_model=%s override_model=%s",
-                resolved_session_key or "", model, override_model,
-            )
-        else:
-            logger.debug(
-                "No session model override: session=%s config_model=%s override_keys=%s",
-                resolved_session_key or "", model,
-                list(self._session_model_overrides.keys())[:5] if self._session_model_overrides else "[]",
-            )
-
-        runtime_kwargs = _resolve_runtime_agent_kwargs()
-        runtime_model = runtime_kwargs.pop("model", None)
-        if runtime_model:
-            logger.info(
-                "Runtime provider supplied explicit model override: %s -> %s",
-                model,
-                runtime_model,
-            )
-            model = runtime_model
-        if override and resolved_session_key:
-            model, runtime_kwargs = self._apply_session_model_override(
-                resolved_session_key, model, runtime_kwargs
-            )
-
-        # When the config has no model.default but a provider was resolved
-        # (e.g. user ran `marlow auth add openai-codex` without `marlow model`),
-        # fall back to the provider's first catalog model so the API call
-        # doesn't fail with "model must be a non-empty string".
-        if not model and runtime_kwargs.get("provider"):
-            try:
-                from marlow_cli.models import get_default_model_for_provider
-                model = get_default_model_for_provider(runtime_kwargs["provider"])
-                if model:
-                    logger.info(
-                        "No model configured — defaulting to %s for provider %s",
-                        model, runtime_kwargs["provider"],
-                    )
-            except Exception:
-                pass
-
-        # Final safety net (#35314): if resolution still produced an empty
-        # model — e.g. a transient config-cache miss during a post-interrupt
-        # recovery turn returned an empty user_config — reuse the last model we
-        # successfully resolved for this session (or, failing that, the most
-        # recent one resolved process-wide). Building an agent with model=""
-        # makes every API call fail HTTP 400 "No models provided" and the
-        # session goes silent until the user manually re-sends. ``getattr``
-        # guards against bare test runners built via ``object.__new__``.
-        _last_good = getattr(self, "_last_resolved_model", None)
-        if _last_good is not None:
-            if not model:
-                _recovered = _last_good.get(resolved_session_key or "") or _last_good.get("*")
-                if _recovered:
-                    logger.warning(
-                        "Empty model resolved for session=%s — recovering "
-                        "last-known-good model %s (config read likely returned "
-                        "empty; see #35314)",
-                        resolved_session_key or "", _recovered,
-                    )
-                    model = _recovered
-            elif model:
-                # Cache the good resolution for future recovery turns.
-                if resolved_session_key:
-                    _last_good[resolved_session_key] = model
-                _last_good["*"] = model
-
-        return model, runtime_kwargs
 
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
         """Build the effective model/runtime config for a single turn.
@@ -3041,7 +2803,7 @@ class GatewayRunner:
     @staticmethod
     def _load_prefill_messages() -> List[Dict[str, Any]]:
         """Load ephemeral prefill messages from config or env var.
-        
+
         Checks MARLOW_PREFILL_MESSAGES_FILE env var first, then falls back to
         the prefill_messages_file key in ~/.marlow/config.yaml.
         Relative paths are resolved from ~/.marlow/.
@@ -3072,7 +2834,7 @@ class GatewayRunner:
     @staticmethod
     def _load_ephemeral_system_prompt() -> str:
         """Load ephemeral system prompt from config or env var.
-        
+
         Checks MARLOW_EPHEMERAL_SYSTEM_PROMPT env var first, then falls back to
         agent.system_prompt in ~/.marlow/config.yaml.
         """
@@ -3139,8 +2901,6 @@ class GatewayRunner:
                 resolved_session_key = None
 
         overrides = getattr(self, "_session_reasoning_overrides", {}) or {}
-        if getattr(self, "_stateless_teams_thread_run", False):
-            resolved_session_key = None
         if resolved_session_key and resolved_session_key in overrides:
             return overrides[resolved_session_key]
         return self._load_reasoning_config()
@@ -3240,24 +3000,6 @@ class GatewayRunner:
             return "all"
         return mode
 
-    @staticmethod
-    def _load_fallback_providers() -> list | None:
-        """Load fallback provider chain from config.yaml.
-
-        Returns the canonical ``fallback_providers`` chain.
-        """
-        try:
-            import yaml as _y
-            cfg_path = _marlow_home / "config.yaml"
-            if cfg_path.exists():
-                with open(cfg_path, encoding="utf-8") as _f:
-                    cfg = _y.safe_load(_f) or {}
-                fb = get_fallback_chain(cfg)
-                if fb:
-                    return fb
-        except Exception:
-            pass
-        return None
 
     def _snapshot_running_agents(self) -> Dict[str, Any]:
         return {
@@ -3845,8 +3587,7 @@ class GatewayRunner:
         # any entries whose event loop is now dead so their httpx transports do
         # not accumulate across gateway turns.
         try:
-            from agent.auxiliary_client import cleanup_stale_async_clients
-            cleanup_stale_async_clients()
+            pass
         except Exception:
             pass
 
@@ -4117,72 +3858,8 @@ class GatewayRunner:
     )
 
     def _schedule_resume_pending_sessions(self) -> int:
-        """Auto-continue fresh restart-interrupted sessions after startup.
-
-        ``resume_pending`` already preserves the transcript AND the existing
-        ``_is_resume_pending`` branch in ``_handle_message_with_agent``
-        injects a reason-aware recovery system note on the next turn.  This
-        method closes the UX gap by synthesizing that next turn once
-        adapters are back online — the event text is empty so the existing
-        injection path owns the wording and we never double up.
-
-        Adapters that are not yet ready (adapter missing from
-        ``self.adapters``) are skipped silently; their sessions stay
-        ``resume_pending`` and will auto-resume on the next real user
-        message, or on the next gateway startup.
-        """
-        window = _auto_continue_freshness_window()
-        try:
-            with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
-                self.session_store._ensure_loaded_locked()  # noqa: SLF001
-                candidates = [
-                    entry for entry in self.session_store._entries.values()  # noqa: SLF001
-                    if entry.resume_pending
-                    and not entry.suspended
-                    and entry.origin is not None
-                    and entry.resume_reason in self._AUTO_RESUME_REASONS
-                ]
-        except Exception as exc:
-            logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
-            return 0
-
-        now = datetime.now()
-        scheduled = 0
-        for entry in candidates:
-            marker = entry.last_resume_marked_at or entry.updated_at
-            if marker is not None and (now - marker).total_seconds() > window:
-                continue
-
-            source = entry.origin
-            adapter = self.adapters.get(source.platform)
-            if adapter is None:
-                logger.debug(
-                    "Skipping auto-resume for %s: adapter not ready for %s",
-                    entry.session_key,
-                    getattr(source.platform, "value", source.platform),
-                )
-                continue
-
-            # Empty-text internal event — the _is_resume_pending branch in
-            # _handle_message_with_agent prepends the proper reason-aware
-            # system note before the turn runs.
-            event = MessageEvent(
-                text="",
-                message_type=MessageType.TEXT,
-                source=source,
-                internal=True,
-            )
-            task = asyncio.create_task(adapter.handle_message(event))
-            self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
-            scheduled += 1
-
-        if scheduled:
-            logger.info(
-                "Scheduled auto-resume for %d restart-interrupted session(s)",
-                scheduled,
-            )
-        return scheduled
+        """Retain interrupted state for verification; never replay writes on boot."""
+        return 0
 
     async def _start_managed_mcp_server(self) -> None:
         """Start the config-enabled MCP HTTP service and verify its bind."""
@@ -4214,7 +3891,7 @@ class GatewayRunner:
     async def start(self) -> bool:
         """
         Start the gateway and all configured platform adapters.
-        
+
         Returns True if at least one adapter connected successfully.
         """
         logger.info("Starting Marlow Gateway...")
@@ -4316,7 +3993,7 @@ class GatewayRunner:
                 "security advisory check failed at gateway startup",
                 exc_info=True,
             )
-        
+
         # Warn if no user allowlists are configured and open access is not opted in
         _builtin_allowed_vars = (
             "TELEGRAM_ALLOWED_USERS", "DISCORD_ALLOWED_USERS",
@@ -4362,7 +4039,7 @@ class GatewayRunner:
                 "Set GATEWAY_ALLOW_ALL_USERS=true in ~/.marlow/.env to allow open access, "
                 "or configure platform allowlists (e.g., TELEGRAM_ALLOWED_USERS=your_id)."
             )
-        
+
         # Discover Python plugins before shell hooks so plugin block
         # decisions take precedence in tie cases.  The CLI startup path
         # does this via an explicit call in marlow_cli/main.py; the
@@ -4399,7 +4076,7 @@ class GatewayRunner:
         # Discover and load event hooks
         self.hooks.discover_and_load()
 
-        
+
         # Recover background processes from checkpoint (crash recovery)
         try:
             from tools.process_registry import process_registry
@@ -4448,13 +4125,13 @@ class GatewayRunner:
         enabled_platform_count = 0
         startup_nonretryable_errors: list[str] = []
         startup_retryable_errors: list[str] = []
-        
+
         # Initialize and connect each configured platform
         for platform, platform_config in self.config.platforms.items():
             if not platform_config.enabled:
                 continue
             enabled_platform_count += 1
-            
+
             adapter = self._create_adapter(platform, platform_config)
             if not adapter:
                 # Distinguish between missing builtin deps and missing plugin
@@ -4469,7 +4146,7 @@ class GatewayRunner:
                 else:
                     logger.warning("No adapter available for %s", _pval)
                 continue
-            
+
             # Set up message + fatal error handlers
             adapter.set_message_handler(self._handle_message)
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
@@ -4477,7 +4154,7 @@ class GatewayRunner:
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
             adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
             adapter._busy_text_mode = self._busy_text_mode
-            
+
             # Try to connect
             logger.info("Connecting to %s...", platform.value)
             self._update_platform_runtime_status(
@@ -4566,7 +4243,7 @@ class GatewayRunner:
                     "attempts": 1,
                     "next_retry": time.monotonic() + 30,
                 }
-        
+
         if connected_count == 0:
             if startup_nonretryable_errors:
                 reason = "; ".join(startup_nonretryable_errors)
@@ -4618,7 +4295,7 @@ class GatewayRunner:
             else:
                 logger.warning("No messaging platforms enabled.")
                 logger.info("Gateway will continue running for cron job execution.")
-        
+
         # The HTTP MCP endpoint is an explicitly enabled gateway service.  A
         # bad token, invalid bind, or occupied port is a startup failure rather
         # than a silently degraded integration.
@@ -4644,7 +4321,7 @@ class GatewayRunner:
         self.delivery_router.adapters = self.adapters
         self._running = True
         self._update_runtime_status("running")
-        
+
         # Emit gateway:startup hook
         hook_count = len(self.hooks.loaded_hooks)
         if hook_count:
@@ -4652,10 +4329,10 @@ class GatewayRunner:
         await self.hooks.emit("gateway:startup", {
             "platforms": [p.value for p in self.adapters.keys()],
         })
-        
+
         if connected_count > 0:
             logger.info("Gateway running with %s platform(s)", connected_count)
-        
+
         # Build initial channel directory for send_message name resolution
         try:
             from gateway.channel_directory import build_channel_directory
@@ -4664,7 +4341,7 @@ class GatewayRunner:
             logger.info("Channel directory built: %d target(s)", ch_count)
         except Exception as e:
             logger.warning("Channel directory build failed: %s", e)
-        
+
         # Check if we're restarting after a /update command. If the update is
         # still running, keep watching so we notify once it actually finishes.
         notified = await self._send_update_notification()
@@ -4750,7 +4427,7 @@ class GatewayRunner:
         asyncio.create_task(self._async_delegation_watcher())
 
         logger.info("Press Ctrl+C to stop")
-        
+
         return True
 
     async def _handoff_watcher(self, interval: float = 2.0) -> None:
@@ -5600,8 +5277,7 @@ class GatewayRunner:
             # async httpx transports until they hit EMFILE on macOS's default
             # RLIMIT_NOFILE=256.  See #14210.
             try:
-                from agent.auxiliary_client import shutdown_cached_clients
-                shutdown_cached_clients()
+                pass
             except Exception as _e:
                 logger.debug("shutdown_cached_clients error: %s", _e)
 
@@ -5696,8 +5372,8 @@ class GatewayRunner:
         await self._shutdown_event.wait()
 
     def _create_adapter(
-        self, 
-        platform: Platform, 
+        self,
+        platform: Platform,
         config: Any
     ) -> Optional[BasePlatformAdapter]:
         """Create the appropriate adapter for a platform.
@@ -5768,7 +5444,7 @@ class GatewayRunner:
                 _notify_mode = "important"
             adapter._notifications_mode = _notify_mode
             return adapter
-        
+
         elif platform == Platform.SLACK:
             from gateway.platforms.slack import SlackAdapter, check_slack_requirements
             if not check_slack_requirements():
@@ -5828,7 +5504,7 @@ class GatewayRunner:
     def _is_user_authorized(self, source: SessionSource) -> bool:
         """
         Check if a user is authorized to use the bot.
-        
+
         Checks in order:
         1. Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)
         2. Environment variable allowlists (TELEGRAM_ALLOWED_USERS, etc.)
@@ -6161,10 +5837,11 @@ class GatewayRunner:
             and _command_from_text(event.text) == "access"
         )
 
+    @__import__('agent.codex_file_scope', fromlist=['gateway_delivery_scope']).gateway_delivery_scope
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
-        
+
         This is the core message processing pipeline:
         1. Check user authorization
         2. Check for commands (/new, /reset, etc.)
@@ -6324,7 +6001,7 @@ class GatewayRunner:
         thread_lane_key = None
         if stateless_thread:
             thread_lane_key = _canonical_teams_thread_lane(stateless_thread_snapshot)
-        
+
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
         # forwarded it to the user; now the user's reply goes back via
@@ -6719,12 +6396,6 @@ class GatewayRunner:
             if _cmd_def_inner and _cmd_def_inner.name == "model":
                 return "Agent is running — wait or /stop first, then switch models."
 
-            # /codex-runtime must not be used while the agent is running.
-            # Switching mid-turn would split a turn across two transports.
-            if _cmd_def_inner and _cmd_def_inner.name == "codex-runtime":
-                return ("Agent is running — wait or /stop first, then "
-                        "change runtime.")
-
             # /approve and /deny must bypass the running-agent interrupt path.
             # The agent thread is blocked on a threading.Event inside
             # tools/approval.py — sending an interrupt won't unblock it.
@@ -7032,7 +6703,7 @@ class GatewayRunner:
 
         if canonical == "topic":
             return await self._handle_topic_command(event)
-        
+
         if canonical == "help":
             return await self._handle_help_command(event)
 
@@ -7042,7 +6713,7 @@ class GatewayRunner:
 
         if canonical == "commands":
             return await self._handle_commands_command(event)
-        
+
         if canonical == "profile":
             return await self._handle_profile_command(event)
 
@@ -7063,10 +6734,10 @@ class GatewayRunner:
 
         if canonical == "restart":
             return await self._handle_restart_command(event)
-        
+
         if canonical == "stop":
             return await self._handle_stop_command(event)
-        
+
         if canonical == "reasoning":
             return await self._handle_reasoning_command(event)
 
@@ -7107,13 +6778,11 @@ class GatewayRunner:
         if canonical == "model":
             return await self._handle_model_command(event)
 
-        if canonical == "codex-runtime":
-            return await self._handle_codex_runtime_command(event)
 
 
         if canonical == "retry":
             return await self._handle_retry_command(event)
-        
+
         if canonical == "undo":
             async def _do_undo():
                 return await self._handle_undo_command(event)
@@ -7136,7 +6805,7 @@ class GatewayRunner:
                 detail=_undo_detail,
                 execute=_do_undo,
             )
-        
+
         if canonical == "sethome":
             return await self._handle_set_home_command(event)
 
@@ -7339,7 +7008,7 @@ class GatewayRunner:
                         )
             except Exception as e:
                 logger.debug("Skill command check failed (non-fatal): %s", e)
-        
+
         # Pending exec approvals are handled by /approve and /deny commands above.
         # No bare text matching — "yes" in normal conversation must not trigger
         # execution of a dangerous command.
@@ -7481,29 +7150,11 @@ class GatewayRunner:
                     audio_file_paths.append(path)
 
             if image_paths:
-                # Decide routing: native (attach pixels) vs text (vision_analyze
-                # pre-run + prepend description).  See agent/image_routing.py.
-                _img_mode = self._decide_image_input_mode()
-                if _img_mode == "native":
-                    # Defer attachment to the run_conversation call site.
-                    pending_native = getattr(self, "_pending_native_image_paths_by_session", None)
-                    if pending_native is None:
-                        pending_native = {}
-                        self._pending_native_image_paths_by_session = pending_native
-                    pending_native[session_key] = list(image_paths)
-                    logger.info(
-                        "Image routing: native (model supports vision). %d image(s) will be attached inline.",
-                        len(image_paths),
-                    )
-                else:
-                    logger.info(
-                        "Image routing: text (mode=%s). Pre-analyzing %d image(s) via vision_analyze.",
-                        _img_mode, len(image_paths),
-                    )
-                    message_text = await self._enrich_message_with_vision(
-                        message_text,
-                        image_paths,
-                    )
+                pending_native = getattr(self, "_pending_native_image_paths_by_session", None)
+                if pending_native is None:
+                    pending_native = {}
+                    self._pending_native_image_paths_by_session = pending_native
+                pending_native[session_key] = list(image_paths)
 
         if audio_file_paths:
             from tools.credential_files import to_agent_visible_cache_path as _to_agent_path
@@ -7512,7 +7163,7 @@ class GatewayRunner:
                 _parts = _basename.split("_", 2)
                 _display = _parts[2] if len(_parts) >= 3 else _basename
                 _display = re.sub(r'[^\w.\- ]', '_', _display)
-                _agent_path = _to_agent_path(_apath)
+                _agent_path = self._stage_runtime_attachment(source, _apath)
                 _note = (
                     f"[The user sent an audio file attachment: '{_display}'. "
                     f"It is saved at: {_agent_path}.]"
@@ -7545,7 +7196,7 @@ class GatewayRunner:
                 # Translate host cache path to in-container path if running under Docker backend.
                 # This ensures the agent receives a path it can open inside its sandbox, as the
                 # cache directories are auto-mounted at /root/.marlow/cache/* by get_cache_directory_mounts().
-                agent_path = to_agent_visible_cache_path(path)
+                agent_path = self._stage_runtime_attachment(source, path)
 
                 if mtype.startswith("text/"):
                     context_note = (
@@ -7574,26 +7225,13 @@ class GatewayRunner:
         if "@" in message_text:
             try:
                 from agent.context_references import preprocess_context_references_async
-                from agent.model_metadata import get_model_context_length
-
-                _msg_cwd = os.environ.get("TERMINAL_CWD", os.path.expanduser("~"))
-                _msg_runtime = _resolve_runtime_agent_kwargs()
-                _msg_config_ctx = None
-                try:
-                    _msg_cfg = _load_gateway_config()
-                    _msg_model_cfg = _msg_cfg.get("model", {})
-                    if isinstance(_msg_model_cfg, dict):
-                        _msg_raw_ctx = _msg_model_cfg.get("context_length")
-                        if _msg_raw_ctx is not None:
-                            _msg_config_ctx = int(_msg_raw_ctx)
-                except Exception:
-                    pass
-                _msg_ctx_len = get_model_context_length(
-                    self._model,
-                    base_url=self._base_url or _msg_runtime.get("base_url") or "",
-                    api_key=_msg_runtime.get("api_key") or "",
-                    config_context_length=_msg_config_ctx,
-                )
+                from agent.codex_environment import managed_environment
+                environment = self._conversation_codex_environment(source)
+                selected = ((self.config if isinstance(self.config, dict) else {}) .get('runtime') or {}).get('codex', {}).get('project')
+                _msg_cwd = str(environment.workspace)
+                if selected and any(Path(selected).resolve() == Path(path) or Path(selected).resolve().is_relative_to(Path(path)) for path, _ in environment.projects):
+                    _msg_cwd = str(Path(selected).resolve())
+                _msg_ctx_len = environment.config.get('model_context_window')
                 _ctx_result = await preprocess_context_references_async(
                     message_text,
                     cwd=_msg_cwd,
@@ -7614,6 +7252,33 @@ class GatewayRunner:
                 logger.debug("@ context reference expansion failed: %s", exc)
 
         return message_text
+
+    @staticmethod
+    def _conversation_codex_environment(source):
+        from agent.codex_environment import gateway_environment
+        return gateway_environment(source)
+
+    @classmethod
+    def _stage_runtime_attachment(cls, source, raw):
+        """Only explicit received attachments enter this conversation workspace."""
+        import shutil
+        import stat
+        import uuid
+        path = Path(raw)
+        if path.is_symlink() or not path.is_file():
+            raise ValueError('Attachment must be a regular received file')
+        if not stat.S_ISREG(path.stat().st_mode) or path.stat().st_size > 100 * 1024 * 1024:
+            raise ValueError('Attachment exceeds the 100 MiB runtime staging limit')
+        environment = cls._conversation_codex_environment(source)
+        inbox = environment.workspace / 'inbox'
+        if inbox.is_symlink():
+            raise PermissionError('Attachment inbox must not be a symlink')
+        inbox.mkdir(mode=0o700, exist_ok=True)
+        target = inbox / (uuid.uuid4().hex + '-' + path.name)
+        with path.open('rb') as incoming, target.open('xb') as outgoing:
+            shutil.copyfileobj(incoming, outgoing)
+        target.chmod(0o600)
+        return str(target)
 
     def _consume_pending_native_image_paths(self, session_key: str) -> List[str]:
         pending_native = getattr(self, "_pending_native_image_paths_by_session", None)
@@ -7874,345 +7539,8 @@ class GatewayRunner:
                 ):
                     history = []
 
-            # -----------------------------------------------------------------
-            # Session hygiene: auto-compress pathologically large transcripts
-            #
-            # Long-lived gateway sessions can accumulate enough history that
-            # every new message rehydrates an oversized transcript, causing
-            # repeated truncation/context failures.  Detect this early and
-            # compress proactively — before the agent even starts.  (#628)
-            #
-            # Token source priority:
-            # 1. Actual API-reported prompt_tokens from the last turn
-            #    (stored in session_entry.last_prompt_tokens)
-            # 2. Rough char-based estimate (str(msg)//4). Overestimates
-            #    by 30-50% on code/JSON-heavy sessions, but that just
-            #    means hygiene fires a bit early — safe and harmless.
-            # -----------------------------------------------------------------
-            if history and len(history) >= 4:
-                from agent.model_metadata import (
-                    estimate_messages_tokens_rough,
-                    get_model_context_length,
-                )
-
-                # Read model + compression config from config.yaml.
-                # NOTE: hygiene threshold is intentionally HIGHER than the agent's
-                # own compressor (0.85 vs 0.50).  Hygiene is a safety net for
-                # sessions that grew too large between turns — it fires pre-agent
-                # to prevent API failures.  The agent's own compressor handles
-                # normal context management during its tool loop with accurate
-                # real token counts.  Having hygiene at 0.50 caused premature
-                # compression on every turn in long gateway sessions.
-                _hyg_model = ""
-                _hyg_threshold_pct = 0.85
-                _hyg_compression_enabled = True
-                _hyg_hard_msg_limit = 400
-                _hyg_config_context_length = None
-                _hyg_provider = None
-                _hyg_base_url = None
-                _hyg_api_key = None
-                _hyg_data = {}
-                try:
-                    _hyg_data = _load_gateway_config()
-                    if _hyg_data:
-                        # Resolve model name (same logic as run_sync)
-                        _model_cfg = _hyg_data.get("model", {})
-                        if isinstance(_model_cfg, str):
-                            _hyg_model = _model_cfg
-                        elif isinstance(_model_cfg, dict):
-                            _hyg_model = _model_cfg.get("default") or _model_cfg.get("model") or _hyg_model
-                            # Read explicit context_length override from model config
-                            # (same as run_agent.py lines 995-1005)
-                            _raw_ctx = _model_cfg.get("context_length")
-                            if _raw_ctx is not None:
-                                try:
-                                    _hyg_config_context_length = int(_raw_ctx)
-                                except (TypeError, ValueError):
-                                    pass
-                            # Read provider for accurate context detection
-                            _hyg_provider = _model_cfg.get("provider") or None
-                            _hyg_base_url = _model_cfg.get("base_url") or None
-
-                        # Read compression settings — only use enabled flag.
-                        # The threshold is intentionally separate from the agent's
-                        # compression.threshold (hygiene runs higher).
-                        _comp_cfg = _hyg_data.get("compression", {})
-                        if isinstance(_comp_cfg, dict):
-                            _hyg_compression_enabled = str(
-                                _comp_cfg.get("enabled", True)
-                            ).lower() in {"true", "1", "yes"}
-                            _raw_hard_limit = _comp_cfg.get("hygiene_hard_message_limit")
-                            if _raw_hard_limit is not None:
-                                try:
-                                    _parsed = int(_raw_hard_limit)
-                                    if _parsed > 0:
-                                        _hyg_hard_msg_limit = _parsed
-                                except (TypeError, ValueError):
-                                    pass
-
-                    try:
-                        _hyg_model, _hyg_runtime = self._resolve_session_agent_runtime(
-                            source=source,
-                            session_key=session_key,
-                            user_config=_hyg_data if isinstance(_hyg_data, dict) else None,
-                        )
-                        _hyg_provider = _hyg_runtime.get("provider") or _hyg_provider
-                        _hyg_base_url = _hyg_runtime.get("base_url") or _hyg_base_url
-                        _hyg_api_key = _hyg_runtime.get("api_key") or _hyg_api_key
-                    except Exception:
-                        pass
-
-                    # Check custom_providers per-model context_length
-                    # (same fallback as run_agent.py lines 1171-1189).
-                    # Must run after runtime resolution so _hyg_base_url is set.
-                    if _hyg_config_context_length is None and _hyg_base_url:
-                        try:
-                            try:
-                                from marlow_cli.config import load_custom_provider_entries as _gw_gcp
-                                _hyg_custom_providers = _gw_gcp(_hyg_data)
-                            except Exception:
-                                _hyg_custom_providers = []
-                            for _cp in _hyg_custom_providers:
-                                if not isinstance(_cp, dict):
-                                    continue
-                                _cp_url = (_cp.get("base_url") or "").rstrip("/")
-                                if _cp_url and _cp_url == _hyg_base_url.rstrip("/"):
-                                    _cp_models = _cp.get("models", {})
-                                    if isinstance(_cp_models, dict):
-                                        _cp_model_cfg = _cp_models.get(_hyg_model, {})
-                                        if isinstance(_cp_model_cfg, dict):
-                                            _cp_ctx = _cp_model_cfg.get("context_length")
-                                            if _cp_ctx is not None:
-                                                _hyg_config_context_length = int(_cp_ctx)
-                                    break
-                        except (TypeError, ValueError):
-                            pass
-                except Exception:
-                    pass
-
-                if _hyg_compression_enabled:
-                    _hyg_context_length = get_model_context_length(
-                        _hyg_model,
-                        base_url=_hyg_base_url or "",
-                        api_key=_hyg_api_key or "",
-                        config_context_length=_hyg_config_context_length,
-                        provider=_hyg_provider or "",
-                    )
-                    _compress_token_threshold = int(
-                        _hyg_context_length * _hyg_threshold_pct
-                    )
-                    _warn_token_threshold = int(_hyg_context_length * 0.95)
-
-                    _msg_count = len(history)
-
-                    # Prefer actual API-reported tokens from the last turn
-                    # (stored in session entry) over the rough char-based estimate.
-                    _stored_tokens = session_entry.last_prompt_tokens
-                    if _stored_tokens > 0:
-                        _approx_tokens = _stored_tokens
-                        _token_source = "actual"
-                    else:
-                        _approx_tokens = estimate_messages_tokens_rough(history)
-                        _token_source = "estimated"
-                        # Note: rough estimates overestimate by 30-50% for code/JSON-heavy
-                        # sessions, but that just means hygiene fires a bit early — which
-                        # is safe and harmless.  The 85% threshold already provides ample
-                        # headroom (agent's own compressor runs at 50%).  A previous 1.4x
-                        # multiplier tried to compensate by inflating the threshold, but
-                        # 85% * 1.4 = 119% of context — which exceeds the model's limit
-                        # and prevented hygiene from ever firing for ~200K models (GLM-5).
-
-                    # Hard safety valve: force compression if message count is
-                    # extreme, regardless of token estimates.  This breaks the
-                    # death spiral where API disconnects prevent token data
-                    # collection, which prevents compression, which causes more
-                    # disconnects.  400 messages is well above normal sessions
-                    # but catches runaway growth before it becomes unrecoverable.
-                    # Threshold is configurable via
-                    # compression.hygiene_hard_message_limit.
-                    # (#2153)
-                    _HARD_MSG_LIMIT = _hyg_hard_msg_limit
-                    _needs_compress = (
-                        _approx_tokens >= _compress_token_threshold
-                        or _msg_count >= _HARD_MSG_LIMIT
-                    )
-
-                    if _needs_compress:
-                        logger.info(
-                            "Session hygiene: %s messages, ~%s tokens (%s) — auto-compressing "
-                            "(threshold: %s%% of %s = %s tokens)",
-                            _msg_count, f"{_approx_tokens:,}", _token_source,
-                            int(_hyg_threshold_pct * 100),
-                            f"{_hyg_context_length:,}",
-                            f"{_compress_token_threshold:,}",
-                        )
-
-                        _hyg_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
-
-                        try:
-                            from run_agent import AIAgent
-
-                            _hyg_model, _hyg_runtime = self._resolve_session_agent_runtime(
-                                source=source,
-                                session_key=session_key,
-                                user_config=_hyg_data if isinstance(_hyg_data, dict) else None,
-                            )
-                            if _hyg_runtime.get("api_key"):
-                                _hyg_msgs = [
-                                    {"role": m.get("role"), "content": m.get("content")}
-                                    for m in history
-                                    if m.get("role") in {"user", "assistant"}
-                                    and m.get("content")
-                                ]
-
-                                if len(_hyg_msgs) >= 4:
-                                    _hyg_agent = AIAgent(
-                                        **_hyg_runtime,
-                                        model=_hyg_model,
-                                        max_iterations=4,
-                                        quiet_mode=True,
-                                        skip_memory=True,
-                                        enabled_toolsets=["memory"],
-                                        session_id=session_entry.session_id,
-                                        session_db=getattr(self, "_session_db", None),
-                                    )
-                                    try:
-                                        _hyg_agent._print_fn = lambda *a, **kw: None
-                                        # The hygiene transcript came from the
-                                        # durable store.  Legacy rotation must not
-                                        # append that loaded prefix back to the
-                                        # preserved parent before splitting.
-                                        _hyg_agent._last_flushed_db_idx = len(_hyg_msgs)
-
-                                        loop = asyncio.get_running_loop()
-                                        _compressed, _ = await loop.run_in_executor(
-                                            None,
-                                            lambda: _hyg_agent._compress_context(
-                                                _hyg_msgs, "",
-                                                approx_tokens=_approx_tokens,
-                                            ),
-                                        )
-
-                                        # _compress_context ends the old session and creates
-                                        # a new session_id.  Write compressed messages into
-                                        # the NEW session so the old transcript stays intact
-                                        # and searchable via session_search.
-                                        _hyg_parent_sid = session_entry.session_id
-                                        _hyg_new_sid = _hyg_agent.session_id
-                                        _hyg_rotated = _hyg_new_sid != _hyg_parent_sid
-                                        _hyg_in_place = bool(
-                                            getattr(_hyg_agent, "_last_compaction_in_place", False)
-                                        )
-                                        if _hyg_rotated:
-                                            # Commit order is deliberate: the child
-                                            # transcript must be durable before the
-                                            # gateway route can publish it.
-                                            try:
-                                                self.session_store.rewrite_transcript(
-                                                    _hyg_new_sid, _compressed
-                                                )
-                                                session_entry = self.session_store.publish_compression_continuation(
-                                                    session_key,
-                                                    _hyg_parent_sid,
-                                                    _hyg_new_sid,
-                                                )
-                                            except BaseException:
-                                                self._rollback_unpublished_compression(
-                                                    _hyg_parent_sid, _hyg_new_sid
-                                                )
-                                                _hyg_agent.session_id = _hyg_parent_sid
-                                                raise
-                                            self._sync_telegram_topic_binding(
-                                                source, session_entry,
-                                                reason="hygiene-compression",
-                                            )
-                                        # Reset stored token count — transcript was rewritten
-                                        if _hyg_in_place:
-                                            session_entry.last_prompt_tokens = 0
-                                        history = _compressed
-                                        _new_count = len(_compressed)
-                                        _new_tokens = estimate_messages_tokens_rough(
-                                            _compressed
-                                        )
-
-                                        logger.info(
-                                            "Session hygiene: compressed %s → %s msgs, "
-                                            "~%s → ~%s tokens",
-                                            _msg_count, _new_count,
-                                            f"{_approx_tokens:,}", f"{_new_tokens:,}",
-                                        )
-
-                                        if _new_tokens >= _warn_token_threshold:
-                                            logger.warning(
-                                                "Session hygiene: still ~%s tokens after "
-                                                "compression",
-                                                f"{_new_tokens:,}",
-                                            )
-
-                                        # If summary generation failed, the
-                                        # compressor aborts entirely and returns
-                                        # messages unchanged — nothing is dropped.
-                                        # Surface a visible warning to the gateway
-                                        # user — agent.log alone is invisible on
-                                        # TG/Discord/etc. — so they know the chat
-                                        # is "frozen" at the current size and can
-                                        # /compress to retry or /reset to start
-                                        # fresh.
-                                        _comp = getattr(_hyg_agent, "context_compressor", None)
-                                        if _comp is not None and getattr(_comp, "_last_compress_aborted", False):
-                                            _err = getattr(_comp, "_last_summary_error", None) or "unknown error"
-                                            _warn_msg = (
-                                                "⚠️ Context compression aborted "
-                                                f"({_err}). No messages were dropped — "
-                                                "conversation is unchanged. Run /compress "
-                                                "to retry, /reset for a clean session, or "
-                                                "check your auxiliary.compression model "
-                                                "configuration."
-                                            )
-                                            try:
-                                                _adapter = self.adapters.get(source.platform)
-                                                if _adapter and source.chat_id:
-                                                    await _adapter.send(source.chat_id, _warn_msg, metadata=_hyg_meta)
-                                            except Exception as _werr:
-                                                logger.warning(
-                                                    "Failed to deliver compression-failure warning to user: %s",
-                                                    _werr,
-                                                )
-                                        # Separately: if the user's CONFIGURED aux
-                                        # model failed and we recovered by falling
-                                        # back to the main model, tell them — a
-                                        # misconfigured auxiliary.compression.model
-                                        # is something only they can fix, and
-                                        # silent recovery would hide it.
-                                        elif _comp is not None and getattr(_comp, "_last_aux_model_failure_model", None):
-                                            _aux_model = getattr(_comp, "_last_aux_model_failure_model", "")
-                                            _aux_err = getattr(_comp, "_last_aux_model_failure_error", None) or "unknown error"
-                                            _aux_msg = (
-                                                f"ℹ️ Configured compression model `{_aux_model}` "
-                                                f"failed ({_aux_err}). Recovered using your main "
-                                                "model — context is intact — but you may want to "
-                                                "check `auxiliary.compression.model` in config.yaml."
-                                            )
-                                            try:
-                                                _adapter = self.adapters.get(source.platform)
-                                                if _adapter and source.chat_id:
-                                                    await _adapter.send(source.chat_id, _aux_msg, metadata=_hyg_meta)
-                                            except Exception as _werr:
-                                                logger.warning(
-                                                    "Failed to deliver aux-model-fallback notice to user: %s",
-                                                    _werr,
-                                                )
-                                    finally:
-                                        # Evict the cached agent so the next turn
-                                        # rebuilds its system prompt from current
-                                        # SOUL.md, memory, and skills.
-                                        self._evict_cached_agent(session_key)
-                                        self._cleanup_agent_resources(_hyg_agent)
-
-                        except Exception as e:
-                            logger.warning(
-                                "Session hygiene auto-compress failed: %s", e
-                            )
+            # Codex owns thread compaction. Raw Marlow history is never rewritten
+            # by an independent summarization model before a turn.
 
             # First-message onboarding -- only on the very first interaction ever
             if not history and not self.session_store.has_any_sessions():
@@ -8420,7 +7748,7 @@ class GatewayRunner:
                 **hook_ctx,
                 "response": (response or "")[:500],
             })
-            
+
             # Check for pending process watchers (check_interval on background processes)
             try:
                 from tools.process_registry import process_registry
@@ -8464,7 +7792,7 @@ class GatewayRunner:
             # the time we reach here the approval has already been resolved.  The
             # old post-loop pop_pending + approval_hint code was removed in favour
             # of the blocking approach that mirrors CLI's synchronous input().
-            
+
             # Save the full conversation to the transcript, including tool calls.
             # This preserves the complete agent loop (tool_calls, tool results,
             # intermediate reasoning) so sessions can be resumed with full context
@@ -8533,7 +7861,7 @@ class GatewayRunner:
                 )
 
             ts = datetime.now().isoformat()
-            
+
             # If this is a fresh session (no history), write the full tool
             # definitions as the first entry so the transcript is self-describing
             # -- the same list of dicts sent as tools=[...] in the API request.
@@ -8552,7 +7880,7 @@ class GatewayRunner:
                             "timestamp": ts,
                         }
                     )
-            
+
             # Find only the NEW messages from this turn (skip history we loaded).
             # Use the filtered history length (history_offset) that was actually
             # passed to the agent, not len(history) which includes session_meta
@@ -8663,7 +7991,7 @@ class GatewayRunner:
                 return None
 
             return response
-            
+
         except Exception as e:
             # Stop typing indicator on error too
             try:
@@ -8728,93 +8056,18 @@ class GatewayRunner:
             self._clear_session_env(_session_env_tokens)
 
     def _format_session_info(self) -> str:
-        """Resolve current model config and return a formatted info block.
-
-        Surfaces model, provider, context length, and endpoint so gateway
-        users can immediately see if context detection went wrong (e.g.
-        local models falling to the 128K default).
-        """
-        from agent.model_metadata import get_model_context_length, DEFAULT_FALLBACK_CONTEXT
-
-        model = _resolve_gateway_model()
-        config_context_length = None
-        provider = None
-        base_url = None
-        api_key = None
-        custom_provs = None
-        data = None
-
-        try:
-            data = _load_gateway_config()
-            if data:
-                model_cfg = data.get("model", {})
-                if isinstance(model_cfg, dict):
-                    raw_ctx = model_cfg.get("context_length")
-                    if raw_ctx is not None:
-                        try:
-                            config_context_length = int(raw_ctx)
-                        except (TypeError, ValueError):
-                            pass
-                    provider = model_cfg.get("provider") or None
-                    base_url = model_cfg.get("base_url") or None
-                try:
-                    from marlow_cli.config import load_custom_provider_entries
-                    custom_provs = load_custom_provider_entries(data)
-                except Exception:
-                    custom_provs = []
-        except Exception:
-            pass
-
-        # Resolve runtime credentials for probing
-        try:
-            runtime = _resolve_runtime_agent_kwargs()
-            provider = provider or runtime.get("provider")
-            base_url = base_url or runtime.get("base_url")
-            api_key = runtime.get("api_key")
-        except Exception:
-            pass
-
-        context_length = get_model_context_length(
-            model,
-            base_url=base_url or "",
-            api_key=api_key or "",
-            config_context_length=config_context_length,
-            provider=provider or "",
-            custom_providers=custom_provs,
-        )
-
-        # Format context source hint
-        if config_context_length is not None:
-            ctx_source = "config"
-        elif context_length == DEFAULT_FALLBACK_CONTEXT:
-            ctx_source = "default — set model.context_length in config to override"
-        else:
-            ctx_source = "detected"
-
-        # Format context length for display
-        if context_length >= 1_000_000:
-            ctx_display = f"{context_length / 1_000_000:.1f}M"
-        elif context_length >= 1_000:
-            ctx_display = f"{context_length // 1_000}K"
-        else:
-            ctx_display = str(context_length)
-
-        lines = [
-            f"◆ Model: `{model}`",
-            f"◆ Provider: {provider or 'custom'}",
-            f"◆ Context: {ctx_display} tokens ({ctx_source})",
-        ]
-
-        # Show endpoint for local/custom setups
-        if base_url and ("localhost" in base_url or "127.0.0.1" in base_url or "0.0.0.0" in base_url):
-            lines.append(f"◆ Endpoint: {base_url}")
-
-        return "\n".join(lines)
+        from agent.codex_environment import managed_environment
+        e = managed_environment()
+        return "\n".join([
+            f"◆ Model: `{e.config.get('model') or 'Codex default'}`",
+            f"◆ Provider: {e.config.get('model_provider', 'openai')}",
+            "◆ Context: managed by Codex; usage available after a turn",
+        ])
 
     async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""
         source = event.source
-        
+
         # Get existing session key
         session_key = self._session_key_for_source(source)
         self._invalidate_session_run_generation(session_key, reason="session_reset")
@@ -9814,443 +9067,29 @@ class GatewayRunner:
             getattr(getattr(event, "source", None), "platform", None),
         )
 
-    async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
-        """Handle /model command — switch model for this session.
+    async def _handle_model_command(self, event):
+        from marlow_cli.model_switch import parse_model_flags
+        from marlow_cli.runtime_provider import resolve_runtime_provider
+        from marlow_cli.codex_config import set_model
+        model, provider, persist, refresh = parse_model_flags(event.get_command_args().strip())
+        runtime = resolve_runtime_provider(requested=provider or None)
+        if not model:
+            return f"Codex model: {runtime['model'] or '(Codex default)'}. Use /model <id>; edit provider in the profile runtime/codex/config.toml."
+        key = self._session_key_for_source(event.source)
+        if persist:
+            set_model(model)
+        self._session_model_overrides[key] = {'model': model}
+        self._evict_cached_agent(key)
+        return f"Codex model: {model}"
 
-        Supports:
-          /model                              — interactive picker (Telegram/Discord) or text list
-          /model <name>                       — switch for this session only
-          /model <name> --global              — switch and persist to config.yaml
-          /model <name> --provider <provider> — switch provider + model
-          /model --provider <provider>        — switch to provider, auto-detect model
-        """
-        import yaml
-        from marlow_cli.model_switch import (
-            switch_model as _switch_model, parse_model_flags,
-            list_authenticated_providers,
-            list_picker_providers,
-        )
-        from marlow_cli.providers import get_label
 
-        raw_args = event.get_command_args().strip()
-
-        # Parse --provider, --global, and --refresh flags
-        model_input, explicit_provider, persist_global, force_refresh = parse_model_flags(raw_args)
-
-        # --refresh: bust the disk cache so the picker shows live data.
-        if force_refresh:
-            try:
-                from marlow_cli.models import clear_provider_models_cache
-                clear_provider_models_cache()
-            except Exception:
-                pass
-
-        # Read current model/provider from config
-        current_model = ""
-        current_provider = "custom"
-        current_base_url = ""
-        current_api_key = ""
-        user_provs = None
-        custom_provs = None
-        config_path = _marlow_home / "config.yaml"
-        try:
-            cfg = _load_gateway_config()
-            if cfg:
-                model_cfg = cfg.get("model", {})
-                if isinstance(model_cfg, dict):
-                    current_model = model_cfg.get("default", "")
-                    current_provider = model_cfg.get("provider", current_provider)
-                    current_base_url = model_cfg.get("base_url", "")
-                user_provs = cfg.get("providers")
-                try:
-                    from marlow_cli.config import load_custom_provider_entries
-                    custom_provs = load_custom_provider_entries(cfg)
-                except Exception:
-                    custom_provs = []
-        except Exception:
-            pass
-
-        # Check for session override
-        source = event.source
-        session_key = self._session_key_for_source(source)
-        override = self._session_model_overrides.get(session_key, {})
-        if override:
-            current_model = override.get("model", current_model)
-            current_provider = override.get("provider", current_provider)
-            current_base_url = override.get("base_url", current_base_url)
-            current_api_key = override.get("api_key", current_api_key)
-
-        # No args: show interactive picker (Telegram/Discord) or text list
-        if not model_input and not explicit_provider:
-            # Try interactive picker if the platform supports it
-            adapter = self.adapters.get(source.platform)
-            has_picker = (
-                adapter is not None
-                and getattr(type(adapter), "send_model_picker", None) is not None
-            )
-
-            if has_picker:
-                try:
-                    providers = list_picker_providers(
-                        current_provider=current_provider,
-                        current_base_url=current_base_url,
-                        current_model=current_model,
-                        user_providers=user_provs,
-                        custom_providers=custom_provs,
-                        max_models=50,
-                    )
-                except Exception:
-                    providers = []
-
-                if providers:
-                    # Build a callback closure for when the user picks a model.
-                    # Captures self + locals needed for the switch logic.
-                    _self = self
-                    _session_key = session_key
-                    _cur_model = current_model
-                    _cur_provider = current_provider
-                    _cur_base_url = current_base_url
-                    _cur_api_key = current_api_key
-
-                    async def _on_model_selected(
-                        _chat_id: str, model_id: str, provider_slug: str
-                    ) -> str:
-                        """Perform the model switch and return confirmation text."""
-                        result = _switch_model(
-                            raw_input=model_id,
-                            current_provider=_cur_provider,
-                            current_model=_cur_model,
-                            current_base_url=_cur_base_url,
-                            current_api_key=_cur_api_key,
-                            is_global=False,
-                            explicit_provider=provider_slug,
-                            user_providers=user_provs,
-                            custom_providers=custom_provs,
-                        )
-                        if not result.success:
-                            return t("gateway.model.error_prefix", error=result.error_message)
-
-                        # Update cached agent in-place
-                        cached_entry = None
-                        _cache_lock = getattr(_self, "_agent_cache_lock", None)
-                        _cache = getattr(_self, "_agent_cache", None)
-                        if _cache_lock and _cache is not None:
-                            with _cache_lock:
-                                cached_entry = _cache.get(_session_key)
-                        if cached_entry and cached_entry[0] is not None:
-                            try:
-                                cached_entry[0].switch_model(
-                                    new_model=result.new_model,
-                                    new_provider=result.target_provider,
-                                    api_key=result.api_key,
-                                    base_url=result.base_url,
-                                    api_mode=result.api_mode,
-                                )
-                            except Exception as exc:
-                                logger.warning("Picker model switch failed for cached agent: %s", exc)
-
-                        # Persist the new model to the session DB for later
-                        # session inspection and resumption.
-                        _sess_db = getattr(_self, "_session_db", None)
-                        if _sess_db is not None:
-                            try:
-                                _sess_entry = _self.session_store.get_or_create_session(
-                                    event.source
-                                )
-                                _sess_db.update_session_model(
-                                    _sess_entry.session_id, result.new_model
-                                )
-                            except Exception as exc:
-                                logger.debug(
-                                    "Failed to persist model switch to DB: %s", exc
-                                )
-
-                        # Store model note + session override
-                        if not hasattr(_self, "_pending_model_notes"):
-                            _self._pending_model_notes = {}
-                        _self._pending_model_notes[_session_key] = (
-                            f"[Note: model was just switched from {_cur_model} to {result.new_model} "
-                            f"via {result.provider_label or result.target_provider}. "
-                            f"Adjust your self-identification accordingly.]"
-                        )
-                        _self._session_model_overrides[_session_key] = {
-                            "model": result.new_model,
-                            "provider": result.target_provider,
-                            "api_key": result.api_key,
-                            "base_url": result.base_url,
-                            "api_mode": result.api_mode,
-                        }
-
-                        # Evict cached agent so the next turn creates a fresh
-                        # agent from the override rather than relying on the
-                        # stale cache signature to trigger a rebuild.
-                        _self._evict_cached_agent(_session_key)
-
-                        # Build confirmation text
-                        plabel = result.provider_label or result.target_provider
-                        lines = [t("gateway.model.switched", model=result.new_model)]
-                        lines.append(t("gateway.model.provider_label", provider=plabel))
-                        from marlow_cli.model_switch import resolve_display_context_length
-                        _sw_config_ctx = None
-                        try:
-                            _sw_cfg = _load_gateway_config()
-                            _sw_model_cfg = _sw_cfg.get("model", {})
-                            if isinstance(_sw_model_cfg, dict):
-                                _sw_raw = _sw_model_cfg.get("context_length")
-                                if _sw_raw is not None:
-                                    _sw_config_ctx = int(_sw_raw)
-                        except Exception:
-                            pass
-                        ctx = resolve_display_context_length(
-                            result.new_model,
-                            result.target_provider,
-                            base_url=result.base_url or current_base_url or "",
-                            api_key=result.api_key or current_api_key or "",
-                            custom_providers=custom_provs,
-                            config_context_length=_sw_config_ctx,
-                        )
-                        if ctx:
-                            lines.append(t("gateway.model.context_label", tokens=f"{ctx:,}"))
-                        lines.append(t("gateway.model.session_only_hint"))
-                        return "\n".join(lines)
-
-                    metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
-                    result = await adapter.send_model_picker(
-                        chat_id=source.chat_id,
-                        providers=providers,
-                        current_model=current_model,
-                        current_provider=current_provider,
-                        session_key=session_key,
-                        on_model_selected=_on_model_selected,
-                        metadata=metadata,
-                    )
-                    if result.success:
-                        return None  # Picker sent — adapter handles the response
-
-            # Fallback: text list (for platforms without picker or if picker failed)
-            provider_label = get_label(current_provider)
-            lines = [t("gateway.model.current_label", model=current_model or "unknown", provider=provider_label), ""]
-
-            try:
-                providers = list_authenticated_providers(
-                    current_provider=current_provider,
-                    current_base_url=current_base_url,
-                    current_model=current_model,
-                    user_providers=user_provs,
-                    custom_providers=custom_provs,
-                    max_models=5,
-                )
-                for p in providers:
-                    tag = t("gateway.model.current_tag") if p["is_current"] else ""
-                    lines.append(f"**{p['name']}** `--provider {p['slug']}`{tag}:")
-                    if p["models"]:
-                        model_strs = ", ".join(f"`{m}`" for m in p["models"])
-                        extra = t("gateway.model.more_models_suffix", count=p["total_models"] - len(p["models"])) if p["total_models"] > len(p["models"]) else ""
-                        lines.append(f"  {model_strs}{extra}")
-                    elif p.get("api_url"):
-                        lines.append(f"  `{p['api_url']}`")
-                    lines.append("")
-            except Exception:
-                pass
-
-            lines.append(t("gateway.model.usage_switch_model"))
-            lines.append(t("gateway.model.usage_switch_provider"))
-            lines.append(t("gateway.model.usage_persist"))
-            return "\n".join(lines)
-
-        # Perform the switch
-        result = _switch_model(
-            raw_input=model_input,
-            current_provider=current_provider,
-            current_model=current_model,
-            current_base_url=current_base_url,
-            current_api_key=current_api_key,
-            is_global=persist_global,
-            explicit_provider=explicit_provider,
-            user_providers=user_provs,
-            custom_providers=custom_provs,
-        )
-
-        if not result.success:
-            return t("gateway.model.error_prefix", error=result.error_message)
-
-        # If there's a cached agent, update it in-place
-        cached_entry = None
-        _cache_lock = getattr(self, "_agent_cache_lock", None)
-        _cache = getattr(self, "_agent_cache", None)
-        if _cache_lock and _cache is not None:
-            with _cache_lock:
-                cached_entry = _cache.get(session_key)
-
-        if cached_entry and cached_entry[0] is not None:
-            try:
-                cached_entry[0].switch_model(
-                    new_model=result.new_model,
-                    new_provider=result.target_provider,
-                    api_key=result.api_key,
-                    base_url=result.base_url,
-                    api_mode=result.api_mode,
-                )
-            except Exception as exc:
-                logger.warning("In-place model switch failed for cached agent: %s", exc)
-
-        # Persist the new model to the session DB for later session
-        # inspection and resumption.
-        _sess_db = getattr(self, "_session_db", None)
-        if _sess_db is not None:
-            try:
-                _sess_entry = self.session_store.get_or_create_session(source)
-                _sess_db.update_session_model(
-                    _sess_entry.session_id, result.new_model
-                )
-            except Exception as exc:
-                logger.debug(
-                    "Failed to persist model switch to DB: %s", exc
-                )
-
-        # Store a note to prepend to the next user message so the model
-        # knows about the switch (avoids system messages mid-history).
-        if not hasattr(self, "_pending_model_notes"):
-            self._pending_model_notes = {}
-        self._pending_model_notes[session_key] = (
-            f"[Note: model was just switched from {current_model} to {result.new_model} "
-            f"via {result.provider_label or result.target_provider}. "
-            f"Adjust your self-identification accordingly.]"
-        )
-
-        # Store session override so next agent creation uses the new model
-        self._session_model_overrides[session_key] = {
-            "model": result.new_model,
-            "provider": result.target_provider,
-            "api_key": result.api_key,
-            "base_url": result.base_url,
-            "api_mode": result.api_mode,
-        }
-
-        # Evict cached agent so the next turn creates a fresh agent from the
-        # override rather than relying on cache signature mismatch detection.
-        self._evict_cached_agent(session_key)
-
-        # Persist to config if --global
-        if persist_global:
-            try:
-                if config_path.exists():
-                    with open(config_path, encoding="utf-8") as f:
-                        cfg = yaml.safe_load(f) or {}
-                else:
-                    cfg = {}
-                # Coerce scalar/None ``model:`` into a dict before mutation —
-                # otherwise ``cfg.setdefault("model", {})`` returns the existing
-                # scalar and the next assignment raises
-                # ``TypeError: 'str' object does not support item assignment``.
-                # Reproduces when ``config.yaml`` has ``model: <name>`` (flat
-                # string) instead of the proper nested ``model: {default: ...}``.
-                raw_model = cfg.get("model")
-                if isinstance(raw_model, dict):
-                    model_cfg = raw_model
-                elif isinstance(raw_model, str) and raw_model.strip():
-                    model_cfg = {"default": raw_model.strip()}
-                    cfg["model"] = model_cfg
-                else:
-                    model_cfg = {}
-                    cfg["model"] = model_cfg
-                model_cfg["default"] = result.new_model
-                model_cfg["provider"] = result.target_provider
-                if result.base_url:
-                    model_cfg["base_url"] = result.base_url
-                from marlow_cli.config import save_config
-                save_config(cfg)
-            except Exception as e:
-                logger.warning("Failed to persist model switch: %s", e)
-
-        # Build confirmation message with full metadata
-        provider_label = result.provider_label or result.target_provider
-        lines = [t("gateway.model.switched", model=result.new_model)]
-        lines.append(t("gateway.model.provider_label", provider=provider_label))
-
-        # Resolve context through the retained Codex/custom endpoint path.
-        from marlow_cli.model_switch import resolve_display_context_length
-        _sw2_config_ctx = None
-        try:
-            _sw2_cfg = _load_gateway_config()
-            _sw2_model_cfg = _sw2_cfg.get("model", {})
-            if isinstance(_sw2_model_cfg, dict):
-                _sw2_raw = _sw2_model_cfg.get("context_length")
-                if _sw2_raw is not None:
-                    _sw2_config_ctx = int(_sw2_raw)
-        except Exception:
-            pass
-        ctx = resolve_display_context_length(
-            result.new_model,
-            result.target_provider,
-            base_url=result.base_url or current_base_url or "",
-            api_key=result.api_key or current_api_key or "",
-            custom_providers=custom_provs,
-            config_context_length=_sw2_config_ctx,
-        )
-        if ctx:
-            lines.append(t("gateway.model.context_label", tokens=f"{ctx:,}"))
-        if result.warning_message:
-            lines.append(t("gateway.model.warning_prefix", warning=result.warning_message))
-
-        if persist_global:
-            lines.append(t("gateway.model.saved_global"))
-        else:
-            lines.append(t("gateway.model.session_only_hint"))
-
-        return "\n".join(lines)
-
-    async def _handle_codex_runtime_command(self, event: MessageEvent) -> str:
-        """Handle /codex-runtime command in the gateway.
-
-        Same surface as the CLI handler in cli.py:
-            /codex-runtime                  — show current state
-            /codex-runtime auto             — Marlow default runtime
-            /codex-runtime codex_app_server — codex subprocess runtime
-            /codex-runtime on / off         — synonyms
-
-        On change, the cached agent for this session is evicted so the next
-        message creates a fresh AIAgent with the new api_mode wired in
-        (avoids prompt-cache invalidation mid-session)."""
-        from marlow_cli import codex_runtime_switch as crs
-
-        raw_args = event.get_command_args().strip() if event else ""
-        new_value, errors = crs.parse_args(raw_args)
-        if errors:
-            return "❌ " + "\n❌ ".join(errors)
-
-        # Load + persist via the same helpers used for /model and /yolo
-        try:
-            from marlow_cli.config import load_config, save_config
-        except Exception as exc:
-            return f"❌ Could not load config: {exc}"
-        cfg = load_config()
-
-        result = crs.apply(
-            cfg,
-            new_value,
-            persist_callback=(save_config if new_value is not None else None),
-        )
-
-        # On a real change, evict the cached agent so the new runtime takes
-        # effect on the next message rather than waiting for cache TTL.
-        if result.success and new_value is not None and result.requires_new_session:
-            try:
-                session_key = self._session_key_for_source(event.source)
-                self._evict_cached_agent(session_key)
-            except Exception:
-                logger.debug("could not evict cached agent after codex-runtime change",
-                             exc_info=True)
-
-        prefix = "✓" if result.success else "✗"
-        return f"{prefix} {result.message}"
 
     async def _handle_retry_command(self, event: MessageEvent) -> str:
         """Handle /retry command - re-send the last user message."""
         source = event.source
         session_entry = self.session_store.get_or_create_session(source)
         history = self.session_store.load_transcript(session_entry.session_id)
-        
+
         # Find the last user message
         last_user_msg = None
         last_user_idx = None
@@ -10259,16 +9098,17 @@ class GatewayRunner:
                 last_user_msg = history[i].get("content", "")
                 last_user_idx = i
                 break
-        
+
         if not last_user_msg:
             return t("gateway.retry.no_previous")
-        
-        # Truncate history to before the last user message and persist
-        truncated = history[:last_user_idx]
-        self.session_store.rewrite_transcript(session_entry.session_id, truncated)
-        # Reset stored token count — transcript was truncated
-        session_entry.last_prompt_tokens = 0
-        
+
+        if not isinstance(last_user_msg, str):
+            return "Please resend the original attachments to request another attempt."
+        # An explicit retry is a NEW turn. Preserve the native and raw history;
+        # the runtime lease still blocks uncertain prior business operations.
+        last_user_msg = ("The user explicitly requests another attempt. Verify previous side effects before repeating writes.\n"
+                         + last_user_msg)
+
         # Re-send by creating a fake text event with the old message
         retry_event = MessageEvent(
             text=last_user_msg,
@@ -10277,7 +9117,7 @@ class GatewayRunner:
             raw_message=event.raw_message,
             channel_prompt=event.channel_prompt,
         )
-        
+
         # Let the normal message handler process it
         return await self._handle_message(retry_event)
 
@@ -10597,43 +9437,8 @@ class GatewayRunner:
         (active-only) transcript — the gateway's equivalent of the CLI's
         in-place history surgery + memory-cache invalidation.
         """
-        source = event.source
-
-        # Parse optional turn count: "/undo" → 1, "/undo 3" → 3.
-        n = 1
-        raw_args = event.get_command_args().strip()
-        if raw_args:
-            try:
-                n = int(raw_args.split()[0])
-            except (ValueError, IndexError):
-                return t("gateway.undo.invalid_count", arg=raw_args.split()[0])
-            if n < 1:
-                n = 1
-
-        session_entry = self.session_store.get_or_create_session(source)
-        result = self.session_store.rewind_session(session_entry.session_id, n)
-
-        if result is None:
-            return t("gateway.undo.nothing")
-
-        # Reset stored token count — transcript was truncated.
-        session_entry.last_prompt_tokens = 0
-        # Evict the cached agent so the next turn rebuilds from the active-only
-        # transcript and memory providers refresh their per-session caches.
-        try:
-            session_key = build_session_key(source)
-            self._evict_cached_agent(session_key)
-        except Exception as e:
-            logger.debug("undo: cached-agent eviction skipped: %s", e)
-
-        target_text = result["target_text"]
-        preview = target_text[:200] + "..." if len(target_text) > 200 else target_text
-        return t(
-            "gateway.undo.removed",
-            turns=result["turns_undone"],
-            count=result["rewound_count"],
-            preview=preview,
-        )
+        return ("Undo is unavailable with the supported Codex app-server protocol. "
+                "The conversation and its actions were preserved. Use /new to start another conversation.")
 
     async def _handle_set_home_command(self, event: MessageEvent) -> str:
         """Handle /sethome command -- set the current chat as the platform's home channel."""
@@ -10672,6 +9477,7 @@ class GatewayRunner:
 
         return t("gateway.set_home.success", name=chat_name, chat_id=chat_id)
 
+    @__import__('agent.codex_file_scope', fromlist=['source_delivery_scope']).source_delivery_scope
     async def _deliver_media_from_response(
         self,
         response: str,
@@ -10882,6 +9688,7 @@ class GatewayRunner:
         preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
         return t("gateway.background.started", preview=preview, task_id=task_id)
 
+    @__import__('agent.codex_file_scope', fromlist=['source_delivery_scope']).source_delivery_scope
     async def _run_background_task(
         self,
         prompt: str,
@@ -10910,13 +9717,6 @@ class GatewayRunner:
                 source=source,
                 user_config=user_config,
             )
-            if not runtime_kwargs.get("api_key"):
-                await adapter.send(
-                    source.chat_id,
-                    f"❌ Background task {task_id} failed: no provider credentials configured.",
-                    metadata=_thread_metadata,
-                )
-                return
 
             platform_key = _platform_config_key(source.platform)
 
@@ -10930,22 +9730,15 @@ class GatewayRunner:
             self._reasoning_config = reasoning_config
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
 
-            # Enrich the prompt with image descriptions so the background
-            # agent can see user-attached images (same as the main flow).
             enriched_prompt = prompt
             if media_urls:
-                image_paths = []
-                for i, path in enumerate(media_urls):
-                    mtype = media_types[i] if i < len(media_types) else ""
-                    if mtype.startswith("image/"):
-                        image_paths.append(path)
+                image_paths = [path for index, path in enumerate(media_urls)
+                               if index < len(media_types) and media_types[index].startswith('image/')]
                 if image_paths:
-                    try:
-                        enriched_prompt = await self._enrich_message_with_vision(
-                            prompt, image_paths,
-                        )
-                    except Exception as e:
-                        logger.warning("Background task vision enrichment failed: %s", e)
+                    from agent.image_routing import build_native_content_parts
+                    enriched_prompt, skipped = build_native_content_parts(prompt, image_paths)
+                    if skipped:
+                        raise ValueError('Background task image attachment could not be loaded')
 
             _is_super_admin = self._is_super_admin_source(source)
 
@@ -10974,6 +9767,7 @@ class GatewayRunner:
                         reasoning_config=reasoning_config,
                         request_overrides=turn_route.get("request_overrides"),
                         session_id=task_id,
+                        conversation_shared=__import__('agent.codex_environment', fromlist=['gateway_shared']).gateway_shared(source, getattr(self, "config", None)),
                         platform=platform_key,
                         user_id=source.user_id,
                         user_id_alt=source.user_id_alt,
@@ -10983,7 +9777,6 @@ class GatewayRunner:
                         chat_type=source.chat_type,
                         thread_id=source.thread_id,
                         session_db=self._session_db,
-                        fallback_providers=self._fallback_providers,
                         ephemeral_system_prompt=(
                             self._super_admin_authority_prompt()
                             if _is_super_admin
@@ -10993,6 +9786,7 @@ class GatewayRunner:
                     return agent.run_conversation(
                         user_message=enriched_prompt,
                         task_id=task_id,
+                        turn_origin="gateway_background",
                     )
                 finally:
                     if agent is not None:
@@ -11376,212 +10170,15 @@ class GatewayRunner:
                 example = t("gateway.footer.example_line", preview=preview)
         return t("gateway.footer.saved", state=state, example=example)
 
-    async def _handle_compress_command(self, event: MessageEvent) -> str:
-        """Handle /compress command -- manually compress conversation context.
+    async def _handle_compress_command(self, event):
+        key = self._session_key_for_source(event.source)
+        entry = self._agent_cache.get(key)
+        agent = entry[0] if entry else None
+        if agent is None:
+            return "No active Codex thread. Resume the conversation before requesting compaction."
+        completed = await asyncio.to_thread(agent.compact)
+        return "Codex context compacted; Marlow raw history is preserved." if completed else "Codex compaction did not complete. Inspect runtime status before retrying."
 
-        Accepts an optional focus topic: ``/compress <focus>`` guides the
-        summariser to preserve information related to *focus* while being
-        more aggressive about discarding everything else.
-
-        Also accepts the boundary-aware form ``/compress here [N]``:
-        summarize everything except the most recent ``N`` exchanges
-        (default 2), kept verbatim. Inspired by Claude Code's Rewind
-        "Summarize up to here" action (v2.1.139, May 2026,
-        https://code.claude.com/docs/en/whats-new/2026-w20).
-        """
-        source = event.source
-        session_entry = self.session_store.get_or_create_session(source)
-        history = self.session_store.load_transcript(session_entry.session_id)
-
-        if not history or len(history) < 4:
-            return t("gateway.compress.not_enough")
-
-        # Parse args: either a focus topic (full compress) or the
-        # boundary-aware "here [N]" form (partial compress).
-        from marlow_cli.partial_compress import (
-            parse_partial_compress_args,
-            rejoin_compressed_head_and_tail,
-            split_history_for_partial_compress,
-        )
-        _raw_args = (event.get_command_args() or "").strip()
-        partial, keep_last, focus_topic = parse_partial_compress_args(_raw_args)
-
-        try:
-            from run_agent import AIAgent
-            from agent.manual_compression_feedback import summarize_manual_compression
-            from agent.model_metadata import estimate_request_tokens_rough
-
-            session_key = self._session_key_for_source(source)
-            model, runtime_kwargs = self._resolve_session_agent_runtime(
-                source=source,
-                session_key=session_key,
-            )
-            if not runtime_kwargs.get("api_key"):
-                return t("gateway.compress.no_provider")
-
-            msgs = [
-                {"role": m.get("role"), "content": m.get("content")}
-                for m in history
-                if m.get("role") in {"user", "assistant"} and m.get("content")
-            ]
-
-            # Boundary-aware split: only the head is summarized; the most
-            # recent `keep_last` exchanges are preserved verbatim. The
-            # split snaps the tail to a user-turn start so the rejoined
-            # transcript keeps role alternation valid.
-            tail: list = []
-            head = msgs
-            if partial:
-                head, tail = split_history_for_partial_compress(msgs, keep_last)
-                if not tail:
-                    # Degenerate split — fall back to full compression.
-                    partial = False
-                    head = msgs
-
-            tmp_agent = AIAgent(
-                **runtime_kwargs,
-                model=model,
-                max_iterations=4,
-                quiet_mode=True,
-                skip_memory=True,
-                enabled_toolsets=["memory"],
-                session_id=session_entry.session_id,
-                session_db=getattr(self, "_session_db", None),
-            )
-            try:
-                tmp_agent._print_fn = lambda *a, **kw: None
-                if partial:
-                    # Partial compression summarizes only ``head`` and rejoins
-                    # ``tail`` in the gateway. In-place persistence inside the
-                    # agent would therefore install an incomplete live set
-                    # before the tail exists. Keep this mode on the legacy
-                    # rotation path: the full parent remains intact and the
-                    # completed head+tail transcript is written to its child.
-                    tmp_agent.compression_in_place = False
-
-                # ``head`` is wholly loaded from SQLite.  In legacy rotation
-                # mode the compression helper preserves only messages after
-                # this cursor in the parent; starting at zero duplicates the
-                # loaded history (and partial compression would duplicate the
-                # summarized head specifically).
-                tmp_agent._last_flushed_db_idx = len(head)
-
-                # Estimate with system prompt + tool schemas included so the
-                # figure reflects real request pressure, not a transcript-only
-                # underestimate (#6217). Must be computed after tmp_agent is
-                # built so _cached_system_prompt/tools are populated.
-                _sys_prompt = getattr(tmp_agent, "_cached_system_prompt", "") or ""
-                _tools = getattr(tmp_agent, "tools", None) or None
-                approx_tokens = estimate_request_tokens_rough(
-                    msgs, system_prompt=_sys_prompt, tools=_tools
-                )
-
-                compressor = tmp_agent.context_compressor
-                if not compressor.has_content_to_compress(head):
-                    return t("gateway.compress.nothing_to_do")
-
-                loop = asyncio.get_running_loop()
-                compressed, _ = await loop.run_in_executor(
-                    None,
-                    lambda: tmp_agent._compress_context(head, "", approx_tokens=approx_tokens, focus_topic=focus_topic, force=True)
-                )
-
-                # Re-append the verbatim tail after the compressed head,
-                # guarding the seam against illegal role adjacency.
-                if partial and tail:
-                    compressed = rejoin_compressed_head_and_tail(compressed, tail)
-
-                # _compress_context already calls end_session() on the old session
-                # (preserving its full transcript in SQLite) and creates a new
-                # session_id for the continuation.  Write the compressed messages
-                # into the NEW session so the original history stays searchable.
-                parent_session_id = session_entry.session_id
-                new_session_id = tmp_agent.session_id
-                rotated = new_session_id != parent_session_id
-                compacted_in_place = bool(
-                    getattr(tmp_agent, "_last_compaction_in_place", False)
-                )
-                if rotated:
-                    try:
-                        self.session_store.rewrite_transcript(
-                            new_session_id, compressed
-                        )
-                        session_entry = self.session_store.publish_compression_continuation(
-                            session_entry.session_key,
-                            parent_session_id,
-                            new_session_id,
-                        )
-                    except BaseException:
-                        self._rollback_unpublished_compression(
-                            parent_session_id, new_session_id
-                        )
-                        tmp_agent.session_id = parent_session_id
-                        raise
-                    self._sync_telegram_topic_binding(
-                        source, session_entry, reason="compress-command",
-                    )
-
-                if not (rotated or compacted_in_place):
-                    return "Compression did not produce a durable session update."
-
-                # Reset stored token count — transcript changed, old value is stale
-                if compacted_in_place:
-                    self.session_store.update_session(
-                        session_entry.session_key, last_prompt_tokens=0
-                    )
-                new_tokens = estimate_request_tokens_rough(
-                    compressed, system_prompt=_sys_prompt, tools=_tools
-                )
-                summary = summarize_manual_compression(
-                    msgs,
-                    compressed,
-                    approx_tokens,
-                    new_tokens,
-                )
-                # Detect summary-generation failure so we can surface a
-                # visible warning to the user even on the manual /compress
-                # path (otherwise the failure is silently logged).
-                # _last_compress_aborted means the aux LLM returned no
-                # usable summary and the compressor preserved messages
-                # unchanged (no drop, no placeholder).  force=True was
-                # passed above so any active cooldown is bypassed.
-                _summary_aborted = bool(getattr(compressor, "_last_compress_aborted", False))
-                _summary_err = getattr(compressor, "_last_summary_error", None)
-                # Separately: did the user's CONFIGURED aux model fail
-                # and we recovered via main?  Surface that as an info
-                # note so they can fix their config.
-                _aux_fail_model = getattr(compressor, "_last_aux_model_failure_model", None)
-                _aux_fail_err = getattr(compressor, "_last_aux_model_failure_error", None)
-            finally:
-                # Evict cached agent so next turn rebuilds system prompt
-                # from current files (SOUL.md, memory, etc.).
-                self._evict_cached_agent(session_key)
-                self._cleanup_agent_resources(tmp_agent)
-            lines = [f"🗜️ {summary['headline']}"]
-            if focus_topic:
-                lines.append(t("gateway.compress.focus_line", topic=focus_topic))
-            lines.append(summary["token_line"])
-            if summary["note"]:
-                lines.append(summary["note"])
-            if _summary_aborted:
-                lines.append(
-                    t(
-                        "gateway.compress.aborted",
-                        error=(_summary_err or "unknown error"),
-                    )
-                )
-            elif _aux_fail_model:
-                lines.append(
-                    t(
-                        "gateway.compress.aux_failed",
-                        model=_aux_fail_model,
-                        error=(_aux_fail_err or "unknown error"),
-                    )
-                )
-            return "\n".join(lines)
-        except Exception as e:
-            logger.warning("Manual compress failed: %s", e)
-            return t("gateway.compress.failed", error=e)
 
     async def _get_telegram_topic_capabilities(self, source: SessionSource) -> dict:
         """Read Telegram private-topic capability flags via Bot API getMe."""
@@ -12419,7 +11016,7 @@ class GatewayRunner:
                 lines.append(t("gateway.usage.label_cache_write", count=f"{cache_write:,}"))
             lines.append(t("gateway.usage.label_output_tokens", count=f"{output_tokens:,}"))
             lines.append(t("gateway.usage.label_total", count=f"{agent.session_total_tokens:,}"))
-            lines.append(t("gateway.usage.label_api_calls", count=agent.session_api_calls))
+            lines.append(f"Codex turns: {agent.session_api_calls}")
 
             # Cost estimation
             try:
@@ -12444,12 +11041,12 @@ class GatewayRunner:
                 pass
 
             # Context window and compressions
-            ctx = agent.context_compressor
-            if ctx.last_prompt_tokens:
-                pct = min(100, ctx.last_prompt_tokens / ctx.context_length * 100) if ctx.context_length else 0
-                lines.append(t("gateway.usage.label_context", used=f"{ctx.last_prompt_tokens:,}", total=f"{ctx.context_length:,}", pct=f"{pct:.0f}"))
-            if ctx.compression_count:
-                lines.append(t("gateway.usage.label_compressions", count=ctx.compression_count))
+            if agent.usage_available:
+                lines.append(f"Codex usage: {agent.session_total_tokens} tokens (provider-reported)")
+            else:
+                lines.append("Codex usage: unavailable")
+            if agent.compression_count:
+                lines.append(f"Codex compactions requested: {agent.compression_count}")
 
             if account_lines:
                 lines.append("")
@@ -13862,96 +12459,8 @@ class GatewayRunner:
         return await loop.run_in_executor(None, ctx.run, func, *args)
 
     def _decide_image_input_mode(self) -> str:
-        """Resolve the image-input routing for the currently active model.
-
-        Returns ``"native"`` (attach pixels on the user turn) or ``"text"``
-        (pre-analyze with vision_analyze and prepend the description). See
-        agent/image_routing.py for the full decision table.
-
-        The active provider/model are read from config.yaml so the decision
-        tracks ``/model`` switches automatically on the next message.
-        """
-        try:
-            from agent.image_routing import decide_image_input_mode
-            from agent.auxiliary_client import _read_main_model, _read_main_provider
-            from marlow_cli.config import load_config
-
-            cfg = load_config()
-            provider = _read_main_provider()
-            model = _read_main_model()
-            return decide_image_input_mode(provider, model, cfg)
-        except Exception as exc:
-            logger.debug("image_routing: decision failed, falling back to text — %s", exc)
-            return "text"
-
-    async def _enrich_message_with_vision(
-        self,
-        user_text: str,
-        image_paths: List[str],
-    ) -> str:
-        """
-        Auto-analyze user-attached images with the vision tool and prepend
-        the descriptions to the message text.
-
-        Each image is analyzed with a general-purpose prompt.  The resulting
-        description *and* the local cache path are injected so the model can:
-          1. Immediately understand what the user sent (no extra tool call).
-          2. Re-examine the image with vision_analyze if it needs more detail.
-
-        Args:
-            user_text:   The user's original caption / message text.
-            image_paths: List of local file paths to cached images.
-
-        Returns:
-            The enriched message string with vision descriptions prepended.
-        """
-        from tools.vision_tools import vision_analyze_tool
-        from agent.memory_manager import sanitize_context
-
-        analysis_prompt = (
-            "Describe everything visible in this image in thorough detail. "
-            "Include any text, code, data, objects, people, layout, colors, "
-            "and any other notable visual information."
-        )
-
-        enriched_parts = []
-        for path in image_paths:
-            try:
-                logger.debug("Auto-analyzing user image: %s", path)
-                result_json = await vision_analyze_tool(
-                    image_url=path,
-                    user_prompt=analysis_prompt,
-                )
-                result = json.loads(result_json)
-                if result.get("success"):
-                    description = result.get("analysis", "")
-                    description = sanitize_context(description)
-                    enriched_parts.append(
-                        f"[The user sent an image~ Here's what I can see:\n{description}]\n"
-                        f"[If you need a closer look, use vision_analyze with "
-                        f"image_url: {path} ~]"
-                    )
-                else:
-                    enriched_parts.append(
-                        "[The user sent an image but I couldn't quite see it "
-                        "this time (>_<) You can try looking at it yourself "
-                        f"with vision_analyze using image_url: {path}]"
-                    )
-            except Exception as e:
-                logger.error("Vision auto-analysis error: %s", e)
-                enriched_parts.append(
-                    f"[The user sent an image but something went wrong when I "
-                    f"tried to look at it~ You can try examining it yourself "
-                    f"with vision_analyze using image_url: {path}]"
-                )
-
-        # Combine: vision descriptions first, then the user's original text
-        if enriched_parts:
-            prefix = "\n\n".join(enriched_parts)
-            if user_text:
-                return f"{prefix}\n\n{user_text}"
-            return prefix
-        return user_text
+        """Pixels go to the active Codex model; unsupported models fail explicitly."""
+        return "native"
 
     def _build_process_event_source(self, evt: dict):
         """Resolve the canonical source for a synthetic background-process event.
@@ -14934,13 +13443,13 @@ class GatewayRunner:
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
-        
+
         Returns the full result dict from run_conversation, including:
           - "final_response": str (the text to send back)
           - "messages": list (full conversation including tool calls)
           - "api_calls": int
           - "completed": bool
-        
+
         This is run in a thread pool to not block the event loop.
         Supports interruption via new messages.
         """
@@ -14951,7 +13460,7 @@ class GatewayRunner:
             if run_generation is None or not session_key:
                 return True
             return self._is_session_run_current(session_key, run_generation)
-        
+
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
         telegram_digital_twin = _telegram_digital_twin_context(
@@ -15020,7 +13529,7 @@ class GatewayRunner:
                 )
             )
         )
-        
+
         # Queue for progress messages (thread-safe)
         progress_queue = queue.Queue() if tool_progress_enabled else None
         last_tool = [None]  # Mutable container for tracking in closure
@@ -15108,11 +13617,11 @@ class GatewayRunner:
             if progress_mode == "new" and tool_name == last_tool[0]:
                 return
             last_tool[0] = tool_name
-            
+
             # Build progress message with primary argument preview
             from agent.display import get_tool_emoji
             emoji = get_tool_emoji(tool_name, default="⚙️")
-            
+
             # Verbose mode: show detailed arguments, respects tool_preview_length
             if progress_mode == "verbose":
                 if args:
@@ -15130,7 +13639,7 @@ class GatewayRunner:
                     msg = f"{emoji} {tool_name}..."
                 progress_queue.put(msg)
                 return
-            
+
             # "all" / "new" modes: short preview, respects tool_preview_length
             # config (defaults to 40 chars when unset to keep gateway messages
             # compact — unlike CLI spinners, these persist as permanent messages).
@@ -15142,7 +13651,7 @@ class GatewayRunner:
                 msg = f"{emoji} {tool_name}: \"{preview}\""
             else:
                 msg = f"{emoji} {tool_name}..."
-            
+
             # Dedup: collapse consecutive identical progress messages.
             # Common with execute_code where models iterate with the same
             # code (same boilerplate imports → identical previews).
@@ -15154,9 +13663,9 @@ class GatewayRunner:
                 return
             last_progress_msg[0] = msg
             repeat_count[0] = 0
-            
+
             progress_queue.put(msg)
-        
+
         # Background task to send progress messages
         # Accumulates tool lines into a single message that gets edited.
         #
@@ -15510,13 +14019,13 @@ class GatewayRunner:
                 except Exception as e:
                     logger.error("Progress message error: %s", e)
                     await asyncio.sleep(1)
-        
+
         # We need to share the agent instance for interrupt support
         agent_holder = [None]  # Mutable container for the agent instance
         result_holder = [None]  # Mutable container for the result
         tools_holder = [None]   # Mutable container for the tool definitions
         stream_consumer_holder = [None]  # Mutable container for stream consumer
-        
+
         # Bridge sync step_callback → async hooks.emit for agent:step events
         _loop_for_step = asyncio.get_running_loop()
         _hooks_ref = self.hooks
@@ -15609,16 +14118,14 @@ class GatewayRunner:
             # session_key is now set via contextvars in _set_session_env()
             # (concurrency-safe). Keep os.environ as fallback for CLI/cron.
             os.environ["MARLOW_SESSION_KEY"] = "" if stateless_thread else (session_key or "")
-            old_stateless_flag = getattr(self, "_stateless_teams_thread_run", False)
-            self._stateless_teams_thread_run = stateless_thread
 
             # Read from env var or use default (same as CLI)
             max_iterations = int(os.getenv("MARLOW_MAX_ITERATIONS", "90"))
-            
+
             # Map platform enum to the platform hint key the agent understands.
             # Platform.LOCAL ("local") maps to "cli"; others pass through as-is.
             platform_key = "cli" if source.platform == Platform.LOCAL else source.platform.value
-            
+
             # Combine platform context, per-channel context, and the user-configured
             # ephemeral system prompt.
             combined_ephemeral = context_prompt or ""
@@ -15657,10 +14164,8 @@ class GatewayRunner:
                     "tools": [],
                 }
 
-            reasoning_config = self._resolve_session_reasoning_config(
-                source=source,
-                session_key=session_key,
-            )
+            reasoning_config = (self._load_reasoning_config() if stateless_thread else
+                self._resolve_session_reasoning_config(source=source, session_key=session_key))
             self._reasoning_config = reasoning_config
             # Set up stream consumer for token streaming or interim commentary.
             _stream_consumer = None
@@ -15822,8 +14327,8 @@ class GatewayRunner:
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
                     gateway_session_key=session_key,
+                    conversation_shared=__import__('agent.codex_environment', fromlist=['gateway_shared']).gateway_shared(source, getattr(self, "config", None)),
                     session_db=None if stateless_thread else self._session_db,
-                    fallback_providers=self._fallback_providers,
                     conversation_persistence_policy="none" if stateless_thread else "session",
                 )
                 if not stateless_thread and _cache_lock and _cache is not None:
@@ -15994,7 +14499,7 @@ class GatewayRunner:
             agent_holder[0] = agent
             # Capture the full tool definitions for transcript logging
             tools_holder[0] = agent.tools if hasattr(agent, 'tools') else None
-            
+
             # Convert history to agent format.
             # Two cases:
             #   1. Normal path (from transcript): simple {role, content, timestamp} dicts
@@ -16013,7 +14518,7 @@ class GatewayRunner:
                 history,
                 channel_prompt=channel_prompt,
             )
-            
+
             # Register per-session gateway approval callback so dangerous
             # command approval blocks the agent thread (mirrors CLI input()).
             # The callback bridges sync→async to send the approval request
@@ -16328,7 +14833,7 @@ class GatewayRunner:
                 _turn_context_token = set_current_turn(
                     TurnContext.from_source(
                         source,
-                        turn_id=_quick_key,
+                        turn_id=__import__("uuid").uuid4().hex,
                         session_key=_approval_session_key,
                         session_id=session_id or "",
                         mode=ExecutionMode.INTERACTIVE,
@@ -16435,7 +14940,7 @@ class GatewayRunner:
             # Signal the stream consumer that the agent is done
             if _stream_consumer is not None:
                 _stream_consumer.finish()
-            
+
             # Return final response, or a message if something went wrong
             final_response = result.get("final_response")
 
@@ -16445,11 +14950,11 @@ class GatewayRunner:
             _output_toks = 0
             _context_length = 0
             _agent = agent_holder[0]
-            if _agent and hasattr(_agent, "context_compressor"):
-                _last_prompt_toks = getattr(_agent.context_compressor, "last_prompt_tokens", 0)
+            if _agent:
+                _last_prompt_toks = getattr(_agent, "session_input_tokens", 0)
                 _input_toks = getattr(_agent, "session_prompt_tokens", 0)
                 _output_toks = getattr(_agent, "session_completion_tokens", 0)
-                _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
+                _context_length = getattr(_agent, "context_length", 0) or 0
             _resolved_model = getattr(_agent, "model", None) if _agent else None
 
             if not final_response:
@@ -16473,7 +14978,7 @@ class GatewayRunner:
                     "model": _resolved_model,
                     "context_length": _context_length,
                 }
-            
+
             # Sync session_id: the agent may have created a new session during
             # mid-run context compression (_compress_context splits sessions).
             # If so, update the session store entry so the NEXT message loads
@@ -16600,7 +15105,7 @@ class GatewayRunner:
                 "response_previewed": result.get("response_previewed", False),
                 "response_transformed": result.get("response_transformed", False),
             }
-        
+
         # Start progress message sender if enabled
         progress_task = None
         if tool_progress_enabled:
@@ -16619,7 +15124,7 @@ class GatewayRunner:
                 await asyncio.sleep(0.05)
 
         stream_task = asyncio.create_task(_start_stream_consumer())
-        
+
         # Track this agent as running for this session (for interrupt support)
         # We do this in a callback after the agent is created
         async def track_agent():
@@ -16644,9 +15149,9 @@ class GatewayRunner:
             self._running_agents[session_key] = agent_holder[0]
             if self._draining:
                 self._update_runtime_status("draining")
-        
+
         tracking_task = asyncio.create_task(track_agent())
-        
+
         # Monitor for interrupts from the adapter (new messages arriving).
         # This is the PRIMARY interrupt path for regular text messages —
         # Level 1 (base.py) catches them before _handle_message() is reached,
@@ -16692,7 +15197,7 @@ class GatewayRunner:
                     raise
                 except Exception as _mon_err:
                     logger.debug("monitor_for_interrupt error (will retry): %s", _mon_err)
-        
+
         interrupt_monitor = asyncio.create_task(monitor_for_interrupt())
 
         # Periodic "still working" notifications for long-running tasks.
@@ -16983,7 +15488,7 @@ class GatewayRunner:
             # Check if we were interrupted OR have a queued message (/queue).
             result = result_holder[0]
             adapter = self.adapters.get(source.platform)
-            
+
             # Get pending message from adapter.
             # Use session_key (not source.chat_id) to match adapter's storage keys.
             pending_event = None
@@ -17223,10 +15728,6 @@ class GatewayRunner:
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
             # Stop progress sender, interrupt monitor, and notification task
-            try:
-                self._stateless_teams_thread_run = old_stateless_flag
-            except Exception:
-                pass
             if progress_task:
                 progress_task.cancel()
             interrupt_monitor.cancel()
@@ -17259,7 +15760,7 @@ class GatewayRunner:
                             await stream_task
                         except asyncio.CancelledError:
                             pass
-            
+
             # Clean up tracking
             tracking_task.cancel()
             if session_key:
@@ -17273,7 +15774,7 @@ class GatewayRunner:
                 )
             if self._draining:
                 self._update_runtime_status("draining")
-            
+
             # Wait for cancelled tasks
             for task in [progress_task, interrupt_monitor, tracking_task, _notify_task]:
                 if task:
@@ -17468,7 +15969,7 @@ def _run_planned_stop_watcher(
 def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60):
     """
     Background thread that ticks the cron scheduler at a regular interval.
-    
+
     Runs inside the gateway process so cronjobs fire automatically without
     needing a separate `marlow cron daemon` or system cron entry.
 
@@ -17547,11 +16048,11 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
     """
     Start the gateway and run until interrupted.
-    
+
     This is the main entry point for running the gateway.
     Returns True if the gateway ran successfully, False if it failed to start.
     A False return causes a non-zero exit code so systemd can auto-restart.
-    
+
     Args:
         config: Optional gateway configuration override.
         replace: If True, kill any existing gateway instance before starting.
@@ -17689,7 +16190,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             logging.getLogger().setLevel(_stderr_level)
 
     runner = GatewayRunner(config)
-    
+
     # Track whether an unexpected signal initiated the shutdown. When an
     # unexpected SIGTERM kills the gateway, we exit non-zero so service
     # managers can revive the process. Planned stop paths write a marker
@@ -17805,7 +16306,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     def restart_signal_handler():
         runner.request_restart(detached=False, via_service=True)
-    
+
     loop = asyncio.get_running_loop()
 
     # Install a loop-level exception handler that swallows transient
@@ -17894,7 +16395,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         if runner.exit_reason:
             logger.error("Gateway exiting cleanly: %s", runner.exit_reason)
         return True
-    
+
     # Start background cron ticker so scheduled jobs fire automatically.
     # Pass the event loop so cron delivery can use live adapters (E2EE support).
     cron_stop = threading.Event()
@@ -17906,7 +16407,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         name="cron-ticker",
     )
     cron_thread.start()
-    
+
     # Wait for shutdown
     await runner.wait_for_shutdown()
 
@@ -17914,7 +16415,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         if runner.exit_reason:
             logger.error("Gateway exiting with failure: %s", runner.exit_reason)
         return False
-    
+
     # Stop cron ticker cleanly
     cron_stop.set()
     cron_thread.join(timeout=5)
@@ -17963,20 +16464,20 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 def main():
     """CLI entry point for the gateway."""
     import argparse
-    
+
     parser = argparse.ArgumentParser(description="Marlow Gateway - Multi-platform messaging")
     parser.add_argument("--config", "-c", help="Path to gateway config file")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
-    
+
     args = parser.parse_args()
-    
+
     config = None
     if args.config:
         import yaml
         with open(args.config, encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
             config = GatewayConfig.from_dict(data)
-    
+
     # Run the gateway - exit with code 1 if no platforms connected,
     # so systemd Restart=on-failure will retry on transient errors (e.g. DNS)
     success = asyncio.run(start_gateway(config))

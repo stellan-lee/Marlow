@@ -866,35 +866,7 @@ def _discover_memory_providers() -> list[tuple[str, str]]:
 
 
 def _discover_context_engines() -> list[tuple[str, str]]:
-    """Return [(name, description), ...] for available context engines.
-
-    Includes repo-shipped engines from ``plugins/context_engine/`` AND
-    plugin-registered engines (third-party engines installed as Marlow
-    plugins via ``ctx.register_context_engine``). Repo-shipped descriptions
-    win when a plugin-registered engine collides on name.
-    """
-    engines: list[tuple[str, str]] = []
-    seen: set[str] = set()
-
-    try:
-        from plugins.context_engine import discover_context_engines
-        for name, desc, _avail in discover_context_engines():
-            if name not in seen:
-                engines.append((name, desc))
-                seen.add(name)
-    except Exception:
-        pass
-
-    try:
-        from marlow_cli.plugins import discover_plugins, get_plugin_context_engine
-        discover_plugins()
-        plugin_engine = get_plugin_context_engine()
-        if plugin_engine and getattr(plugin_engine, "name", None) and plugin_engine.name not in seen:
-            engines.append((plugin_engine.name, "installed plugin"))
-    except Exception:
-        pass
-
-    return engines
+    return []
 
 
 def _get_current_memory_provider() -> str:
@@ -908,13 +880,7 @@ def _get_current_memory_provider() -> str:
 
 
 def _get_current_context_engine() -> str:
-    """Return the current context.engine from config."""
-    try:
-        from marlow_cli.config import load_config
-        config = load_config()
-        return cfg_get(config, "context", "engine", default="compressor") or "compressor"
-    except Exception:
-        return "compressor"
+    return 'Codex'
 
 
 def _save_memory_provider(name: str) -> None:
@@ -928,13 +894,7 @@ def _save_memory_provider(name: str) -> None:
 
 
 def _save_context_engine(name: str) -> None:
-    """Persist context.engine to config.yaml."""
-    from marlow_cli.config import load_config, save_config
-    config = load_config()
-    if "context" not in config:
-        config["context"] = {}
-    config["context"]["engine"] = name
-    save_config(config)
+    raise ValueError('Codex owns context management')
 
 
 def _configure_memory_provider() -> bool:
@@ -976,40 +936,6 @@ def _configure_memory_provider() -> bool:
 
 
 def _configure_context_engine() -> bool:
-    """Launch a radio picker for context engines. Returns True if changed."""
-    from marlow_cli.curses_ui import curses_radiolist
-
-    current = _get_current_context_engine()
-    engines = _discover_context_engines()
-
-    # Build items: "compressor" first (built-in), then discovered engines
-    items = ["compressor (default)"]
-    names = ["compressor"]
-    selected = 0
-
-    for name, desc in engines:
-        names.append(name)
-        label = f"{name} \u2014 {desc}" if desc else name
-        items.append(label)
-        if name == current:
-            selected = len(items) - 1
-
-    # If current engine isn't in discovered list and isn't compressor, add it
-    if current != "compressor" and current not in names:
-        names.append(current)
-        items.append(f"{current} (not found)")
-        selected = len(items) - 1
-
-    choice = curses_radiolist(
-        title="Context Engine (select one)",
-        items=items,
-        selected=selected,
-    )
-
-    new_engine = names[choice]
-    if new_engine != current:
-        _save_context_engine(new_engine)
-        return True
     return False
 
 
@@ -1048,7 +974,6 @@ def cmd_toggle() -> None:
     current_context = _get_current_context_engine()
     categories = [
         ("Memory Provider", current_memory, _configure_memory_provider),
-        ("Context Engine", current_context, _configure_context_engine),
     ]
 
     has_plugins = bool(plugin_names)

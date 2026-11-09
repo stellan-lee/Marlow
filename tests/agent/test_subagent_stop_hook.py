@@ -47,10 +47,10 @@ def _make_parent(depth: int = 0, session_id: str = "parent-1"):
 def _fresh_plugin_manager():
     """Each test gets a fresh PluginManager so hook callbacks don't
     leak between tests."""
-    original = plugins._plugin_manager
-    plugins._plugin_manager = plugins.PluginManager()
+    original = plugins._plugin_managers
+    plugins._plugin_managers = {str(__import__("marlow_constants").get_marlow_home().absolute()): plugins.PluginManager()}
     yield
-    plugins._plugin_manager = original
+    plugins._plugin_managers = original
 
 
 @pytest.fixture(autouse=True)

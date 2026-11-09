@@ -303,11 +303,12 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
     This prevents accidentally leaking secrets like API keys, tokens, or
     credentials to MCP server subprocesses.
     """
-    env = {}
-    for key, value in os.environ.items():
-        if key in _SAFE_ENV_KEYS or key.startswith("XDG_"):
-            env[key] = value
+    from agent.codex_environment import managed_environment, FORBIDDEN_ENV
+    runtime = managed_environment()
+    env = dict(runtime.overrides()['shell_environment_policy']['set'])
     if user_env:
+        if set(user_env) & FORBIDDEN_ENV or any(key.startswith('XDG_') for key in user_env):
+            raise ValueError('Marlow MCP environment cannot override managed discovery paths')
         env.update(user_env)
     return env
 
@@ -754,12 +755,13 @@ class SamplingHandler:
 
     def __init__(self, server_name: str, config: dict):
         self.server_name = server_name
+        self._authorization = None
+        self._authorization_lock = threading.Lock()
+        self._sampling_handles = set()
+        self._handles_lock = threading.Lock()
         self.max_rpm = _safe_numeric(config.get("max_rpm", 10), 10, int)
         self.timeout = _safe_numeric(config.get("timeout", 30), 30, float)
         self.max_tokens_cap = _safe_numeric(config.get("max_tokens_cap", 4096), 4096, int)
-        self.max_tool_rounds = _safe_numeric(
-            config.get("max_tool_rounds", 5), 5, int, minimum=0,
-        )
         self.model_override = config.get("model")
         self.allowed_models = config.get("allowed_models", [])
 
@@ -770,7 +772,6 @@ class SamplingHandler:
 
         # Per-instance state
         self._rate_timestamps: List[float] = []
-        self._tool_loop_count = 0
         self.metrics = {"requests": 0, "errors": 0, "tokens_used": 0, "tool_use_count": 0}
 
     # -- Rate limiting -------------------------------------------------------
@@ -887,66 +888,8 @@ class SamplingHandler:
 
     # -- Response building ---------------------------------------------------
 
-    def _build_tool_use_result(self, choice, response):
-        """Build a CreateMessageResultWithTools from an LLM tool_calls response."""
-        self.metrics["tool_use_count"] += 1
-
-        # Tool loop governance
-        if self.max_tool_rounds == 0:
-            self._tool_loop_count = 0
-            return self._error(
-                f"Tool loops disabled for server '{self.server_name}' (max_tool_rounds=0)"
-            )
-
-        self._tool_loop_count += 1
-        if self._tool_loop_count > self.max_tool_rounds:
-            self._tool_loop_count = 0
-            return self._error(
-                f"Tool loop limit exceeded for server '{self.server_name}' "
-                f"(max {self.max_tool_rounds} rounds)"
-            )
-
-        content_blocks = []
-        for tc in choice.message.tool_calls:
-            args = tc.function.arguments
-            if isinstance(args, str):
-                try:
-                    parsed = json.loads(args)
-                except (json.JSONDecodeError, ValueError):
-                    logger.warning(
-                        "MCP server '%s': malformed tool_calls arguments "
-                        "from LLM (wrapping as raw): %.100s",
-                        self.server_name, args,
-                    )
-                    parsed = {"_raw": args}
-            else:
-                parsed = args if isinstance(args, dict) else {"_raw": str(args)}
-
-            content_blocks.append(ToolUseContent(
-                type="tool_use",
-                id=tc.id,
-                name=tc.function.name,
-                input=parsed,
-            ))
-
-        logger.log(
-            self.audit_level,
-            "MCP server '%s' sampling response: model=%s, tokens=%s, tool_calls=%d",
-            self.server_name, response.model,
-            getattr(getattr(response, "usage", None), "total_tokens", "?"),
-            len(content_blocks),
-        )
-
-        return CreateMessageResultWithTools(
-            role="assistant",
-            content=content_blocks,
-            model=response.model,
-            stopReason="toolUse",
-        )
-
     def _build_text_result(self, choice, response):
         """Build a CreateMessageResult from a normal text response."""
-        self._tool_loop_count = 0  # reset on text response
         response_text = choice.message.content or ""
 
         logger.log(
@@ -969,9 +912,7 @@ class SamplingHandler:
         """Return kwargs to pass to ClientSession for sampling support."""
         return {
             "sampling_callback": self,
-            "sampling_capabilities": SamplingCapability(
-                tools=SamplingToolsCapability(),
-            ),
+            "sampling_capabilities": SamplingCapability(),
         }
 
     # -- Main callback -------------------------------------------------------
@@ -983,6 +924,15 @@ class SamplingHandler:
         ``CreateMessageResult``, ``CreateMessageResultWithTools``, or
         ``ErrorData``.
         """
+        authorization = self._authorization
+        if authorization is None or authorization._interrupt_requested or authorization._closed:
+            return self._error('Sampling requires an active host-authorized MCP tool operation')
+        with authorization._sampling_budget_lock:
+            if authorization._sampling_remaining <= 0:
+                return self._error('Sampling budget for this host turn is exhausted')
+            authorization._sampling_remaining -= 1
+        if getattr(params, 'tools', None):
+            return self._error('Tool-bearing sampling is unsupported; Codex owns tool reasoning')
         # Rate limit
         if not self._check_rate_limit():
             logger.warning(
@@ -999,7 +949,8 @@ class SamplingHandler:
         model = self._resolve_model(getattr(params, "modelPreferences", None))
 
         # Get auxiliary LLM client via centralized router
-        from agent.auxiliary_client import call_llm
+        from agent.codex_tasks import call_llm, TaskCancellation
+        cancellation = TaskCancellation()
 
         # Model whitelist check (we need to resolve model before calling)
         resolved_model = model or self.model_override or ""
@@ -1026,24 +977,6 @@ class SamplingHandler:
         if hasattr(params, "temperature") and params.temperature is not None:
             call_temperature = params.temperature
 
-        # Forward server-provided tools
-        call_tools = None
-        server_tools = getattr(params, "tools", None)
-        if server_tools:
-            call_tools = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": getattr(t, "name", ""),
-                        "description": getattr(t, "description", "") or "",
-                        "parameters": _normalize_mcp_input_schema(
-                            getattr(t, "inputSchema", None)
-                        ),
-                    },
-                }
-                for t in server_tools
-            ]
-
         logger.log(
             self.audit_level,
             "MCP server '%s' sampling request: model=%s, max_tokens=%d, messages=%d",
@@ -1052,16 +985,20 @@ class SamplingHandler:
 
         # Offload sync LLM call to thread (non-blocking)
         def _sync_call():
-            return call_llm(
-                task="mcp",
+            with authorization._profile_context():
+                return call_llm(
+                task="mcp:" + self.server_name,
+                host_scope=dict({key: getattr(authorization, '_' + key, None) for key in ('user_id','chat_id','thread_id')}, workspace_scope=authorization._workspace_scope, conversation_shared=authorization._conversation_shared),
+                parent_session_id=authorization.session_id, parent_agent=authorization, cancellation=cancellation,
                 model=resolved_model or None,
                 messages=messages,
                 temperature=call_temperature,
                 max_tokens=max_tokens,
-                tools=call_tools,
                 timeout=self.timeout,
             )
 
+        with self._handles_lock:
+            self._sampling_handles.add(cancellation)
         try:
             response = await asyncio.wait_for(
                 asyncio.to_thread(_sync_call), timeout=self.timeout,
@@ -1078,6 +1015,11 @@ class SamplingHandler:
                 f"Sampling LLM call failed: {_sanitize_error(_exc_str(exc))}"
             )
 
+        finally:
+            cancellation.cancel()
+            with self._handles_lock:
+                self._sampling_handles.discard(cancellation)
+
         # Guard against empty choices (content filtering, provider errors)
         if not getattr(response, "choices", None):
             self.metrics["errors"] += 1
@@ -1092,14 +1034,6 @@ class SamplingHandler:
         total_tokens = getattr(getattr(response, "usage", None), "total_tokens", 0)
         if isinstance(total_tokens, int):
             self.metrics["tokens_used"] += total_tokens
-
-        # Dispatch based on response type
-        if (
-            choice.finish_reason == "tool_calls"
-            and hasattr(choice.message, "tool_calls")
-            and choice.message.tool_calls
-        ):
-            return self._build_tool_use_result(choice, response)
 
         return self._build_text_result(choice, response)
 
@@ -1762,7 +1696,7 @@ class MCPServerTask:
 
         # Set up sampling handler if enabled and SDK types are available
         sampling_config = config.get("sampling", {})
-        if sampling_config.get("enabled", True) and _MCP_SAMPLING_TYPES:
+        if sampling_config.get("enabled", False) and _MCP_SAMPLING_TYPES:
             self._sampling = SamplingHandler(self.name, sampling_config)
         else:
             self._sampling = None
@@ -1977,7 +1911,9 @@ class MCPServerTask:
 # Module-level state
 # ---------------------------------------------------------------------------
 
-_servers: Dict[str, MCPServerTask] = {}
+from agent.profile_scope import ProfileMap, ProfileSet
+
+_servers = ProfileMap()
 
 # Circuit breaker: consecutive error counts per server.  After
 # _CIRCUIT_BREAKER_THRESHOLD consecutive failures, the handler returns
@@ -1996,8 +1932,8 @@ _servers: Dict[str, MCPServerTask] = {}
 # the breaker most recently transitioned into the open state. Use the
 # ``_bump_server_error`` / ``_reset_server_error`` helpers to mutate
 # this state — they keep the count and timestamp in sync.
-_server_error_counts: Dict[str, int] = {}
-_server_breaker_opened_at: Dict[str, float] = {}
+_server_error_counts = ProfileMap()
+_server_breaker_opened_at = ProfileMap()
 _CIRCUIT_BREAKER_THRESHOLD = 3
 _CIRCUIT_BREAKER_COOLDOWN_SEC = 60.0
 
@@ -2350,7 +2286,7 @@ def _handle_session_expired_and_retry(
 # Sanitized server names whose ``supports_parallel_tool_calls`` config is True.
 # Populated during ``register_mcp_servers()`` and queried by
 # ``is_mcp_tool_parallel_safe()`` for the parallel-execution check in run_agent.
-_parallel_safe_servers: set = set()
+_parallel_safe_servers = ProfileSet()
 
 # Exact MCP tool-name provenance. MCP tool names are formatted as
 # ``mcp_{sanitized_server}_{sanitized_tool}``, which is ambiguous when server
@@ -2358,7 +2294,7 @@ _parallel_safe_servers: set = set()
 # ``b_tool`` or server ``a_b`` + tool ``tool``). Keep the server component
 # captured at registration time so parallel safety never relies on prefix
 # guessing.
-_mcp_tool_server_names: Dict[str, str] = {}
+_mcp_tool_server_names = ProfileMap()
 
 # Dedicated event loop running in a background daemon thread.
 _mcp_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -2693,36 +2629,27 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         except InterruptedError:
             return _interrupted_call_result()
         except Exception as exc:
-            # Auth-specific recovery path: consult the manager, signal
-            # reconnect if viable, retry once. Returns None to fall
-            # through for non-auth exceptions.
-            recovered = _handle_auth_error_and_retry(
-                server_name, exc, _call_once,
-                f"tools/call {tool_name}",
-            )
-            if recovered is not None:
-                return recovered
-
-            # Transport session expiry (#13383): same reconnect flow
-            # but skips OAuth recovery because the access token is
-            # still valid — only the server-side session is stale.
-            recovered = _handle_session_expired_and_retry(
-                server_name, exc, _call_once,
-                f"tools/call {tool_name}",
-            )
-            if recovered is not None:
-                return recovered
-
+            # The server may have committed this operation before losing
+            # the response. Reconnect for future requests, never replay it.
             _bump_server_error(server_name)
             logger.error(
                 "MCP tool %s/%s call failed: %s",
                 server_name, tool_name, exc,
             )
-            return json.dumps({
+            failure = {
                 "error": _sanitize_error(
                     f"MCP call failed: {type(exc).__name__}: {_exc_str(exc)}"
+                ),
+                "operation_state": "needs_verification",
+            }
+            if _is_auth_error(exc):
+                failure.update(
+                    needs_reauth=True,
+                    server=server_name,
+                    error=f"MCP server '{server_name}' requires re-authentication. "
+                          f"Run `marlow mcp login {server_name}`. Verify the previous operation before retrying.",
                 )
-            }, ensure_ascii=False)
+            return json.dumps(failure, ensure_ascii=False)
 
     return _handler
 
@@ -2776,11 +2703,20 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
             logger.error(
                 "MCP %s/list_resources failed: %s", server_name, exc,
             )
-            return json.dumps({
+            failure = {
                 "error": _sanitize_error(
                     f"MCP call failed: {type(exc).__name__}: {_exc_str(exc)}"
+                ),
+                "operation_state": "needs_verification",
+            }
+            if _is_auth_error(exc):
+                failure.update(
+                    needs_reauth=True,
+                    server=server_name,
+                    error=f"MCP server '{server_name}' requires re-authentication. "
+                          f"Run `marlow mcp login {server_name}`. Verify the previous operation before retrying.",
                 )
-            }, ensure_ascii=False)
+            return json.dumps(failure, ensure_ascii=False)
 
     return _handler
 
@@ -2836,11 +2772,20 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
             logger.error(
                 "MCP %s/read_resource failed: %s", server_name, exc,
             )
-            return json.dumps({
+            failure = {
                 "error": _sanitize_error(
                     f"MCP call failed: {type(exc).__name__}: {_exc_str(exc)}"
+                ),
+                "operation_state": "needs_verification",
+            }
+            if _is_auth_error(exc):
+                failure.update(
+                    needs_reauth=True,
+                    server=server_name,
+                    error=f"MCP server '{server_name}' requires re-authentication. "
+                          f"Run `marlow mcp login {server_name}`. Verify the previous operation before retrying.",
                 )
-            }, ensure_ascii=False)
+            return json.dumps(failure, ensure_ascii=False)
 
     return _handler
 
@@ -2899,11 +2844,20 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
             logger.error(
                 "MCP %s/list_prompts failed: %s", server_name, exc,
             )
-            return json.dumps({
+            failure = {
                 "error": _sanitize_error(
                     f"MCP call failed: {type(exc).__name__}: {_exc_str(exc)}"
+                ),
+                "operation_state": "needs_verification",
+            }
+            if _is_auth_error(exc):
+                failure.update(
+                    needs_reauth=True,
+                    server=server_name,
+                    error=f"MCP server '{server_name}' requires re-authentication. "
+                          f"Run `marlow mcp login {server_name}`. Verify the previous operation before retrying.",
                 )
-            }, ensure_ascii=False)
+            return json.dumps(failure, ensure_ascii=False)
 
     return _handler
 
@@ -2970,11 +2924,20 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
             logger.error(
                 "MCP %s/get_prompt failed: %s", server_name, exc,
             )
-            return json.dumps({
+            failure = {
                 "error": _sanitize_error(
                     f"MCP call failed: {type(exc).__name__}: {_exc_str(exc)}"
+                ),
+                "operation_state": "needs_verification",
+            }
+            if _is_auth_error(exc):
+                failure.update(
+                    needs_reauth=True,
+                    server=server_name,
+                    error=f"MCP server '{server_name}' requires re-authentication. "
+                          f"Run `marlow mcp login {server_name}`. Verify the previous operation before retrying.",
                 )
-            }, ensure_ascii=False)
+            return json.dumps(failure, ensure_ascii=False)
 
     return _handler
 
@@ -3805,7 +3768,8 @@ def shutdown_mcp_servers():
 
     # Fast path: nothing to shut down.
     if not servers_snapshot:
-        _stop_mcp_loop()
+        if not any(_servers.profiles.values()):
+            _stop_mcp_loop()
         return
 
     async def _shutdown():
@@ -3836,7 +3800,8 @@ def shutdown_mcp_servers():
             except Exception as exc:
                 logger.debug("Error during MCP shutdown: %s", exc)
 
-    _stop_mcp_loop()
+    if not any(_servers.profiles.values()):
+        _stop_mcp_loop()
 
 
 def _kill_orphaned_mcp_children(include_active: bool = False) -> None:
@@ -3945,3 +3910,27 @@ def _stop_mcp_loop():
         # graceful shutdown are now orphaned — include active PIDs too
         # since the loop is gone and no session can still be in flight.
         _kill_orphaned_mcp_children(include_active=True)
+
+
+@__import__('contextlib').contextmanager
+def authorize_sampling(agent, tool_name):
+    """Bind sampling to one explicit tool invocation and trusted host actor."""
+    safe_server = _mcp_tool_server_names.get(tool_name)
+    with _lock:
+        server = next((value for name, value in _servers.items()
+                       if sanitize_mcp_name_component(name) == safe_server), None)
+    handler = getattr(server, '_sampling', None) if server else None
+    if handler is None:
+        yield
+        return
+    if not handler._authorization_lock.acquire(timeout=agent.turn_timeout):
+        raise TimeoutError('MCP sampling authorization is busy')
+    try:
+        handler._authorization = agent
+        yield
+    finally:
+        handler._authorization = None
+        with handler._handles_lock:
+            for handle in handler._sampling_handles:
+                handle.cancel()
+        handler._authorization_lock.release()

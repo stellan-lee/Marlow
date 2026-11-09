@@ -11,105 +11,10 @@ from agent.title_generator import (
 
 
 class TestGenerateTitle:
-    """Unit tests for generate_title()."""
-
-    def test_returns_title_on_success(self):
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "Debugging Python Import Errors"
-
-        with patch("agent.title_generator.call_llm", return_value=mock_response):
-            title = generate_title("help me fix this import", "Sure, let me check...")
-            assert title == "Debugging Python Import Errors"
-
-    def test_strips_quotes(self):
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = '"Setting Up Docker Environment"'
-
-        with patch("agent.title_generator.call_llm", return_value=mock_response):
-            title = generate_title("how do I set up docker", "First install...")
-            assert title == "Setting Up Docker Environment"
-
-    def test_strips_title_prefix(self):
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "Title: Kubernetes Pod Debugging"
-
-        with patch("agent.title_generator.call_llm", return_value=mock_response):
-            title = generate_title("my pod keeps crashing", "Let me look...")
-            assert title == "Kubernetes Pod Debugging"
-
-    def test_truncates_long_titles(self):
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "A" * 100
-
-        with patch("agent.title_generator.call_llm", return_value=mock_response):
-            title = generate_title("question", "answer")
-            assert len(title) == 80
-            assert title.endswith("...")
-
-    def test_returns_none_on_empty_response(self):
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = ""
-
-        with patch("agent.title_generator.call_llm", return_value=mock_response):
-            assert generate_title("question", "answer") is None
-
-    def test_returns_none_on_exception(self):
-        with patch("agent.title_generator.call_llm", side_effect=RuntimeError("no provider")):
-            assert generate_title("question", "answer") is None
-
-    def test_invokes_failure_callback_on_exception(self):
-        """failure_callback must fire so the user sees a warning (issue #15775)."""
-        captured = []
-
-        def _cb(task, exc):
-            captured.append((task, exc))
-
-        exc = RuntimeError("openrouter 402: credits exhausted")
-        with patch("agent.title_generator.call_llm", side_effect=exc):
-            result = generate_title("question", "answer", failure_callback=_cb)
-
-        assert result is None
-        assert len(captured) == 1
-        assert captured[0][0] == "title generation"
-        assert captured[0][1] is exc
-
-    def test_failure_callback_errors_are_swallowed(self):
-        """A broken callback must not crash title generation."""
-
-        def _bad_cb(task, exc):
-            raise ValueError("callback bug")
-
-        with patch("agent.title_generator.call_llm", side_effect=RuntimeError("nope")):
-            # Should return None without re-raising the callback error
-            assert generate_title("q", "a", failure_callback=_bad_cb) is None
-
-    def test_no_callback_matches_legacy_behavior(self):
-        """Omitting failure_callback preserves the silent-None return."""
-        with patch("agent.title_generator.call_llm", side_effect=RuntimeError("nope")):
-            assert generate_title("q", "a") is None
-
-    def test_truncates_long_messages(self):
-        """Long user/assistant messages should be truncated in the LLM request."""
-        captured_kwargs = {}
-
-        def mock_call_llm(**kwargs):
-            captured_kwargs.update(kwargs)
-            resp = MagicMock()
-            resp.choices = [MagicMock()]
-            resp.choices[0].message.content = "Short Title"
-            return resp
-
-        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
-            generate_title("x" * 1000, "y" * 1000)
-
-        # The user content in the messages should be truncated
-        user_content = captured_kwargs["messages"][1]["content"]
-        assert len(user_content) < 1100  # 500 + 500 + formatting
+    def test_title_is_local_and_bounded(self):
+        assert generate_title('  A short   question ', 'irrelevant') == 'A short question'
+        assert generate_title('', 'ignored') is None
+        assert len(generate_title('x' * 1000, 'ignored')) == 80
 
 
 class TestAutoTitleSession:

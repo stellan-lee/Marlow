@@ -1,35 +1,4 @@
-"""Routing helpers for inbound user-attached images.
-
-Two modes:
-
-  native  — attach images as OpenAI-style ``image_url`` content parts on the
-            user turn. The Codex and OpenAI-compatible transports translate
-            these into their request formats.
-
-  text    — run ``vision_analyze`` on each image up-front and prepend the
-            description to the user's text. The model never sees the pixels;
-            it only sees a lossy text summary. This is the pre-existing
-            behaviour and still the right choice for non-vision models.
-
-The decision is made once per message turn by :func:`decide_image_input_mode`.
-It reads ``agent.image_input_mode`` from config.yaml (``auto`` | ``native``
-| ``text``, default ``auto``) and the active model's capability metadata.
-
-In ``auto`` mode:
-  - If the user has explicitly configured ``auxiliary.vision.provider``
-    (i.e. not ``auto`` and not empty), we assume they want the text pipeline
-    regardless of the main model — they've opted in to a specific vision
-    backend for a reason (cost, quality, local-only, etc.).
-  - Otherwise, if the active Codex model supports vision, we attach natively.
-  - Otherwise (non-vision model, no explicit override), we fall back to text.
-
-This keeps ``vision_analyze`` surfaced as a tool in every session — skills
-and agent flows that chain it (browser screenshots, deeper inspection of
-URL-referenced images, style-gating loops) keep working. The routing only
-affects *how user-attached images on the current turn* are presented to the
-main model.
-"""
-
+"""Input image encoding and references for the sole Codex runtime."""
 from __future__ import annotations
 
 import base64
@@ -220,59 +189,10 @@ def _supports_vision_override(
     return None
 
 
-def _coerce_mode(raw: Any) -> str:
-    """Normalize a config value into one of the valid modes."""
-    if not isinstance(raw, str):
-        return "auto"
-    val = raw.strip().lower()
-    if val in _VALID_MODES:
-        return val
-    return "auto"
 
 
-def _explicit_aux_vision_override(cfg: Optional[Dict[str, Any]]) -> bool:
-    """True when the user configured a specific auxiliary vision backend.
-
-    An explicit override means the user *wants* the text pipeline (they're
-    paying for a dedicated vision model), so we don't silently bypass it.
-    """
-    if not isinstance(cfg, dict):
-        return False
-    aux = cfg.get("auxiliary") or {}
-    if not isinstance(aux, dict):
-        return False
-    vision = aux.get("vision") or {}
-    if not isinstance(vision, dict):
-        return False
-
-    provider = str(vision.get("provider") or "").strip().lower()
-    model = str(vision.get("model") or "").strip()
-    base_url = str(vision.get("base_url") or "").strip()
-
-    # "auto" / "" / blank = not explicit
-    if provider in {"", "auto"} and not model and not base_url:
-        return False
-    return True
 
 
-def _lookup_supports_vision(
-    provider: str,
-    model: str,
-    cfg: Optional[Dict[str, Any]] = None,
-) -> Optional[bool]:
-    """Return True/False if we can resolve caps, None if unknown.
-
-    Consults the user's ``supports_vision`` override in config.yaml first
-    (so custom/local models declared as vision-capable don't fall through to
-    text routing in ``auto`` mode). Codex models support native images;
-    unknown custom endpoints fall back to text routing unless configured.
-    """
-    override = _supports_vision_override(cfg, provider, model)
-    if override is not None:
-        return override
-    if provider == "openai-codex" and model:
-        return True
-    return None
 
 
 def decide_image_input_mode(
@@ -280,47 +200,8 @@ def decide_image_input_mode(
     model: str,
     cfg: Optional[Dict[str, Any]],
 ) -> str:
-    """Return ``"native"`` or ``"text"`` for the given turn.
-
-    Args:
-      provider: active inference provider ID (for example ``"openai-codex"`` or ``"custom"``).
-      model:    active model slug as it would be sent to the provider.
-      cfg:      loaded config.yaml dict, or None. When None, behaves as auto.
-    """
-    mode_cfg = "auto"
-    if isinstance(cfg, dict):
-        agent_cfg = cfg.get("agent") or {}
-        if isinstance(agent_cfg, dict):
-            mode_cfg = _coerce_mode(agent_cfg.get("image_input_mode"))
-
-    if mode_cfg == "native":
-        return "native"
-    if mode_cfg == "text":
-        return "text"
-
-    # auto
-    if _explicit_aux_vision_override(cfg):
-        return "text"
-
-    supports = _lookup_supports_vision(provider, model, cfg)
-    if supports is True:
-        return "native"
-    return "text"
-
-
-# Image size handling is REACTIVE rather than proactive: we attempt native
-# attachment at full size regardless of provider, and rely on
-# ``run_agent._try_shrink_image_parts_in_messages`` to shrink + retry if
-# the provider rejects the request (e.g. Anthropic's hard 5 MB per-image
-# ceiling returned as HTTP 400 "image exceeds 5 MB maximum").
-#
-# Why reactive: our knowledge of provider ceilings is partial and evolving
-# (OpenAI accepts 49 MB+, Anthropic 5 MB, Gemini 100 MB, others unknown).
-# A proactive per-provider table would be stale the moment a provider raises
-# or lowers its limit, and silently degrading quality for users on providers
-# that would have accepted the full image is the worse failure mode.
-# The shrink-on-reject path loses 1 API call + maybe 1s of Pillow work when
-# it fires, which is cheaper than permanent quality loss.
+    """Attach original pixels to Codex; model incompatibility is explicit."""
+    return 'native'
 
 
 def _sniff_mime_from_bytes(raw: bytes) -> Optional[str]:
@@ -387,11 +268,8 @@ def _guess_mime(path: Path, raw: Optional[bytes] = None) -> str:
 def _file_to_data_url(path: Path) -> Optional[str]:
     """Encode a local image as a base64 data URL at its native size.
 
-    Size limits are NOT enforced here — the agent retry loop
-    (``run_agent._try_shrink_image_parts_in_messages``) shrinks on the
-    provider's first rejection. Keeping this simple means providers that
-    accept large images (OpenAI 49 MB+, Gemini 100 MB) don't pay a silent
-    quality tax just because one other provider is stricter.
+    Input encoding preserves pixels. Codex owns provider capability errors;
+    Marlow does not retry inference through another vision model.
 
     Returns None only if the file can't be read (missing, permission
     denied, etc.); the caller reports those paths in ``skipped``.

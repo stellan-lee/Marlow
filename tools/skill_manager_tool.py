@@ -59,7 +59,7 @@ MAX_DESCRIPTION_LENGTH = 1024
 
 def _containing_skills_root(skill_path: Path) -> Path:
     """Return the skills root directory (local or external_dirs entry) that
-    contains ``skill_path``.  Falls back to the local ``SKILLS_DIR`` if no
+    contains ``skill_path``.  Falls back to the local ``_skills_path()`` if no
     match is found (defensive — callers should have located the skill via
     ``_find_skill`` first).
     """
@@ -76,7 +76,7 @@ def _containing_skills_root(skill_path: Path) -> Path:
             return root
         except (ValueError, OSError):
             continue
-    return SKILLS_DIR
+    return _skills_path()
 
 
 def _pinned_guard(name: str) -> Optional[str]:
@@ -213,8 +213,8 @@ def _validate_content_size(content: str, label: str = "SKILL.md") -> Optional[st
 def _resolve_skill_dir(name: str, category: str = None) -> Path:
     """Build the directory path for a new skill, optionally under a category."""
     if category:
-        return SKILLS_DIR / category / name
-    return SKILLS_DIR / name
+        return _skills_path() / category / name
+    return _skills_path() / name
 
 
 def _find_skill(name: str) -> Optional[Dict[str, Any]]:
@@ -259,8 +259,8 @@ def _find_skill_in_other_profiles(name: str) -> List[Tuple[str, Path]]:
         return matches
 
     # Collect (profile_name, skills_dir) for every profile EXCEPT the
-    # one whose SKILLS_DIR we already searched in _find_skill().
-    active_dir = SKILLS_DIR.resolve() if SKILLS_DIR.exists() else SKILLS_DIR
+    # one whose _skills_path() we already searched in _find_skill().
+    active_dir = _skills_path().resolve() if _skills_path().exists() else _skills_path()
     candidates: List[Tuple[str, Path]] = []
 
     # Default profile (~/.marlow/skills) — only consider when active is non-default.
@@ -382,11 +382,11 @@ def _resolve_skill_target(skill_dir: Path, file_path: str) -> Tuple[Optional[Pat
 def _atomic_write_text(file_path: Path, content: str, encoding: str = "utf-8") -> None:
     """
     Atomically write text content to a file.
-    
+
     Uses a temporary file in the same directory and os.replace() to ensure
     the target file is never left in a partially-written state if the process
     crashes or is interrupted.
-    
+
     Args:
         file_path: Target file path
         content: Content to write
@@ -459,7 +459,7 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     result = {
         "success": True,
         "message": f"Skill '{name}' created.",
-        "path": str(skill_dir.relative_to(SKILLS_DIR)),
+        "path": str(skill_dir.relative_to(_skills_path())),
         "skill_md": str(skill_md),
     }
     if category:
@@ -904,3 +904,9 @@ registry.register(
         absorbed_into=args.get("absorbed_into")),
     emoji="📝",
 )
+
+
+_INITIAL_SKILLS_DIR = SKILLS_DIR
+
+def _skills_path():
+    return SKILLS_DIR if SKILLS_DIR != _INITIAL_SKILLS_DIR else get_marlow_home() / "skills"

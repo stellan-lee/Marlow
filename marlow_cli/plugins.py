@@ -354,6 +354,7 @@ class PluginContext:
             emoji=emoji,
             action_intent=action_intent,
             override=override,
+            profile_scope=str(get_marlow_home().absolute()),
         )
         self._manager._plugin_tool_names.add(name)
         logger.debug(
@@ -504,36 +505,7 @@ class PluginContext:
     # -- context engine registration -----------------------------------------
 
     def register_context_engine(self, engine) -> None:
-        """Register a context engine to replace the built-in ContextCompressor.
-
-        Only one context engine plugin is allowed. If a second plugin tries
-        to register one, it is rejected with a warning.
-
-        The engine must be an instance of ``agent.context_engine.ContextEngine``.
-        """
-        if self._manager._context_engine is not None:
-            logger.warning(
-                "Plugin '%s' tried to register a context engine, but one is "
-                "already registered. Only one context engine plugin is allowed.",
-                self.manifest.name,
-            )
-            return
-        # Defer the import to avoid circular deps at module level
-        from agent.context_engine import ContextEngine
-        if not isinstance(engine, ContextEngine):
-            logger.warning(
-                "Plugin '%s' tried to register a context engine that does not "
-                "inherit from ContextEngine. Ignoring.",
-                self.manifest.name,
-            )
-            return
-        self._manager._context_engine = engine
-        logger.info(
-            "Plugin '%s' registered context engine: %s",
-            self.manifest.name, engine.name,
-        )
-
-    # -- web search/extract provider registration ----------------------------
+        raise ValueError('Context engines are retired; Codex owns context compaction')
 
     def register_web_search_provider(self, provider) -> None:
         """Register a web search/extract backend.
@@ -624,116 +596,8 @@ class PluginContext:
 
     # -- auxiliary task registration ---------------------------------------
 
-    def register_auxiliary_task(
-        self,
-        key: str,
-        *,
-        display_name: str,
-        description: str,
-        defaults: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        """Register a plugin-defined auxiliary LLM task.
-
-        Auxiliary tasks are LLM-backed side jobs (vision analysis, web extraction,
-        compression, smart-approval, etc.) that route through ``auxiliary_client.py``.
-        Each task has its own ``auxiliary.<key>`` config block where users can
-        pin a provider/model independent of the main chat model.
-
-        Plugins use this to declare their own auxiliary tasks without touching
-        core files. After registration, the task:
-
-          - Appears in the ``marlow model → Configure auxiliary models`` picker
-          - Has its provider/model/base_url/api_key bridged from config.yaml to
-            ``AUXILIARY_<KEY_UPPER>_*`` env vars at gateway startup
-          - Gets default routing fields (provider="auto", model="", etc.) merged
-            into loaded configs so ``cfg.get("auxiliary", {}).get(key)`` works
-
-        Args:
-            key: stable task key (snake_case). Used in config ``auxiliary.<key>``
-                and env vars ``AUXILIARY_<KEY_UPPER>_*``. Must not shadow a
-                built-in task key (vision, compression, web_extract, approval,
-                mcp, title_generation, curator).
-            display_name: human-readable name shown in the picker.
-            description: short one-line description shown next to the name.
-            defaults: optional dict of default routing fields. Recognized keys:
-                ``provider`` (default "auto"), ``model`` (default ""),
-                ``base_url`` (default ""), ``api_key`` (default ""),
-                ``timeout`` (default 60), ``extra_body`` (default {}),
-                plus any task-specific extras (e.g. ``download_timeout``).
-                Unknown keys are preserved verbatim — the plugin owns the
-                schema for its own task.
-
-        Raises:
-            ValueError: if *key* is empty, contains invalid characters, or
-                shadows a built-in auxiliary task key.
-
-        Example:
-            ctx.register_auxiliary_task(
-                key="memory_retain_filter",
-                display_name="Memory retain filter",
-                description="memory pre-retain dedup/extract",
-                defaults={"provider": "auto", "timeout": 30},
-            )
-        """
-        # Validate key shape
-        if not key or not isinstance(key, str):
-            raise ValueError(
-                f"Plugin '{self.manifest.name}' tried to register auxiliary task "
-                f"with invalid key {key!r}"
-            )
-        if not all(c.isalnum() or c == "_" for c in key):
-            raise ValueError(
-                f"Plugin '{self.manifest.name}' auxiliary task key {key!r} "
-                f"must contain only alphanumeric characters and underscores"
-            )
-
-        # Lazy import to avoid circular: marlow_cli.main imports plugins indirectly
-        from marlow_cli.main import _AUX_TASKS as _BUILTIN_AUX_TASKS
-
-        builtin_keys = {k for k, _name, _desc in _BUILTIN_AUX_TASKS}
-        if key in builtin_keys:
-            raise ValueError(
-                f"Plugin '{self.manifest.name}' cannot register auxiliary task "
-                f"{key!r} — that key is reserved for a built-in task. "
-                f"Pick a plugin-namespaced key (e.g. '{self.manifest.name}_{key}')."
-            )
-
-        # Reject duplicate registrations across plugins
-        existing = self._manager._aux_tasks.get(key)
-        if existing is not None and existing.get("plugin") != self.manifest.name:
-            raise ValueError(
-                f"Plugin '{self.manifest.name}' cannot register auxiliary task "
-                f"{key!r} — already registered by plugin "
-                f"'{existing.get('plugin')}'"
-            )
-
-        # Normalize defaults — plugin owns the schema, but we ensure routing
-        # fields exist with sensible types so consumers don't crash.
-        merged_defaults: Dict[str, Any] = {
-            "provider": "auto",
-            "model": "",
-            "base_url": "",
-            "api_key": "",
-            "timeout": 60,
-            "extra_body": {},
-        }
-        if defaults:
-            for k, v in defaults.items():
-                merged_defaults[k] = v
-
-        self._manager._aux_tasks[key] = {
-            "key": key,
-            "display_name": display_name,
-            "description": description,
-            "defaults": merged_defaults,
-            "plugin": self.manifest.name,
-        }
-        logger.debug(
-            "Plugin %s registered auxiliary task: %s (%s)",
-            self.manifest.name,
-            key,
-            display_name,
-        )
+    def register_auxiliary_task(self, key, **kwargs):
+        raise ValueError("Auxiliary model routing is retired; use the host Codex business-task API")
 
     def register_hook(self, hook_name: str, callback: Callable) -> None:
         """Register a lifecycle hook callback.
@@ -1294,7 +1158,10 @@ class PluginManager:
 
         key = manifest.key or manifest.name
         slug = key.replace("/", "__").replace("-", "_")
-        module_name = f"{_NS_PARENT}.{slug}"
+        import hashlib
+        from marlow_constants import get_marlow_home
+        namespace = hashlib.sha256((str(get_marlow_home().absolute()) + ':' + str(plugin_dir.absolute())).encode()).hexdigest()[:16]
+        module_name = f"{_NS_PARENT}.{slug}_{namespace}"
         spec = importlib.util.spec_from_file_location(
             module_name,
             init_file,
@@ -1420,15 +1287,19 @@ class PluginManager:
 # Module-level singleton & convenience functions
 # ---------------------------------------------------------------------------
 
-_plugin_manager: Optional[PluginManager] = None
+_plugin_managers: dict[str, PluginManager] = {}
+_plugin_manager_lock = __import__("threading").RLock()
 
 
 def get_plugin_manager() -> PluginManager:
-    """Return (and lazily create) the global PluginManager singleton."""
-    global _plugin_manager
-    if _plugin_manager is None:
-        _plugin_manager = PluginManager()
-    return _plugin_manager
+    """Return the manager owned by the current trusted Marlow Profile."""
+    key = str(get_marlow_home().absolute())
+    with _plugin_manager_lock:
+        manager = _plugin_managers.get(key)
+        if manager is None:
+            manager = PluginManager()
+            _plugin_managers[key] = manager
+        return manager
 
 
 def discover_plugins(force: bool = False) -> None:

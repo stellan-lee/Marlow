@@ -593,9 +593,9 @@ def ensure_marlow_home():
 # =============================================================================
 
 DEFAULT_CONFIG = {
-    "model": "",
-    "providers": {},
-    "fallback_providers": [],
+    "runtime": {"codex": {"binary": "", "turn_timeout": 600, "max_concurrent": 4,
+                              "pass_env": [], "projects": [], "skills": []}},
+    "model": {},
     "toolsets": ["marlow-cli"],
     "agent": {
         "max_turns": 90,
@@ -614,15 +614,6 @@ DEFAULT_CONFIG = {
         # budget routinely interrupted legitimate work on /restart. Raise
         # further in config.yaml if you run very-long-reasoning models.
         "restart_drain_timeout": 180,
-        # Max app-level retry attempts for API errors (connection drops,
-        # provider timeouts, 5xx, etc.) before the agent surfaces the
-        # failure.  The OpenAI SDK already does its own low-level retries
-        # (max_retries=2 default) for transient network errors; this is
-        # the Marlow-level retry loop that wraps the whole call.  Lower
-        # this to 1 if you use fallback providers and want fast failover
-        # on flaky primaries; raise it if you prefer to tolerate longer
-        # provider hiccups on a single provider.
-        "api_max_retries": 3,
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.
         # Values: "auto" (default — applies to gpt/codex models), true/false
@@ -690,23 +681,9 @@ DEFAULT_CONFIG = {
         # default is 1800s) plus runtime slack.  Set to 0 to disable the
         # gate and restore pre-fix behaviour (always inject).
         "gateway_auto_continue_freshness": 3600,
-        # How user-attached images are presented to the main model on each turn.
-        #   "auto"   — attach natively when the active model reports
-        #              supports_vision=True AND the user hasn't explicitly
-        #              configured auxiliary.vision.provider.  Otherwise fall
-        #              back to text (vision_analyze pre-analysis).
-        #   "native" — always attach natively; non-vision models will either
-        #              error at the provider or get a last-chance text fallback
-        #              (see run_agent._prepare_messages_for_api).
-        #   "text"   — always pre-analyze with vision_analyze and prepend the
-        #              description as text; the main model never sees pixels.
-        # Affects gateway platforms, and single-query CLI image input.  vision_analyze
-        # remains available as a tool regardless of this setting — the routing
-        # only controls how inbound user images are presented.
-        "image_input_mode": "auto",
         "disabled_toolsets": [],
     },
-    
+
     "terminal": {
         "backend": "local",
         "cwd": ".",  # Use current directory
@@ -891,108 +868,7 @@ DEFAULT_CONFIG = {
         },
     },
 
-    "compression": {
-        "enabled": True,
-        "threshold": 0.50,            # compress when context usage exceeds this ratio
-        "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
-        "protect_last_n": 20,         # minimum recent messages to keep uncompressed
-        "hygiene_hard_message_limit": 400,  # gateway session-hygiene force-compress threshold by message count
-        "protect_first_n": 3,         # non-system head messages always preserved
-                                      # verbatim, in ADDITION to the system prompt
-                                      # (which is always implicitly protected). Set to
-                                      # 0 for long-running rolling-compaction sessions
-                                      # where you want nothing pinned except the
-                                      # system prompt + rolling summary + recent tail.
-        "abort_on_summary_failure": False,  # When True, auto-compression that fails
-                                      # to generate a summary (aux LLM errored / returned
-                                      # non-JSON / timed out) aborts entirely instead of
-                                      # dropping the middle window with a static
-                                      # "summary unavailable" placeholder.  Messages are
-                                      # preserved unchanged and the session "freezes" at
-                                      # its current size until the user runs /compress
-                                      # (which bypasses the failure cooldown) or /new.
-                                      # Default False matches historical behavior; set to
-                                      # True if you'd rather pause than silently lose
-                                      # context turns when your aux model is flaky.
-        "in_place": True,             # Keep one durable session id while soft-archiving
-                                      # pre-compaction turns for search/recovery.
-    },
 
-    # Auxiliary model config — provider:model for each side task.
-    # Format: provider is the provider name, model is the model slug.
-    # "auto" for provider = auto-detect best available provider.
-    # Empty model = use provider's default auxiliary model.
-    # Tasks use Codex or a configured custom/local endpoint.
-    #
-    # extra_body: forwarded verbatim as request body fields on every aux call
-    # for that task. Use this for endpoint-specific OpenAI-compatible fields.
-    "auxiliary": {
-        "vision": {
-            "provider": "auto",    # auto | openai-codex | lmstudio | custom
-            "model": "",           # endpoint model name
-            "base_url": "",        # direct OpenAI-compatible endpoint (takes precedence over provider)
-            "api_key": "",         # API key for base_url
-            "timeout": 120,        # seconds — LLM API call timeout; vision payloads need generous timeout
-            "extra_body": {},      # OpenAI-compatible provider-specific request fields
-            "download_timeout": 30,  # seconds — image HTTP download timeout; increase for slow connections
-        },
-        "web_extract": {
-            "provider": "auto",
-            "model": "",
-            "base_url": "",
-            "api_key": "",
-            "timeout": 360,        # seconds (6min) — per-attempt LLM summarization timeout; increase for slow local models
-            "extra_body": {},
-        },
-        "compression": {
-            "provider": "auto",
-            "model": "",
-            "base_url": "",
-            "api_key": "",
-            "timeout": 120,        # seconds — compression summarises large contexts; increase for local models
-            "extra_body": {},
-        },
-        # Note: session_search no longer uses an auxiliary LLM (PR #27590 —
-        # single-shape tool returns DB content directly). The old
-        # ``auxiliary.session_search.*`` block was removed here. Existing
-        # values in user config.yaml files are harmless leftovers and ignored.
-        "approval": {
-            "provider": "auto",
-            "model": "",           # optional smaller compatible model
-            "base_url": "",
-            "api_key": "",
-            "timeout": 30,
-            "extra_body": {},
-        },
-        "mcp": {
-            "provider": "auto",
-            "model": "",
-            "base_url": "",
-            "api_key": "",
-            "timeout": 30,
-            "extra_body": {},
-        },
-        "title_generation": {
-            "provider": "auto",
-            "model": "",
-            "base_url": "",
-            "api_key": "",
-            "timeout": 30,
-            "extra_body": {},
-        },
-        # Profile describer — auto-generates a 1-2 sentence description
-        # of what a profile is good at. Invoked by
-        # ``marlow profile describe <name> --auto``. Short, cheap call.
-        "profile_describer": {
-            "provider": "auto",
-            "model": "",
-            "base_url": "",
-            "api_key": "",
-            "timeout": 60,
-            "extra_body": {},
-        },
-    },
-    
     "display": {
         "compact": False,
         "resume_display": "full",
@@ -1083,21 +959,11 @@ DEFAULT_CONFIG = {
     "privacy": {
         "redact_pii": False,  # When True, hash user IDs and strip phone numbers from LLM context
     },
-    
+
     "human_delay": {
         "mode": "off",
         "min_ms": 800,
         "max_ms": 2500,
-    },
-    
-    # Context engine -- controls how the context window is managed when
-    # approaching the model's token limit.
-    # "compressor" = built-in lossy summarization (default).
-    # Set to a plugin name to activate an alternative engine (e.g. "lcm"
-    # for Lossless Context Management).  The engine must be installed as
-    # a plugin in plugins/context_engine/<name>/ or ~/.marlow/plugins/.
-    "context": {
-        "engine": "compressor",
     },
 
     # Persistent memory -- bounded curated memory injected into system prompt
@@ -1189,11 +1055,6 @@ DEFAULT_CONFIG = {
     # Uses the same runtime provider resolution as CLI/gateway startup, so all
     # retained Codex and custom/local compatible runtimes are supported.
     "delegation": {
-        "model": "",       # empty = inherit parent model
-        "provider": "",    # empty = inherit parent provider + credentials
-        "base_url": "",    # direct OpenAI-compatible endpoint for subagents
-        "api_key": "",     # API key for delegation.base_url (falls back to OPENAI_API_KEY)
-        "api_mode": "",    # "chat_completions" or "codex_responses"; empty = auto
         # When delegate_task narrows child toolsets explicitly, preserve any
         # MCP toolsets the parent already has enabled. On by default so
         # narrowing (e.g. toolsets=["web","browser"]) expresses "I want these
@@ -1216,14 +1077,8 @@ DEFAULT_CONFIG = {
         "max_spawn_depth": 1,        # depth cap (1 = flat [default], 2 = orchestrator→leaf, 3 = three-level)
         "orchestrator_enabled": True,  # kill switch for role="orchestrator"
         # When a subagent hits a dangerous-command approval prompt, the parent's
-        # single-query terminal approval owns stdin — a thread-local input() call from the
-        # subagent worker would deadlock the parent UI. To avoid the deadlock,
-        # subagent threads ALWAYS resolve approvals non-interactively:
-        #   false (default) → auto-deny with a logger.warning audit line (safe)
-        #   true             → auto-approve "once" with a logger.warning audit line
-        # Flip to true only if you trust delegated work to run dangerous cmds
-        # without human review (cron pipelines, batch automation, etc.).
-        "subagent_auto_approve": False,
+        # Delegated work needs the trusted operation-bound approval channel.
+        # Without one, dangerous operations are denied.
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
@@ -1232,7 +1087,7 @@ DEFAULT_CONFIG = {
     "prefill_messages_file": "",
 
     # Goals — persistent cross-turn goals (Ralph-style loop).
-    # After every turn, a lightweight judge call asks the auxiliary model
+    # Explicitly enabled goals use the same Codex runtime to judge whether
     # whether the active /goal is satisfied by the assistant's last
     # response. If not, Marlow feeds a continuation prompt back into the
     # same session and keeps working until the goal is done, the turn
@@ -1874,22 +1729,22 @@ OPTIONAL_ENV_VARS = {'MARLOW_MCP_BEARER_TOKEN': {'description': 'Bearer token fo
 def get_missing_env_vars(required_only: bool = False) -> List[Dict[str, Any]]:
     """
     Check which environment variables are missing.
-    
+
     Returns list of dicts with var info for missing variables.
     """
     missing = []
-    
+
     # Check required vars
     for var_name, info in REQUIRED_ENV_VARS.items():
         if not get_env_value(var_name):
             missing.append({"name": var_name, **info, "is_required": True})
-    
+
     # Check optional vars (if not required_only)
     if not required_only:
         for var_name, info in OPTIONAL_ENV_VARS.items():
             if not get_env_value(var_name):
                 missing.append({"name": var_name, **info, "is_required": False})
-    
+
     return missing
 
 
@@ -1944,7 +1799,7 @@ def _set_nested(config, dotted_key: str, value):
 def get_missing_config_fields() -> List[Dict[str, Any]]:
     """
     Check which config fields are missing or outdated (recursive).
-    
+
     Walks the DEFAULT_CONFIG tree at arbitrary depth and reports any keys
     present in defaults but absent from the user's loaded config.
     """
@@ -2016,196 +1871,10 @@ def get_missing_skill_config_vars() -> List[Dict[str, Any]]:
     return missing
 
 
-def _normalize_custom_provider_entry(
-    entry: Any,
-    *,
-    provider_key: str = "",
-) -> Optional[Dict[str, Any]]:
-    """Return a runtime-compatible custom provider entry or ``None``."""
-    if not isinstance(entry, dict):
-        return None
-
-    _KNOWN_KEYS = {
-        "name", "base_url", "api_key", "key_env", "api_mode", "model", "models",
-        "context_length", "rate_limit_delay",
-        "request_timeout_seconds", "stale_timeout_seconds",
-        "discover_models", "extra_body",
-    }
-    unknown = set(entry.keys()) - _KNOWN_KEYS
-    if unknown:
-        logger.warning(
-            "providers.%s: unknown config keys ignored: %s",
-            provider_key or "?", ", ".join(sorted(unknown)),
-        )
-
-    from urllib.parse import urlparse
-
-    base_url = ""
-    for url_key in ("base_url",):
-        raw_url = entry.get(url_key)
-        if isinstance(raw_url, str) and raw_url.strip():
-            candidate = raw_url.strip()
-            parsed = urlparse(candidate)
-            if parsed.scheme and parsed.netloc:
-                base_url = candidate
-                break
-            else:
-                logger.warning(
-                    "providers.%s: '%s' value '%s' is not a valid URL "
-                    "(no scheme or host) — skipped",
-                    provider_key or "?", url_key, candidate,
-                )
-    if not base_url:
-        return None
-
-    name = ""
-    raw_name = entry.get("name")
-    if isinstance(raw_name, str) and raw_name.strip():
-        name = raw_name.strip()
-    elif provider_key.strip():
-        name = provider_key.strip()
-    if not name:
-        return None
-
-    normalized: Dict[str, Any] = {
-        "name": name,
-        "base_url": base_url,
-    }
-
-    provider_key = provider_key.strip()
-    if provider_key:
-        normalized["provider_key"] = provider_key
-
-    api_key = entry.get("api_key")
-    if isinstance(api_key, str) and api_key.strip():
-        normalized["api_key"] = api_key.strip()
-
-    key_env = entry.get("key_env")
-    if isinstance(key_env, str) and key_env.strip():
-        normalized["key_env"] = key_env.strip()
-
-    api_mode = entry.get("api_mode")
-    if isinstance(api_mode, str) and api_mode.strip():
-        normalized["api_mode"] = api_mode.strip()
-
-    model_name = entry.get("model")
-    if isinstance(model_name, str) and model_name.strip():
-        normalized["model"] = model_name.strip()
-
-    models = entry.get("models")
-    if isinstance(models, dict) and models:
-        normalized["models"] = models
-
-    context_length = entry.get("context_length")
-    if isinstance(context_length, int) and context_length > 0:
-        normalized["context_length"] = context_length
-
-    rate_limit_delay = entry.get("rate_limit_delay")
-    if isinstance(rate_limit_delay, (int, float)) and rate_limit_delay >= 0:
-        normalized["rate_limit_delay"] = rate_limit_delay
-
-    discover_models = entry.get("discover_models")
-    if isinstance(discover_models, bool):
-        normalized["discover_models"] = discover_models
-
-    extra_body = entry.get("extra_body")
-    if isinstance(extra_body, dict):
-        normalized["extra_body"] = dict(extra_body)
-
-    return normalized
-
-
-def get_custom_provider_entries(providers_dict: Any) -> List[Dict[str, Any]]:
-    """Normalize canonical ``providers`` entries for runtime consumers."""
-    if not isinstance(providers_dict, dict):
-        return []
-
-    custom_providers: List[Dict[str, Any]] = []
-    for key, entry in providers_dict.items():
-        normalized = _normalize_custom_provider_entry(entry, provider_key=str(key))
-        if normalized is not None:
-            custom_providers.append(normalized)
-
-    return custom_providers
-
-
-def load_custom_provider_entries(
-    config: Optional[Dict[str, Any]] = None,
-) -> List[Dict[str, Any]]:
-    """Return normalized custom endpoints from canonical ``providers`` config."""
-    if config is None:
-        config = load_config()
-    return get_custom_provider_entries(config.get("providers"))
-
-
-def get_custom_provider_context_length(
-    model: str,
-    base_url: str,
-    custom_providers: Optional[List[Dict[str, Any]]] = None,
-    config: Optional[Dict[str, Any]] = None,
-) -> Optional[int]:
-    """Look up a per-model ``context_length`` override for a custom endpoint.
-
-    Matches any entry whose ``base_url`` equals ``base_url`` (trailing-slash
-    insensitive) and returns ``custom_providers[i].models.<model>.context_length``
-    if present and valid.  Returns ``None`` when no override applies.
-
-    This is the single source of truth for custom-provider context overrides,
-    used by:
-      * ``AIAgent.__init__`` (startup resolution)
-      * ``AIAgent.switch_model`` (mid-session ``/model`` switch)
-      * ``marlow_cli.model_switch.resolve_display_context_length`` (``/model`` confirmation display)
-      * ``gateway.run._format_session_info`` (``/info`` display)
-      * ``agent.model_metadata.get_model_context_length`` (when custom_providers is threaded through)
-
-    Before this helper existed, the lookup was duplicated in ``run_agent.py``'s
-    startup path only; every other path (notably ``/model`` switch) fell back
-    to the 128K default.  See #15779.
-    """
-    if not model or not base_url:
-        return None
-    if custom_providers is None:
-        try:
-            custom_providers = load_custom_provider_entries(config)
-        except Exception:
-            if config is None:
-                return None
-            custom_providers = []
-    if not isinstance(custom_providers, list):
-        return None
-
-    target_url = (base_url or "").rstrip("/")
-    if not target_url:
-        return None
-
-    for entry in custom_providers:
-        if not isinstance(entry, dict):
-            continue
-        entry_url = (entry.get("base_url") or "").rstrip("/")
-        if not entry_url or entry_url != target_url:
-            continue
-        models = entry.get("models")
-        if not isinstance(models, dict):
-            continue
-        model_cfg = models.get(model)
-        if not isinstance(model_cfg, dict):
-            continue
-        raw_ctx = model_cfg.get("context_length")
-        if raw_ctx is None:
-            continue
-        try:
-            ctx = int(raw_ctx)
-        except (TypeError, ValueError):
-            continue
-        if ctx > 0:
-            return ctx
-    return None
-
-
 def check_config_version() -> Tuple[int, int]:
     """
     Check config version.
-    
+
     Returns (current_version, latest_version).
     """
     config = load_config()
@@ -2220,7 +1889,7 @@ def check_config_version() -> Tuple[int, int]:
 
 # Fields that are valid at root level of config.yaml
 _KNOWN_ROOT_KEYS = {
-    "_config_version", "model", "providers", "fallback_providers", "toolsets",
+    "_config_version", "runtime", "toolsets",
     "agent", "terminal", "display", "compression", "delegation",
     "auxiliary", "context", "memory", "gateway",
     "sessions", "streaming",
@@ -2255,74 +1924,10 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
 
     issues: List[ConfigIssue] = []
 
-    providers = config.get("providers")
-    if providers is not None and not isinstance(providers, dict):
-        issues.append(ConfigIssue(
-            "error",
-            "providers must be a mapping keyed by provider name",
-            "Use: providers:\n  my-provider:\n    base_url: https://...",
-        ))
-    elif isinstance(providers, dict):
-        for key, entry in providers.items():
-            if not isinstance(entry, dict):
-                issues.append(ConfigIssue(
-                    "warning",
-                    f"providers.{key} is not a mapping",
-                    "Each provider needs at minimum: base_url",
-                ))
-            elif not entry.get("base_url"):
-                issues.append(ConfigIssue(
-                    "warning",
-                    f"providers.{key} is missing 'base_url'",
-                    "Add the API endpoint URL, e.g. base_url: https://api.example.com/v1",
-                ))
-
-    # ── fallback_providers: ordered list of provider/model entries ───────
-    fb = config.get("fallback_providers")
-    if fb is not None:
-        if isinstance(fb, list):
-            for i, entry in enumerate(fb):
-                if not isinstance(entry, dict):
-                    issues.append(ConfigIssue(
-                        "error",
-                        f"fallback_providers[{i}] should be a dict, got {type(entry).__name__}",
-                        "Each entry needs provider + model",
-                    ))
-                else:
-                    if not entry.get("provider"):
-                        issues.append(ConfigIssue(
-                            "warning",
-                            f"fallback_providers[{i}] is missing 'provider' field",
-                            "Add: provider: openai-codex or a configured custom provider",
-                        ))
-                    if not entry.get("model"):
-                        issues.append(ConfigIssue(
-                            "warning",
-                            f"fallback_providers[{i}] is missing 'model' field",
-                            "Add: model: <model-name>",
-                        ))
-        else:
-            issues.append(ConfigIssue(
-                "error",
-                f"fallback_providers should be a list, got {type(fb).__name__}",
-                "Change to:\n"
-                "  fallback_providers:\n"
-                "    - provider: openai-codex\n"
-                "      model: gpt-5.3-codex",
-            ))
-
-    # ── model section: should exist when custom providers are configured ──
-    model_cfg = config.get("model")
-    if providers and not model_cfg:
-        issues.append(ConfigIssue(
-            "warning",
-            "providers defined but no 'model' section — Marlow won't know which provider to use",
-            "Add a model section:\n"
-            "  model:\n"
-            "    provider: custom\n"
-            "    default: your-model-name\n"
-            "    base_url: https://...",
-        ))
+    for key in ('model', 'providers', 'custom_providers', 'fallback_providers', 'auxiliary', 'smart_model_routing', 'compression', 'context'):
+        if config.get(key):
+            issues.append(ConfigIssue('error', f'{key} is retired for inference/context management',
+                'Preserve a backup, move model settings to runtime/codex/config.toml and remove retired YAML keys.'))
 
     # ── Root-level keys that look misplaced ──────────────────────────────
     for key in config:
@@ -2699,49 +2304,6 @@ _SECURITY_COMMENT = """
 #   tirith_fail_open: true
 """
 
-_FALLBACK_COMMENT = """
-# ── Fallback Model ────────────────────────────────────────────────────
-# Automatic provider failover when primary is unavailable.
-# Uncomment and configure to enable. Triggers on rate limits (429),
-# overload (529), service errors (503), or connection failures.
-#
-# Supported providers are OpenAI Codex and configured custom/local
-# OpenAI-compatible endpoints.
-#
-# For custom OpenAI-compatible endpoints, add base_url and key_env.
-#
-# fallback_providers:
-#   - provider: custom
-#     model: local-model
-#     base_url: http://localhost:8000/v1
-"""
-
-
-_COMMENTED_SECTIONS = """
-# ── Security ──────────────────────────────────────────────────────────
-# Secret redaction is ON by default. Set to false to pass tool output,
-# logs, and chat responses through unmodified (e.g. for redactor dev).
-#
-# security:
-#   redact_secrets: true
-
-# ── Fallback Model ────────────────────────────────────────────────────
-# Automatic provider failover when primary is unavailable.
-# Uncomment and configure to enable. Triggers on rate limits (429),
-# overload (529), service errors (503), or connection failures.
-#
-# Supported providers are OpenAI Codex and configured custom/local
-# OpenAI-compatible endpoints.
-#
-# For custom OpenAI-compatible endpoints, add base_url and key_env.
-#
-# fallback_providers:
-#   - provider: custom
-#     model: local-model
-#     base_url: http://localhost:8000/v1
-"""
-
-
 def save_config(config: Dict[str, Any]):
     """Save configuration to ~/.marlow/config.yaml."""
     with _CONFIG_LOCK:
@@ -2768,13 +2330,6 @@ def save_config(config: Dict[str, Any]):
         sec = normalized.get("security", {})
         if not sec or sec.get("redact_secrets") is None:
             parts.append(_SECURITY_COMMENT)
-        fb = normalized.get("fallback_providers", [])
-        fb_is_valid = isinstance(fb, list) and any(
-            isinstance(e, dict) and e.get("provider") and e.get("model") for e in fb
-        )
-        if not fb_is_valid:
-            parts.append(_FALLBACK_COMMENT)
-
         atomic_yaml_write(
             config_path,
             normalized,
@@ -2939,7 +2494,7 @@ def save_env_value(key: str, value: str):
         if lines and not lines[-1].endswith("\n"):
             lines[-1] += "\n"
         lines.append(f"{key}={value}\n")
-    
+
     fd, tmp_path = tempfile.mkstemp(dir=str(env_path.parent), suffix='.tmp', prefix='.env_')
     # Preserve original permissions so Docker volume mounts aren't clobbered.
     original_mode = None
@@ -3065,7 +2620,7 @@ def get_env_value(key: str) -> Optional[str]:
     # Check environment first
     if key in os.environ:
         return os.environ[key]
-    
+
     # Then check .env file
     env_vars = load_env()
     return env_vars.get(key)
@@ -3088,29 +2643,29 @@ def redact_key(key: str) -> str:
 def show_config():
     """Display current configuration."""
     config = load_config()
-    
+
     print()
     print(color("┌─────────────────────────────────────────────────────────┐", Colors.CYAN))
     print(color("│              ⚕ Marlow Configuration                    │", Colors.CYAN))
     print(color("└─────────────────────────────────────────────────────────┘", Colors.CYAN))
-    
+
     # Paths
     print()
     print(color("◆ Paths", Colors.CYAN, Colors.BOLD))
     print(f"  Config:       {get_config_path()}")
     print(f"  Secrets:      {get_env_path()}")
     print(f"  Install:      {get_project_root()}")
-    
+
     # API Keys
     print()
     print(color("◆ API Keys", Colors.CYAN, Colors.BOLD))
-    
+
     keys = [
         ("LM_API_KEY", "LM Studio"),
         ("BRAVE_SEARCH_API_KEY", "Brave Search"),
         ("HONCHO_API_KEY", "Honcho"),
     ]
-    
+
     for env_key, name in keys:
         value = get_env_value(env_key)
         print(f"  {name:<14} {redact_key(value)}")
@@ -3119,7 +2674,7 @@ def show_config():
     print(color("◆ Model", Colors.CYAN, Colors.BOLD))
     print(f"  Model:        {config.get('model', 'not set')}")
     print(f"  Max turns:    {config.get('agent', {}).get('max_turns', DEFAULT_CONFIG['agent']['max_turns'])}")
-    
+
     # Display
     print()
     print(color("◆ Display", Colors.CYAN, Colors.BOLD))
@@ -3134,7 +2689,7 @@ def show_config():
     print(f"  Backend:      {terminal.get('backend', 'local')}")
     print(f"  Working dir:  {terminal.get('cwd', '.')}")
     print(f"  Timeout:      {terminal.get('timeout', 60)}s")
-    
+
     if terminal.get('backend') == 'docker':
         print(f"  Docker image: {terminal.get('docker_image', 'nikolaik/python-nodejs:python3.11-nodejs20')}")
     elif terminal.get('backend') == 'ssh':
@@ -3142,7 +2697,7 @@ def show_config():
         ssh_user = get_env_value('TERMINAL_SSH_USER')
         print(f"  SSH host:     {ssh_host or '(not set)'}")
         print(f"  SSH user:     {ssh_user or '(not set)'}")
-    
+
     # Timezone
     print()
     print(color("◆ Timezone", Colors.CYAN, Colors.BOLD))
@@ -3152,56 +2707,18 @@ def show_config():
     else:
         print(f"  Timezone:     {color('(server-local)', Colors.DIM)}")
 
-    # Compression
-    print()
-    print(color("◆ Context Compression", Colors.CYAN, Colors.BOLD))
-    compression = config.get('compression', {})
-    enabled = compression.get('enabled', True)
-    print(f"  Enabled:      {'yes' if enabled else 'no'}")
-    if enabled:
-        print(f"  Threshold:    {compression.get('threshold', 0.50) * 100:.0f}%")
-        print(f"  Target ratio: {compression.get('target_ratio', 0.20) * 100:.0f}% of threshold preserved")
-        print(f"  Protect last: {compression.get('protect_last_n', 20)} messages")
-        print(f"  Protect first: {compression.get('protect_first_n', 3)} non-system head messages")
-        _aux_comp = config.get('auxiliary', {}).get('compression', {})
-        _sm = _aux_comp.get('model', '') or '(auto)'
-        print(f"  Model:        {_sm}")
-        comp_provider = _aux_comp.get('provider', 'auto')
-        if comp_provider and comp_provider != 'auto':
-            print(f"  Provider:     {comp_provider}")
-    
-    # Auxiliary models
-    auxiliary = config.get('auxiliary', {})
-    aux_tasks = {
-        "Vision":      auxiliary.get('vision', {}),
-        "Web extract": auxiliary.get('web_extract', {}),
-    }
-    has_overrides = any(
-        t.get('provider', 'auto') != 'auto' or t.get('model', '')
-        for t in aux_tasks.values()
-    )
-    if has_overrides:
-        print()
-        print(color("◆ Auxiliary Models (overrides)", Colors.CYAN, Colors.BOLD))
-        for label, task_cfg in aux_tasks.items():
-            prov = task_cfg.get('provider', 'auto')
-            mdl = task_cfg.get('model', '')
-            if prov != 'auto' or mdl:
-                parts = [f"provider={prov}"]
-                if mdl:
-                    parts.append(f"model={mdl}")
-                print(f"  {label:12s}  {', '.join(parts)}")
-    
+    print("  Context compaction: managed by Codex")
+
     # Messaging
     print()
     print(color("◆ Messaging Platforms", Colors.CYAN, Colors.BOLD))
-    
+
     telegram_token = get_env_value('TELEGRAM_BOT_TOKEN')
     discord_token = get_env_value('DISCORD_BOT_TOKEN')
-    
+
     print(f"  Telegram:     {'configured' if telegram_token else color('not configured', Colors.DIM)}")
     print(f"  Discord:      {'configured' if discord_token else color('not configured', Colors.DIM)}")
-    
+
     # Skill config
     try:
         from agent.skill_utils import discover_all_skill_config_vars, resolve_skill_config_values
@@ -3233,12 +2750,12 @@ def edit_config():
         managed_error("edit configuration")
         return
     config_path = get_config_path()
-    
+
     # Ensure config exists
     if not config_path.exists():
         save_config(DEFAULT_CONFIG)
         print(f"Created {config_path}")
-    
+
     # Find editor
     editor = os.getenv('EDITOR') or os.getenv('VISUAL')
 
@@ -3250,12 +2767,12 @@ def edit_config():
             if shutil.which(cmd):
                 editor = cmd
                 break
-    
+
     if not editor:
         print("No editor found. Config file is at:")
         print(f"  {config_path}")
         return
-    
+
     print(f"Opening {config_path} in {editor}...")
     subprocess.run([editor, str(config_path)])
 
@@ -3267,12 +2784,12 @@ def set_config_value(key: str, value: str):
         return
     # Check if it's an API key (goes to .env)
     api_keys = ['SUDO_PASSWORD']
-    
+
     if key.upper() in api_keys or key.upper().endswith(('_API_KEY', '_TOKEN')) or key.upper().startswith('TERMINAL_SSH'):
         save_env_value(key.upper(), value)
         print(f"✓ Set {key} in {get_env_path()}")
         return
-    
+
     # Otherwise it goes to config.yaml
     # Read the raw user config (not merged with defaults) to avoid
     # dumping all default values back to the file
@@ -3284,7 +2801,7 @@ def set_config_value(key: str, value: str):
                 user_config = yaml.safe_load(f) or {}
         except Exception:
             user_config = {}
-    
+
     # Handle nested keys (e.g., "terminal.backend") including numeric list
     # indices. Delegates to
     # _set_nested which preserves list-typed nodes; before #17876 the
@@ -3301,12 +2818,12 @@ def set_config_value(key: str, value: str):
         value = float(value)
 
     _set_nested(user_config, key, value)
-    
+
     # Write only user config back (not the full merged defaults)
     ensure_marlow_home()
     from utils import atomic_yaml_write
     atomic_yaml_write(config_path, user_config, sort_keys=False)
-    
+
     # Keep .env in sync for keys that terminal_tool reads directly from env vars.
     # config.yaml is authoritative, but terminal_tool only reads TERMINAL_ENV etc.
     _config_to_env_sync = {
@@ -3341,13 +2858,13 @@ def set_config_value(key: str, value: str):
 def config_command(args):
     """Handle config subcommands."""
     subcmd = getattr(args, 'config_command', None)
-    
+
     if subcmd is None or subcmd == "show":
         show_config()
-    
+
     elif subcmd == "edit":
         edit_config()
-    
+
     elif subcmd == "set":
         key = getattr(args, 'key', None)
         value = getattr(args, 'value', None)
@@ -3360,81 +2877,81 @@ def config_command(args):
             print("  marlow config set LM_API_KEY local-token")
             sys.exit(1)
         set_config_value(key, value)
-    
+
     elif subcmd == "path":
         print(get_config_path())
-    
+
     elif subcmd == "env-path":
         print(get_env_path())
-    
+
     elif subcmd == "migrate":
         print()
         print(color("🔄 Checking configuration for updates...", Colors.CYAN, Colors.BOLD))
         print()
-        
+
         # Check what's missing
         missing_env = get_missing_env_vars(required_only=False)
         missing_config = get_missing_config_fields()
         current_ver, latest_ver = check_config_version()
-        
+
         if not missing_env and not missing_config and current_ver >= latest_ver:
             print(color("✓ Configuration is up to date!", Colors.GREEN))
             print()
             return
-        
+
         # Show what needs to be updated
         if current_ver < latest_ver:
             print(f"  Config version: {current_ver} → {latest_ver}")
-        
+
         if missing_config:
             print(f"\n  {len(missing_config)} new config option(s) will be added with defaults")
-        
+
         required_missing = [v for v in missing_env if v.get("is_required")]
         optional_missing = [
             v for v in missing_env
             if not v.get("is_required") and not v.get("advanced")
         ]
-        
+
         if required_missing:
             print(f"\n  ⚠️  {len(required_missing)} required API key(s) missing:")
             for var in required_missing:
                 print(f"     • {var['name']}")
-        
+
         if optional_missing:
             print(f"\n  ℹ️  {len(optional_missing)} optional API key(s) not configured:")
             for var in optional_missing:
                 tools = var.get("tools", [])
                 tools_str = f" (enables: {', '.join(tools[:2])})" if tools else ""
                 print(f"     • {var['name']}{tools_str}")
-        
+
         print()
-        
+
         # Run migration
         results = migrate_config(interactive=True, quiet=False)
-        
+
         print()
         if results["env_added"] or results["config_added"]:
             print(color("✓ Configuration updated!", Colors.GREEN))
-        
+
         if results["warnings"]:
             print()
             for warning in results["warnings"]:
                 print(color(f"  ⚠️  {warning}", Colors.YELLOW))
-        
+
         print()
-    
+
     elif subcmd == "check":
         # Non-interactive check for what's missing
         print()
         print(color("📋 Configuration Status", Colors.CYAN, Colors.BOLD))
         print()
-        
+
         current_ver, latest_ver = check_config_version()
         if current_ver >= latest_ver:
             print(f"  Config version: {current_ver} ✓")
         else:
             print(color(f"  Config version: {current_ver} → {latest_ver} (update available)", Colors.YELLOW))
-        
+
         print()
         print(color("  Required:", Colors.BOLD))
         for var_name in REQUIRED_ENV_VARS:
@@ -3442,7 +2959,7 @@ def config_command(args):
                 print(f"    ✓ {var_name}")
             else:
                 print(color(f"    ✗ {var_name} (missing)", Colors.RED))
-        
+
         print()
         print(color("  Optional:", Colors.BOLD))
         for var_name, info in OPTIONAL_ENV_VARS.items():
@@ -3452,15 +2969,15 @@ def config_command(args):
                 tools = info.get("tools", [])
                 tools_str = f" → {', '.join(tools[:2])}" if tools else ""
                 print(color(f"    ○ {var_name}{tools_str}", Colors.DIM))
-        
+
         missing_config = get_missing_config_fields()
         if missing_config:
             print()
             print(color(f"  {len(missing_config)} new config option(s) available", Colors.YELLOW))
             print("    Run 'marlow config migrate' to add them")
-        
+
         print()
-    
+
     else:
         print(f"Unknown config command: {subcmd}")
         print()
@@ -3479,42 +2996,6 @@ def config_command(args):
 # Any provider registered in providers/ with auth_type="api_key" automatically
 # gets its env_vars exposed in OPTIONAL_ENV_VARS without editing this file.
 # Runs once at import time.
-
-_profile_env_vars_injected = False
-
-
-def _inject_profile_env_vars() -> None:
-    """Populate OPTIONAL_ENV_VARS from provider profiles not already listed.
-
-    Called once at module load time. Idempotent — repeated calls are no-ops.
-    """
-    global _profile_env_vars_injected
-    if _profile_env_vars_injected:
-        return
-    _profile_env_vars_injected = True
-    try:
-        from providers import list_providers
-        for _pp in list_providers():
-            if _pp.auth_type not in {"api_key",}:
-                continue
-            for _var in _pp.env_vars:
-                if _var in OPTIONAL_ENV_VARS:
-                    continue
-                _is_key = not _var.endswith("_BASE_URL") and not _var.endswith("_URL")
-                OPTIONAL_ENV_VARS[_var] = {
-                    "description": f"{_pp.display_name or _pp.name} {'API key' if _is_key else 'base URL override'}",
-                    "prompt": f"{_pp.display_name or _pp.name} {'API key' if _is_key else 'base URL (leave empty for default)'}",
-                    "url": _pp.signup_url or None,
-                    "password": _is_key,
-                    "category": "provider",
-                    "advanced": True,
-                }
-    except Exception:
-        pass
-
-
-# Eagerly inject so that OPTIONAL_ENV_VARS is fully populated at import time.
-_inject_profile_env_vars()
 
 
 # ── Platform-plugin env var injection ────────────────────────────────────────

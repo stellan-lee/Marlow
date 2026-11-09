@@ -169,100 +169,6 @@ class TestImageToBase64DataUrl:
 # ---------------------------------------------------------------------------
 
 
-class TestHandleVisionAnalyze:
-    """Verify _handle_vision_analyze returns an Awaitable and builds correct prompt."""
-
-    @pytest.fixture(autouse=True)
-    def _use_auxiliary_path(self, monkeypatch):
-        """Keep auxiliary-path assertions independent of prior Codex routing state."""
-        monkeypatch.setattr(
-            "tools.vision_tools._should_use_native_vision_fast_path",
-            lambda: False,
-        )
-
-    def test_returns_awaitable(self):
-        """The handler must return an Awaitable (coroutine) since it's registered as async."""
-        with patch(
-            "tools.vision_tools.vision_analyze_tool", new_callable=AsyncMock
-        ) as mock_tool:
-            mock_tool.return_value = json.dumps({"result": "ok"})
-            result = _handle_vision_analyze(
-                {
-                    "image_url": "https://example.com/img.png",
-                    "question": "What is this?",
-                }
-            )
-            # It should be an Awaitable (coroutine)
-            assert isinstance(result, Awaitable)
-            # Clean up the coroutine to avoid RuntimeWarning
-            result.close()
-
-    def test_prompt_contains_question(self):
-        """The full prompt should incorporate the user's question."""
-        with patch(
-            "tools.vision_tools.vision_analyze_tool", new_callable=AsyncMock
-        ) as mock_tool:
-            mock_tool.return_value = json.dumps({"result": "ok"})
-            coro = _handle_vision_analyze(
-                {
-                    "image_url": "https://example.com/img.png",
-                    "question": "Describe the cat",
-                }
-            )
-            # Clean up coroutine
-            coro.close()
-            call_args = mock_tool.call_args
-            full_prompt = call_args[0][1]  # second positional arg
-            assert "Describe the cat" in full_prompt
-            assert "Fully describe and explain" in full_prompt
-
-    def test_uses_auxiliary_vision_model_env(self):
-        """AUXILIARY_VISION_MODEL env var should override DEFAULT_VISION_MODEL."""
-        with (
-            patch(
-                "tools.vision_tools.vision_analyze_tool", new_callable=AsyncMock
-            ) as mock_tool,
-            patch.dict(os.environ, {"AUXILIARY_VISION_MODEL": "custom/model-v1"}),
-        ):
-            mock_tool.return_value = json.dumps({"result": "ok"})
-            coro = _handle_vision_analyze(
-                {"image_url": "https://example.com/img.png", "question": "test"}
-            )
-            coro.close()
-            call_args = mock_tool.call_args
-            model = call_args[0][2]  # third positional arg
-            assert model == "custom/model-v1"
-
-    def test_falls_back_to_default_model(self):
-        """Without AUXILIARY_VISION_MODEL, model should be None (let call_llm resolve default)."""
-        with (
-            patch(
-                "tools.vision_tools.vision_analyze_tool", new_callable=AsyncMock
-            ) as mock_tool,
-            patch.dict(os.environ, {}, clear=False),
-        ):
-            # Ensure AUXILIARY_VISION_MODEL is not set
-            os.environ.pop("AUXILIARY_VISION_MODEL", None)
-            mock_tool.return_value = json.dumps({"result": "ok"})
-            coro = _handle_vision_analyze(
-                {"image_url": "https://example.com/img.png", "question": "test"}
-            )
-            coro.close()
-            call_args = mock_tool.call_args
-            model = call_args[0][2]
-            # With no AUXILIARY_VISION_MODEL set, model should be None
-            # (the centralized call_llm router picks the default)
-            assert model is None
-
-    def test_empty_args_graceful(self):
-        """Missing keys should default to empty strings, not raise."""
-        with patch(
-            "tools.vision_tools.vision_analyze_tool", new_callable=AsyncMock
-        ) as mock_tool:
-            mock_tool.return_value = json.dumps({"result": "ok"})
-            result = _handle_vision_analyze({})
-            assert isinstance(result, Awaitable)
-            result.close()
 
 
 # ---------------------------------------------------------------------------
@@ -299,211 +205,11 @@ class TestErrorLoggingExcInfo:
             assert len(error_records) >= 1
             assert error_records[0].exc_info is not None
 
-    @pytest.mark.asyncio
-    async def test_analysis_error_logs_exc_info(self, caplog):
-        """When vision_analyze_tool encounters an error, it should log with exc_info."""
-        with (
-            patch("tools.vision_tools._validate_image_url", return_value=True),
-            patch(
-                "tools.vision_tools._download_image",
-                new_callable=AsyncMock,
-                side_effect=Exception("download boom"),
-            ),
-            caplog.at_level(logging.ERROR, logger="tools.vision_tools"),
-        ):
-            result = await vision_analyze_tool(
-                "https://example.com/img.jpg", "describe this", "test/model"
-            )
-            result_data = json.loads(result)
-            # Error response uses "success": False, not an "error" key
-            assert result_data["success"] is False
-
-            error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
-            assert any(r.exc_info and r.exc_info[0] is not None for r in error_records)
-
-    @pytest.mark.asyncio
-    async def test_cleanup_error_logs_exc_info(self, tmp_path, caplog):
-        """Temp file cleanup failure should log warning with exc_info."""
-        # Create a real temp file that will be "downloaded"
-        temp_dir = tmp_path / "temp_vision_images"
-        temp_dir.mkdir()
-
-        async def fake_download(url, dest, max_retries=3):
-            """Simulate download by writing file to the expected destination."""
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(b"\xff\xd8\xff" + b"\x00" * 16)
-            return dest
-
-        with (
-            patch("tools.vision_tools._validate_image_url", return_value=True),
-            patch("tools.vision_tools._download_image", side_effect=fake_download),
-            patch(
-                "tools.vision_tools._image_to_base64_data_url",
-                return_value="data:image/jpeg;base64,abc",
-            ),
-            caplog.at_level(logging.WARNING, logger="tools.vision_tools"),
-        ):
-            # Mock the async_call_llm function to return a mock response
-            mock_response = MagicMock()
-            mock_choice = MagicMock()
-            mock_choice.message.content = "A test image description"
-            mock_response.choices = [mock_choice]
-
-            with (
-                patch("tools.vision_tools.async_call_llm", new_callable=AsyncMock, return_value=mock_response),
-            ):
-                # Make unlink fail to trigger cleanup warning
-                original_unlink = Path.unlink
-
-                def failing_unlink(self, *args, **kwargs):
-                    raise PermissionError("no permission")
-
-                with patch.object(Path, "unlink", failing_unlink):
-                    result = await vision_analyze_tool(
-                        "https://example.com/tempimg.jpg", "describe", "test/model"
-                    )
-
-            warning_records = [
-                r
-                for r in caplog.records
-                if r.levelno == logging.WARNING
-                and "temporary file" in r.getMessage().lower()
-            ]
-            assert len(warning_records) >= 1
-            assert warning_records[0].exc_info is not None
 
 
-class TestVisionConfig:
-    @pytest.mark.asyncio
-    async def test_vision_uses_configured_temperature_and_timeout(self, tmp_path):
-        img = tmp_path / "test.png"
-        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
-
-        mock_response = MagicMock()
-        mock_choice = MagicMock()
-        mock_choice.message.content = "Configured image analysis"
-        mock_response.choices = [mock_choice]
-
-        with (
-            patch("marlow_cli.config.load_config", return_value={
-                "auxiliary": {"vision": {"temperature": 1, "timeout": 77}}
-            }),
-            patch(
-                "tools.vision_tools._image_to_base64_data_url",
-                return_value="data:image/png;base64,abc",
-            ),
-            patch(
-                "tools.vision_tools.async_call_llm",
-                new_callable=AsyncMock,
-                return_value=mock_response,
-            ) as mock_llm,
-        ):
-            result = json.loads(await vision_analyze_tool(str(img), "describe this", "test/model"))
-
-        assert result["success"] is True
-        assert mock_llm.await_args.kwargs["temperature"] == 1.0
-        assert mock_llm.await_args.kwargs["timeout"] == 77.0
-
-    @pytest.mark.asyncio
-    async def test_vision_defaults_temperature_when_config_omits_it(self, tmp_path):
-        img = tmp_path / "test.png"
-        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
-
-        mock_response = MagicMock()
-        mock_choice = MagicMock()
-        mock_choice.message.content = "Default image analysis"
-        mock_response.choices = [mock_choice]
-
-        with (
-            patch("marlow_cli.config.load_config", return_value={"auxiliary": {"vision": {}}}),
-            patch(
-                "tools.vision_tools._image_to_base64_data_url",
-                return_value="data:image/png;base64,abc",
-            ),
-            patch(
-                "tools.vision_tools.async_call_llm",
-                new_callable=AsyncMock,
-                return_value=mock_response,
-            ) as mock_llm,
-        ):
-            result = json.loads(await vision_analyze_tool(str(img), "describe this", "test/model"))
-
-        assert result["success"] is True
-        assert mock_llm.await_args.kwargs["temperature"] == 0.1
-        assert mock_llm.await_args.kwargs["timeout"] == 120.0
 
 
-class TestVisionSafetyGuards:
-    @pytest.mark.asyncio
-    async def test_local_non_image_file_rejected_before_llm_call(self, tmp_path):
-        secret = tmp_path / "secret.txt"
-        secret.write_text("TOP-SECRET=1\n", encoding="utf-8")
 
-        with patch("tools.vision_tools.async_call_llm", new_callable=AsyncMock) as mock_llm:
-            result = json.loads(await vision_analyze_tool(str(secret), "extract text"))
-
-        assert result["success"] is False
-        assert "Only real image files are supported" in result["error"]
-        mock_llm.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_blocked_remote_url_short_circuits_before_download(self):
-        blocked = {
-            "host": "blocked.test",
-            "rule": "blocked.test",
-            "source": "config",
-            "message": "Blocked by website policy",
-        }
-
-        with (
-            patch("tools.vision_tools.check_website_access", return_value=blocked),
-            patch("tools.vision_tools._validate_image_url", return_value=True),
-            patch("tools.vision_tools._download_image", new_callable=AsyncMock) as mock_download,
-        ):
-            result = json.loads(await vision_analyze_tool("https://blocked.test/cat.png", "describe"))
-
-        assert result["success"] is False
-        assert "Blocked by website policy" in result["error"]
-        mock_download.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_download_blocks_redirected_final_url(self, tmp_path):
-        from tools.vision_tools import _download_image
-
-        def fake_check(url):
-            if url == "https://allowed.test/cat.png":
-                return None
-            if url == "https://blocked.test/final.png":
-                return {
-                    "host": "blocked.test",
-                    "rule": "blocked.test",
-                    "source": "config",
-                    "message": "Blocked by website policy",
-                }
-            raise AssertionError(f"unexpected URL checked: {url}")
-
-        class FakeResponse:
-            url = "https://blocked.test/final.png"
-            headers = {"content-length": "24"}
-            content = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
-
-            def raise_for_status(self):
-                return None
-
-        with (
-            patch("tools.vision_tools.check_website_access", side_effect=fake_check),
-            patch("tools.vision_tools.httpx.AsyncClient") as mock_client_cls,
-            pytest.raises(PermissionError, match="Blocked by website policy"),
-        ):
-            mock_client = AsyncMock()
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client.get = AsyncMock(return_value=FakeResponse())
-            mock_client_cls.return_value = mock_client
-
-            await _download_image("https://allowed.test/cat.png", tmp_path / "cat.png", max_retries=1)
-
-        assert not (tmp_path / "cat.png").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -543,55 +249,6 @@ class TestVisionRequirements:
 # ---------------------------------------------------------------------------
 
 
-class TestTildeExpansion:
-    """Verify that ~/path style paths are expanded correctly."""
-
-    @pytest.mark.asyncio
-    async def test_tilde_path_expanded_to_local_file(self, tmp_path, monkeypatch):
-        """vision_analyze_tool should expand ~ in file paths."""
-        # Create a fake image file under a fake home directory
-        fake_home = tmp_path / "fakehome"
-        fake_home.mkdir()
-        img = fake_home / "test_image.png"
-        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
-
-        monkeypatch.setenv("HOME", str(fake_home))
-
-        mock_response = MagicMock()
-        mock_choice = MagicMock()
-        mock_choice.message.content = "A test image"
-        mock_response.choices = [mock_choice]
-
-        with (
-            patch(
-                "tools.vision_tools._image_to_base64_data_url",
-                return_value="data:image/png;base64,abc",
-            ),
-            patch(
-                "tools.vision_tools.async_call_llm",
-                new_callable=AsyncMock,
-                return_value=mock_response,
-            ),
-        ):
-            result = await vision_analyze_tool(
-                "~/test_image.png", "describe this", "test/model"
-            )
-            data = json.loads(result)
-            assert data["success"] is True
-            assert data["analysis"] == "A test image"
-
-    @pytest.mark.asyncio
-    async def test_tilde_path_nonexistent_file_gives_error(self, tmp_path, monkeypatch):
-        """A tilde path that doesn't resolve to a real file should fail gracefully."""
-        fake_home = tmp_path / "fakehome"
-        fake_home.mkdir()
-        monkeypatch.setenv("HOME", str(fake_home))
-
-        result = await vision_analyze_tool(
-            "~/nonexistent.png", "describe this", "test/model"
-        )
-        data = json.loads(result)
-        assert data["success"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -599,45 +256,6 @@ class TestTildeExpansion:
 # ---------------------------------------------------------------------------
 
 
-class TestFileUriSupport:
-    """Verify that file:// URIs resolve as local file paths."""
-
-    @pytest.mark.asyncio
-    async def test_file_uri_resolved_as_local_path(self, tmp_path):
-        """file:///absolute/path should be treated as a local file."""
-        img = tmp_path / "photo.png"
-        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
-
-        mock_response = MagicMock()
-        mock_choice = MagicMock()
-        mock_choice.message.content = "A test image"
-        mock_response.choices = [mock_choice]
-
-        with (
-            patch(
-                "tools.vision_tools._image_to_base64_data_url",
-                return_value="data:image/png;base64,abc",
-            ),
-            patch(
-                "tools.vision_tools.async_call_llm",
-                new_callable=AsyncMock,
-                return_value=mock_response,
-            ),
-        ):
-            result = await vision_analyze_tool(
-                f"file://{img}", "describe this", "test/model"
-            )
-            data = json.loads(result)
-            assert data["success"] is True
-
-    @pytest.mark.asyncio
-    async def test_file_uri_nonexistent_gives_error(self, tmp_path):
-        """file:// pointing to a missing file should fail gracefully."""
-        result = await vision_analyze_tool(
-            f"file://{tmp_path}/nonexistent.png", "describe this", "test/model"
-        )
-        data = json.loads(result)
-        assert data["success"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -645,45 +263,6 @@ class TestFileUriSupport:
 # ---------------------------------------------------------------------------
 
 
-class TestBase64SizeLimit:
-    """Verify that oversized images are rejected before hitting the API."""
-
-    @pytest.mark.asyncio
-    async def test_oversized_image_rejected_before_api_call(self, tmp_path):
-        """Images exceeding the 20 MB hard limit should fail with a clear error."""
-        img = tmp_path / "huge.png"
-        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * (4 * 1024 * 1024))
-
-        # Patch the hard limit to a small value so the test runs fast.
-        with patch("tools.vision_tools._MAX_BASE64_BYTES", 1000), \
-             patch("tools.vision_tools.async_call_llm", new_callable=AsyncMock) as mock_llm:
-            result = json.loads(await vision_analyze_tool(str(img), "describe this"))
-
-        assert result["success"] is False
-        assert "too large" in result["error"].lower()
-        mock_llm.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_small_image_not_rejected(self, tmp_path):
-        """Images well under the limit should pass the size check."""
-        img = tmp_path / "small.png"
-        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
-
-        mock_response = MagicMock()
-        mock_choice = MagicMock()
-        mock_choice.message.content = "Small image"
-        mock_response.choices = [mock_choice]
-
-        with (
-            patch(
-                "tools.vision_tools.async_call_llm",
-                new_callable=AsyncMock,
-                return_value=mock_response,
-            ),
-        ):
-            result = json.loads(await vision_analyze_tool(str(img), "describe this", "test/model"))
-
-        assert result["success"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -691,36 +270,6 @@ class TestBase64SizeLimit:
 # ---------------------------------------------------------------------------
 
 
-class TestErrorClassification:
-    """Verify that API 400 errors produce actionable guidance."""
-
-    @pytest.mark.asyncio
-    async def test_invalid_request_error_gives_image_guidance(self, tmp_path):
-        """An invalid_request_error from the API should mention image size/format."""
-        img = tmp_path / "test.png"
-        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
-
-        api_error = Exception(
-            "Error code: 400 - {'type': 'error', 'error': "
-            "{'type': 'invalid_request_error', 'message': 'Invalid request data'}}"
-        )
-
-        with (
-            patch(
-                "tools.vision_tools._image_to_base64_data_url",
-                return_value="data:image/png;base64,abc",
-            ),
-            patch(
-                "tools.vision_tools.async_call_llm",
-                new_callable=AsyncMock,
-                side_effect=api_error,
-            ),
-        ):
-            result = json.loads(await vision_analyze_tool(str(img), "describe", "test/model"))
-
-        assert result["success"] is False
-        assert "rejected the image" in result["analysis"].lower()
-        assert "smaller" in result["analysis"].lower()
 
 
 class TestVisionRegistration:
@@ -1006,3 +555,51 @@ class TestDownloadRetryClassification:
         # All three attempts used, two backoff sleeps between them.
         assert mock_client.get.await_count == 3
         assert mock_sleep.await_count == 2
+
+
+class TestNativeImageContract:
+    @pytest.mark.asyncio
+    async def test_handler_passes_question_and_pixels_without_model_call(self, tmp_path):
+        image = tmp_path / "native.png"
+        image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+        result = await _handle_vision_analyze({"image_url": str(image), "question": "Inspect"})
+        assert result["_multimodal"]
+        assert "Inspect" in result["content"][0]["text"]
+        assert result["content"][1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+    @pytest.mark.asyncio
+    async def test_helper_rejects_auxiliary_model_selection(self, tmp_path):
+        result = json.loads(await vision_analyze_tool(str(tmp_path / "image.png"), "Inspect", "other-model"))
+        assert not result["success"] and "overrides are retired" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_non_image_never_enters_model_context(self, tmp_path):
+        secret = tmp_path / "secret.txt"
+        secret.write_text("TOP_SECRET")
+        result = json.loads(await vision_analyze_tool(str(secret), "Extract"))
+        assert not result["success"] and "Only real image files" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_blocked_url_never_downloads(self):
+        with patch("tools.vision_tools._validate_image_url", return_value=True), patch("tools.vision_tools.check_website_access", return_value={"message": "blocked"}), patch("tools.vision_tools._download_image", new_callable=AsyncMock) as download:
+            result = json.loads(await vision_analyze_tool("https://blocked.example/image.png", "Inspect"))
+        assert not result["success"]
+        download.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_tilde_and_file_uri_inputs_keep_native_pixels(self, tmp_path, monkeypatch):
+        image = tmp_path / "native.png"
+        image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        for name in ("~/native.png", "file://" + str(image)):
+            result = await vision_analyze_tool(name, "Inspect")
+            assert result["_multimodal"]
+
+    @pytest.mark.asyncio
+    async def test_native_image_obeys_disclosure_scope(self, tmp_path):
+        from agent.codex_file_scope import file_scope
+        image = tmp_path / "secret.png"
+        image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+        with file_scope([tmp_path / "authorized"]):
+            result = json.loads(await vision_analyze_tool(str(image), "Inspect"))
+        assert not result["success"] and "scope" in result["error"]

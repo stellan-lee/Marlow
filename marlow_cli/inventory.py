@@ -65,27 +65,10 @@ def load_picker_context() -> ConfigContext:
 
     Centralizes the config slice used by TUI model-selection handlers.
     """
-    from marlow_cli.config import load_config, load_custom_provider_entries
-
-    cfg = load_config()
-    model_cfg = cfg.get("model", {})
-    if isinstance(model_cfg, dict):
-        current_model = model_cfg.get("default", model_cfg.get("name", "")) or ""
-        current_provider = model_cfg.get("provider", "") or ""
-        current_base_url = model_cfg.get("base_url", "") or ""
-    else:
-        # config.model can be a bare string in older configs.
-        current_model = str(model_cfg) if model_cfg else ""
-        current_provider = ""
-        current_base_url = ""
-    raw = cfg.get("providers")
-    return ConfigContext(
-        current_provider=current_provider,
-        current_model=current_model,
-        current_base_url=current_base_url,
-        user_providers=raw if isinstance(raw, dict) else {},
-        custom_providers=load_custom_provider_entries(cfg),
-    )
+    from agent.codex_environment import managed_environment
+    e = managed_environment()
+    provider = e.config.get('model_provider', 'openai')
+    return ConfigContext(provider, e.config.get('model', ''), '', {}, [])
 
 
 # ─── Public: payload builder ────────────────────────────────────────────
@@ -189,42 +172,11 @@ def _append_unconfigured_rows(rows: list[dict], ctx: ConfigContext) -> list[dict
     return extras
 
 
-def _apply_picker_hints(rows: list[dict]) -> None:
-    """Add ``authenticated``/``auth_type``/``key_env``/``warning`` per row.
-
-    Mutates ``rows`` in-place. Rows already from
-    ``list_authenticated_providers`` are marked ``authenticated=True``;
-    the unconfigured skeleton rows from ``_append_unconfigured_rows`` get
-    the picker's setup-hint shape.
-    """
-    from marlow_cli.auth import PROVIDER_REGISTRY
-
+def _apply_picker_hints(rows):
     for row in rows:
-        if "authenticated" in row:
-            continue
-        # Distinguish authenticated rows (returned by
-        # list_authenticated_providers) from skeleton rows (from
-        # _append_unconfigured_rows). The skeleton rows have empty
-        # `models` AND source="canonical"; authenticated rows have
-        # populated `models` OR a non-canonical source.
-        is_skeleton = row.get("source") == "canonical" and not row.get("models")
-        row["authenticated"] = not is_skeleton
-        if not is_skeleton or row.get("is_user_defined"):
-            continue
-        cfg = PROVIDER_REGISTRY.get(row["slug"])
-        auth_type = cfg.auth_type if cfg else "api_key"
-        key_env = (
-            cfg.api_key_env_vars[0]
-            if (cfg and cfg.api_key_env_vars)
-            else ""
-        )
-        row["auth_type"] = auth_type
-        row["key_env"] = key_env
-        row["warning"] = (
-            f"paste {key_env} to activate"
-            if auth_type == "api_key" and key_env
-            else f"run `marlow model` to configure ({auth_type})"
-        )
+        row["auth_type"] = "codex"
+        row["key_env"] = ""
+        row["warning"] = "Authentication is managed by the active Marlow Profile Codex runtime."
 
 
 def _reorder_canonical(rows: list[dict]) -> list[dict]:

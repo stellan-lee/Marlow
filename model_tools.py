@@ -298,10 +298,12 @@ def get_tool_definitions(
             cfg_fp = (cfg_stat.st_mtime_ns, cfg_stat.st_size)
         except (FileNotFoundError, OSError, ImportError):
             cfg_fp = None
+        from marlow_constants import get_marlow_home
         cache_key = (
             frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
             frozenset(disabled_toolsets) if disabled_toolsets else None,
             registry._generation,
+            str(get_marlow_home().absolute()),
             cfg_fp,
             bool(skip_tool_search_assembly),
         )

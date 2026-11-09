@@ -79,7 +79,7 @@ def test_skills_index_reflects_installed_skills(isolated_home):
     """
     _seed_skill(isolated_home, "hello", "a demo skill for size testing")
     data = compute_prompt_breakdown("cli")
-    assert data["skills_index"]["bytes"] > 0
+    assert data["skills_index"]["bytes"] == 0  # skills are loaded explicitly through MCP
 
 
 def test_memory_and_profile_are_attributed(isolated_home):
@@ -105,7 +105,7 @@ def test_skills_block_regex_matches_tagged_block():
 def test_render_breakdown_is_plain_text(isolated_home):
     data = compute_prompt_breakdown("cli")
     out = render_breakdown(data)
-    assert "System prompt total" in out
+    assert "Marlow context total" in out
     assert "skills index" in out
     assert "Tool schemas" in out
     # Plain text — no JSON braces leaking in.

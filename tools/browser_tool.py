@@ -47,7 +47,6 @@ import time
 import requests
 from typing import Dict, Any, Optional, List, Tuple, Union
 from pathlib import Path
-from agent.auxiliary_client import call_llm
 from marlow_constants import get_marlow_home
 from marlow_cli.config import cfg_get
 
@@ -163,16 +162,6 @@ def _get_command_timeout() -> int:
         logger.debug("Could not read command_timeout from config: %s", e)
     _cached_command_timeout = result
     return result
-
-
-def _get_vision_model() -> Optional[str]:
-    """Model for browser_vision (screenshot analysis — multimodal)."""
-    return os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
-
-
-def _get_extraction_model() -> Optional[str]:
-    """Model for page snapshot text summarization — same as web_extract."""
-    return os.getenv("AUXILIARY_WEB_EXTRACT_MODEL", "").strip() or None
 
 
 def _resolve_cdp_override(cdp_url: str) -> str:
@@ -575,7 +564,7 @@ def _run_chrome_fallback_command(
 
     task_socket_dir = os.path.join(_socket_safe_tmpdir(), f"agent-browser-{tmp_session}")
     os.makedirs(task_socket_dir, mode=0o700, exist_ok=True)
-    browser_env = {**os.environ, "AGENT_BROWSER_SOCKET_DIR": task_socket_dir}
+    browser_env = dict(__import__("agent.codex_environment", fromlist=["managed_environment"]).managed_environment().overrides()["shell_environment_policy"]["set"], AGENT_BROWSER_SOCKET_DIR=task_socket_dir)
     browser_env["PATH"] = _merge_browser_path(browser_env.get("PATH", ""))
 
     if "AGENT_BROWSER_IDLE_TIMEOUT_MS" not in browser_env:
@@ -593,6 +582,7 @@ def _run_chrome_fallback_command(
             proc = subprocess.Popen(
                 full, stdout=stdout_fd, stderr=stderr_fd,
                 stdin=subprocess.DEVNULL, env=browser_env,
+                cwd=str(__import__("agent.codex_environment", fromlist=["managed_environment"]).managed_environment().workspace),
             )
         finally:
             os.close(stdout_fd)
@@ -1098,7 +1088,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_vision",
-        "description": "Take a screenshot of the current page so you can inspect it visually. Use this when you need to understand what the page looks like - especially for CAPTCHAs, visual verification challenges, complex layouts, or cases where the text snapshot misses important visual information. When your active model has native vision, the screenshot is attached to your context directly and you inspect it on the next turn; otherwise Marlow falls back to an auxiliary vision model and returns a text analysis. Includes a screenshot_path that you can share with the user by including MEDIA:<screenshot_path> in your response. Requires browser_navigate to be called first.",
+        "description": "Take a screenshot of the current page so you can inspect it visually. Use this when you need to understand what the page looks like - especially for CAPTCHAs, visual verification challenges, complex layouts, or cases where the text snapshot misses important visual information. When your active model has native vision, the screenshot is attached to your context directly and you inspect it on the next turn; models without image support report a capability error. Includes a screenshot_path that you can share with the user by including MEDIA:<screenshot_path> in your response. Requires browser_navigate to be called first.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -1421,7 +1411,7 @@ def _run_browser_command(
         logger.debug("browser cmd=%s task=%s socket_dir=%s (%d chars)",
                      command, task_id, task_socket_dir, len(task_socket_dir))
 
-        browser_env = {**os.environ}
+        browser_env = dict(__import__("agent.codex_environment", fromlist=["managed_environment"]).managed_environment().overrides()["shell_environment_policy"]["set"])
 
         # Ensure subprocesses inherit the same browser-specific PATH fallbacks
         # used during CLI discovery.
@@ -1487,6 +1477,7 @@ def _run_browser_command(
                 stderr=stderr_fd,
                 stdin=subprocess.DEVNULL,
                 env=browser_env,
+                cwd=str(__import__("agent.codex_environment", fromlist=["managed_environment"]).managed_environment().workspace),
             )
         finally:
             os.close(stdout_fd)
@@ -1607,60 +1598,11 @@ def _run_browser_command(
     return result
 
 
-def _extract_relevant_content(
-    snapshot_text: str,
-    user_task: Optional[str] = None
-) -> str:
-    """Use LLM to extract relevant content from a snapshot based on the user's task.
-
-    Falls back to simple truncation when no auxiliary text model is configured.
-    """
-    if user_task:
-        extraction_prompt = (
-            f"You are a content extractor for a browser automation agent.\n\n"
-            f"The user's task is: {user_task}\n\n"
-            f"Given the following page snapshot (accessibility tree representation), "
-            f"extract and summarize the most relevant information for completing this task. Focus on:\n"
-            f"1. Interactive elements (buttons, links, inputs) that might be needed\n"
-            f"2. Text content relevant to the task (prices, descriptions, headings, important info)\n"
-            f"3. Navigation structure if relevant\n\n"
-            f"Keep ref IDs (like [ref=e5]) for interactive elements so the agent can use them.\n\n"
-            f"Page Snapshot:\n{snapshot_text}\n\n"
-            f"Provide a concise summary that preserves actionable information and relevant content."
-        )
-    else:
-        extraction_prompt = (
-            f"Summarize this page snapshot, preserving:\n"
-            f"1. All interactive elements with their ref IDs (like [ref=e5])\n"
-            f"2. Key text content and headings\n"
-            f"3. Important information visible on the page\n\n"
-            f"Page Snapshot:\n{snapshot_text}\n\n"
-            f"Provide a concise summary focused on interactive elements and key content."
-        )
-
-    # Redact secrets from snapshot before sending to auxiliary LLM.
-    # Without this, a page displaying env vars or API keys would leak
-    # secrets to the extraction model before run_agent.py's general
-    # redaction layer ever sees the tool result.
+def _extract_relevant_content(snapshot_text, instruction=None, **kwargs):
+    """Return browser evidence locally; Codex performs any requested reasoning."""
     from agent.redact import redact_sensitive_text
-    extraction_prompt = redact_sensitive_text(extraction_prompt)
+    return redact_sensitive_text(_truncate_snapshot(snapshot_text), force=True)
 
-    try:
-        call_kwargs = {
-            "task": "web_extract",
-            "messages": [{"role": "user", "content": extraction_prompt}],
-            "max_tokens": 4000,
-            "temperature": 0.1,
-        }
-        model = _get_extraction_model()
-        if model:
-            call_kwargs["model"] = model
-        response = call_llm(**call_kwargs)
-        extracted = (response.choices[0].message.content or "").strip() or _truncate_snapshot(snapshot_text)
-        # Redact any secrets the auxiliary LLM may have echoed back.
-        return redact_sensitive_text(extracted)
-    except Exception:
-        return _truncate_snapshot(snapshot_text)
 
 
 def _truncate_snapshot(snapshot_text: str, max_chars: int = 8000) -> str:
@@ -2327,8 +2269,8 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
 
     Captures what's visually displayed in the browser. When the active model
     supports native vision, the screenshot is attached directly to the
-    conversation so the model can inspect it on the next turn; otherwise Marlow
-    falls back to the auxiliary vision model and returns a text analysis. Useful
+    conversation so the model can inspect it on the next turn. Unsupported image
+    capabilities are reported by the configured Codex provider. Useful
     for visual content the text-based snapshot may not capture (CAPTCHAs,
     verification challenges, images, complex layouts, etc.).
 
@@ -2460,119 +2402,23 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         _screenshot_b64 = base64.b64encode(_screenshot_bytes).decode("ascii")
         data_url = f"data:image/png;base64,{_screenshot_b64}"
 
-        # Fast path: when native image routing is in effect for the active main
-        # model, attach the screenshot directly instead of describing it through
-        # an auxiliary vision LLM. The model inspects the pixels on its next
-        # turn — no aux call, no information loss. Consistent with vision_analyze.
-        from tools.vision_tools import (
-            _build_native_vision_tool_result,
-            _should_use_native_vision_fast_path,
+        # Return pixels to the active Codex turn; no auxiliary inference.
+        from tools.vision_tools import _build_native_vision_tool_result
+
+        native_result = _build_native_vision_tool_result(
+            image_url=str(screenshot_path), question=question,
+            image_data_url=data_url, image_size_bytes=len(_screenshot_bytes),
         )
-
-        if _should_use_native_vision_fast_path():
-            native_result = _build_native_vision_tool_result(
-                image_url=str(screenshot_path),
-                question=question,
-                image_data_url=data_url,
-                image_size_bytes=len(_screenshot_bytes),
-            )
-            meta = native_result.setdefault("meta", {})
-            meta["screenshot_path"] = str(screenshot_path)
-            if _lp_fallback_warning:
-                meta["fallback_warning"] = _lp_fallback_warning
-            if annotate and result.get("data", {}).get("annotations"):
-                meta["annotations"] = result["data"]["annotations"]
-            native_result["text_summary"] = (
-                f"{native_result.get('text_summary', '')} "
-                f"Screenshot path: {screenshot_path}"
-            ).strip()
-            return native_result
-
-        vision_prompt = (
-            f"You are analyzing a screenshot of a web browser.\n\n"
-            f"User's question: {question}\n\n"
-            f"Provide a detailed and helpful answer based on what you see in the screenshot. "
-            f"If there are interactive elements, describe them. If there are verification challenges "
-            f"or CAPTCHAs, describe what type they are and what action might be needed. "
-            f"Focus on answering the user's specific question."
-        )
-
-        # Use the centralized LLM router
-        vision_model = _get_vision_model()
-        logger.debug("browser_vision: analysing screenshot (%d bytes)",
-                     len(_screenshot_bytes))
-
-        # Read vision timeout/temperature from config (auxiliary.vision.*).
-        # Local vision models (llama.cpp, ollama) can take well over 30s for
-        # screenshot analysis, so the default timeout must be generous.
-        vision_timeout = 120.0
-        vision_temperature = 0.1
-        try:
-            from marlow_cli.config import load_config
-            _cfg = load_config()
-            _vision_cfg = cfg_get(_cfg, "auxiliary", "vision", default={})
-            _vt = _vision_cfg.get("timeout")
-            if _vt is not None:
-                vision_timeout = float(_vt)
-            _vtemp = _vision_cfg.get("temperature")
-            if _vtemp is not None:
-                vision_temperature = float(_vtemp)
-        except Exception:
-            pass
-
-        call_kwargs = {
-            "task": "vision",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": vision_prompt},
-                        {"type": "image_url", "image_url": {"url": data_url}},
-                    ],
-                }
-            ],
-            "max_tokens": 2000,
-            "temperature": vision_temperature,
-            "timeout": vision_timeout,
-        }
-        if vision_model:
-            call_kwargs["model"] = vision_model
-        # Try full-size screenshot; on size-related rejection, downscale and retry.
-        try:
-            response = call_llm(**call_kwargs)
-        except Exception as _api_err:
-            from tools.vision_tools import (
-                _is_image_size_error, _resize_image_for_vision, _RESIZE_TARGET_BYTES,
-            )
-            if (_is_image_size_error(_api_err)
-                    and len(data_url) > _RESIZE_TARGET_BYTES):
-                logger.info(
-                    "Vision API rejected screenshot (%.1f MB); "
-                    "auto-resizing to ~%.0f MB and retrying...",
-                    len(data_url) / (1024 * 1024),
-                    _RESIZE_TARGET_BYTES / (1024 * 1024),
-                )
-                data_url = _resize_image_for_vision(
-                    screenshot_path, mime_type="image/png")
-                call_kwargs["messages"][0]["content"][1]["image_url"]["url"] = data_url
-                response = call_llm(**call_kwargs)
-            else:
-                raise
-
-        analysis = (response.choices[0].message.content or "").strip()
-        # Redact secrets the vision LLM may have read from the screenshot.
-        from agent.redact import redact_sensitive_text
-        analysis = redact_sensitive_text(analysis)
-        response_data = {
-            "success": True,
-            "analysis": analysis or "Vision analysis returned no content.",
-            "screenshot_path": str(screenshot_path),
-        }
-        _copy_fallback_warning(response_data, result)
-        # Include annotation data if annotated screenshot was taken
+        meta = native_result.setdefault("meta", {})
+        meta["screenshot_path"] = str(screenshot_path)
+        if _lp_fallback_warning:
+            meta["fallback_warning"] = _lp_fallback_warning
         if annotate and result.get("data", {}).get("annotations"):
-            response_data["annotations"] = result["data"]["annotations"]
-        return json.dumps(response_data, ensure_ascii=False)
+            meta["annotations"] = result["data"]["annotations"]
+        native_result["text_summary"] = (
+            f"{native_result.get('text_summary', '')} Screenshot path: {screenshot_path}"
+        ).strip()
+        return native_result
 
     except Exception as e:
         # Keep the screenshot if it was captured successfully — the failure is

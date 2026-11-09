@@ -74,7 +74,7 @@ class TestPluginSkillRegistry:
         from marlow_cli.plugins import PluginManager
 
         fresh = PluginManager()
-        monkeypatch.setattr(plugins_mod, "_plugin_manager", fresh)
+        monkeypatch.setitem(plugins_mod._plugin_managers, str(__import__("marlow_constants").get_marlow_home().absolute()), fresh)
         return fresh
 
     def test_register_and_find(self, pm, tmp_path):
@@ -123,7 +123,7 @@ class TestPluginContextRegisterSkill:
         from marlow_cli.plugins import PluginContext, PluginManager, PluginManifest
 
         pm = PluginManager()
-        monkeypatch.setattr(plugins_mod, "_plugin_manager", pm)
+        monkeypatch.setitem(plugins_mod._plugin_managers, str(__import__("marlow_constants").get_marlow_home().absolute()), pm)
         manifest = PluginManifest(
             name="testplugin",
             version="1.0.0",
@@ -168,12 +168,13 @@ class TestSkillViewQualifiedName:
         from marlow_cli.plugins import PluginManager
 
         self.pm = PluginManager()
-        monkeypatch.setattr(plugins_mod, "_plugin_manager", self.pm)
+        monkeypatch.setitem(plugins_mod._plugin_managers, str(__import__("marlow_constants").get_marlow_home().absolute()), self.pm)
 
         empty = tmp_path / "empty-skills"
         empty.mkdir()
         monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", empty)
         monkeypatch.setenv("MARLOW_HOME", str(tmp_path / ".marlow"))
+        monkeypatch.setitem(plugins_mod._plugin_managers, str(tmp_path / ".marlow"), self.pm)
 
     def _register_skill(self, tmp_path, plugin="superpowers", name="writing-plans", content=None):
         skill_dir = tmp_path / "plugins" / plugin / "skills" / name
@@ -276,11 +277,12 @@ class TestSkillViewPluginGuards:
         from marlow_cli.plugins import PluginManager
 
         self.pm = PluginManager()
-        monkeypatch.setattr(plugins_mod, "_plugin_manager", self.pm)
+        monkeypatch.setitem(plugins_mod._plugin_managers, str(__import__("marlow_constants").get_marlow_home().absolute()), self.pm)
         empty = tmp_path / "empty"
         empty.mkdir()
         monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", empty)
         monkeypatch.setenv("MARLOW_HOME", str(tmp_path / ".marlow"))
+        monkeypatch.setitem(plugins_mod._plugin_managers, str(tmp_path / ".marlow"), self.pm)
         self._platform = sys.platform
 
     def _reg(self, tmp_path, content, plugin="myplugin", name="foo"):
@@ -333,11 +335,12 @@ class TestBundleContextBanner:
         from marlow_cli.plugins import PluginManager
 
         self.pm = PluginManager()
-        monkeypatch.setattr(plugins_mod, "_plugin_manager", self.pm)
+        monkeypatch.setitem(plugins_mod._plugin_managers, str(__import__("marlow_constants").get_marlow_home().absolute()), self.pm)
         empty = tmp_path / "empty"
         empty.mkdir()
         monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", empty)
         monkeypatch.setenv("MARLOW_HOME", str(tmp_path / ".marlow"))
+        monkeypatch.setitem(plugins_mod._plugin_managers, str(tmp_path / ".marlow"), self.pm)
 
     def _setup_bundle(self, tmp_path, skills=("foo", "bar", "baz")):
         for name in skills:

@@ -23,14 +23,14 @@ entry points you'll actually edit.
 
 ```
 marlow-agent/
-├── run_agent.py          # AIAgent class — core conversation loop (~12k LOC)
+├── run_agent.py          # Thin SDK facade — sole Codex app-server runtime
 ├── model_tools.py        # Tool orchestration, discover_builtin_tools(), handle_function_call()
 ├── toolsets.py           # Toolset definitions, _MARLOW_CORE_TOOLS list
 ├── marlow_state.py       # SessionDB — SQLite session store (FTS5 search)
 ├── marlow_constants.py   # get_marlow_home(), display_marlow_home() — profile-aware paths
 ├── marlow_logging.py     # setup_logging() — agent.log / errors.log / gateway.log (profile-aware)
 ├── batch_runner.py       # Parallel batch processing
-├── agent/                # Agent internals (provider adapters, memory, caching, compression, etc.)
+├── agent/                # Codex adapter, isolated environment, business memory and policy
 ├── marlow_cli/           # CLI subcommands, setup wizard, plugin loader and single-query entry points
 ├── tools/                # Tool implementations — auto-discovered via tools/registry.py
 │   └── environments/     # Terminal backends (local, docker, ssh)
@@ -40,8 +40,6 @@ marlow-agent/
 │   └── builtin_hooks/    # Extension point for always-registered gateway hooks (none shipped)
 ├── plugins/              # Plugin system (see "Plugins" section below)
 │   ├── memory/           # Memory-provider plugins (honcho)
-│   ├── context_engine/   # Context-engine plugins
-│   ├── model-providers/  # Retained inference plugins (openai-codex, custom)
 │   ├── observability/    # Metrics / traces / logs plugin
 │   └── <others>/         # observability, browser/web, platforms, security
 ├── .agents/skills/       # Developer skills for the source checkout
@@ -56,6 +54,30 @@ marlow-agent/
 **Logs:** `~/.marlow/logs/` — `agent.log` (INFO+), `errors.log` (WARNING+),
 `gateway.log` when running the gateway. Profile-aware via `get_marlow_home()`.
 Browse with `marlow logs [--follow] [--level ...] [--session ...]`.
+
+
+## Codex-only execution
+
+Codex CLI 0.159.2 is the only supported inference runtime. Read
+`docs/architecture/phase-2-codex-runtime.md` and
+`docs/architecture/phase-2-validation.md` for configuration, migration and
+validation evidence. Never reintroduce an inference client, provider router,
+Native loop, fallback chain, model-driven approval judge or Marlow compressor.
+
+`agent/codex_environment.py` owns discovery, HOME/CODEX_HOME and sandbox policy.
+`agent/transports/codex_app_server_session.py` owns the protocol event pump.
+Marlow's scoped MCP boundary owns business authorization. Model-native execution
+tools are disabled; shell/files use the same server's sandboxed `command/exec`
+only after host checks. Host browser and media operations must preserve the
+trusted file-disclosure scope. Delegation inherits its parent's workspace and
+grants. Profile globals must not retain another profile's business paths.
+
+Model settings and authentication belong in the profile's native Codex TOML and
+file credential store. Historical YAML inference settings are preserved and
+rejected with migration guidance. A stopped or uncertain mutation must never be
+replayed automatically. A new runtime needs real-schema, real-subprocess and
+independent read-only verification; mock tests alone do not establish sandbox
+or provider compatibility.
 
 ## TypeScript Style
 
@@ -96,61 +118,15 @@ run_agent.py, cli.py, batch_runner.py, environments/
 
 ## AIAgent Class (run_agent.py)
 
-The real `AIAgent.__init__` takes ~60 parameters (credentials, routing, callbacks,
-session context, budget, credential pool, etc.). The signature below is the
-minimum subset you'll usually touch — read `run_agent.py` for the full list.
+`AIAgent` is a synchronous SDK facade over the single Codex app-server adapter.
+`chat()` returns final text; `run_conversation()` returns final text, history,
+usage and durable completion/error state. Read the actual constructor for
+callbacks and scope fields. Legacy credentials, provider routing and runtime
+switches are rejected with migration guidance.
 
-```python
-class AIAgent:
-    def __init__(self,
-        base_url: str = None,
-        api_key: str = None,
-        provider: str = None,
-        api_mode: str = None,              # "chat_completions" | "codex_responses" | ...
-        model: str = "",                   # empty → resolved from config/provider later
-        max_iterations: int = 90,          # tool-calling iterations (shared with subagents)
-        enabled_toolsets: list = None,
-        disabled_toolsets: list = None,
-        quiet_mode: bool = False,
-        save_trajectories: bool = False,
-        platform: str = None,              # "cli", "telegram", etc.
-        session_id: str = None,
-        skip_context_files: bool = False,
-        skip_memory: bool = False,
-        credential_pool=None,
-        # ... plus callbacks, thread/user/chat IDs, iteration_budget, fallback_model,
-        # checkpoints config, prefill_messages, service_tier, reasoning_config, etc.
-    ): ...
-
-    def chat(self, message: str) -> str:
-        """Simple interface — returns final response string."""
-
-    def run_conversation(self, user_message: str, system_message: str = None,
-                         conversation_history: list = None, task_id: str = None) -> dict:
-        """Full interface — returns dict with final_response + messages."""
-```
-
-### Agent Loop
-
-The core loop is inside `run_conversation()` — entirely synchronous, with
-interrupt checks, budget tracking, and a one-turn grace call:
-
-```python
-while (api_call_count < self.max_iterations and self.iteration_budget.remaining > 0) \
-        or self._budget_grace_call:
-    if self._interrupt_requested: break
-    response = client.chat.completions.create(model=model, messages=messages, tools=tool_schemas)
-    if response.tool_calls:
-        for tool_call in response.tool_calls:
-            result = handle_function_call(tool_call.name, tool_call.args, task_id)
-            messages.append(tool_result_message(result))
-        api_call_count += 1
-    else:
-        return response.content
-```
-
-Messages follow OpenAI format: `{"role": "system/user/assistant/tool", ...}`.
-Reasoning content is stored in `assistant_msg["reasoning"]`.
+Codex owns the inference/tool loop and compaction. Marlow projects business
+context before a turn, authorizes each MCP operation and records its outcome.
+Never restore a client.chat.completions loop or an auxiliary inference client.
 
 ---
 
@@ -251,17 +227,14 @@ Reference: #2810 (bounds pass), #9801 (SHA pinning + audit CI).
    section is handled automatically by the deep-merge and does NOT require
    a version bump.
 
-### Top-level `config.yaml` sections (non-exhaustive):
+### Runtime and business settings
 
-`model`, `agent`, `terminal`, `compression`, `display`,
-`memory`, `security`, `delegation`, `smart_model_routing`, `checkpoints`,
-`auxiliary`, `skills`, `gateway`, `logging`, `cron`, `profiles`,
-`plugins`, `honcho`.
-
-`auxiliary` holds per-task overrides for side-LLM work (vision,
-embedding, title generation, session_search, etc.) — each task can pin
-its own provider/model/base_url/max_tokens/reasoning_effort. See
-`agent/auxiliary_client.py::_resolve_auto` for resolution order.
+`runtime.codex` configures the managed binary, timeouts, bounded concurrency,
+explicit environment variables and project/skill allowlists. Model and provider
+settings belong exclusively in the profile's `runtime/codex/config.toml`.
+Retired YAML inference fields fail with migration guidance and are not silently
+translated. Memory, tools, channels, delegation and Cron retain their existing
+business configuration.
 
 ### .env variables (SECRETS ONLY — API keys, tokens, passwords):
 1. Add to `OPTIONAL_ENV_VARS` in `marlow_cli/config.py` with metadata:
@@ -361,34 +334,11 @@ landing in this tree. PRs that add a new directory under
 provider as its own repo. Existing in-tree providers stay; bug fixes
 to them are welcome.
 
-### Model-provider plugins (`plugins/model-providers/<name>/`)
+### Model configuration
 
-The retained Codex and custom/local inference backends ship as plugins here.
-Each plugin's `__init__.py` calls
-`providers.register_provider(ProviderProfile(...))` at module load.
-`providers/__init__.py._discover_providers()` is a **lazy, separate
-discovery system** — scanned on first `get_provider_profile()` or
-`list_providers()` call, NOT by the general PluginManager.
-
-Scan order:
-1. Bundled: `<repo>/plugins/model-providers/<name>/`
-2. User: `$MARLOW_HOME/plugins/model-providers/<name>/`
-
-User plugins of the same name override bundled ones — `register_provider()`
-is last-writer-wins. This lets third parties swap out any built-in
-profile without a repo patch.
-
-The general PluginManager records `kind: model-provider` manifests but does
-NOT import them (would double-instantiate `ProviderProfile`). Plugins
-without an explicit `kind:` get auto-coerced via a source-text heuristic
-(`register_provider` + `ProviderProfile` in `__init__.py`).
-
-Model-provider authoring conventions live in this guide and the bundled examples.
-
-### Context-engine plugins
-
-Context engines plug into `agent/context_engine.py`. Optional provider
-plugins can be installed in the active profile.
+Model-provider and context-engine plugins are retired. Custom inference
+providers use Codex native Responses configuration only. Business plugins and
+memory providers remain supported inside their trusted profile scope.
 
 ## Skills
 
@@ -540,12 +490,11 @@ Roles:
 
 Key config knobs (under `delegation:` in `config.yaml`):
 `max_concurrent_children`, `max_spawn_depth`, `child_timeout_seconds`,
-`orchestrator_enabled`, `subagent_auto_approve`, `inherit_mcp_toolsets`,
+`orchestrator_enabled`, `inherit_mcp_toolsets`,
 `max_iterations`.
 
 Synchronicity rule: delegate_task is **not** durable. For long-running
-work that must outlive the current turn, use `cronjob` or
-`terminal(background=True, notify_on_complete=True)` instead.
+work that must outlive the current turn, use `cronjob` instead.
 
 ---
 
@@ -586,30 +535,15 @@ main conversation's message-role alternation stays intact.
 
 ## Important Policies
 
-### Prompt Caching Must Not Break
+### Context and triggered work
 
-Marlow-Agent ensures caching remains valid throughout a conversation. **Do NOT implement changes that would:**
-- Alter past context mid-conversation
-- Change toolsets mid-conversation
-- Reload memories or rebuild system prompts mid-conversation
+Codex owns context compaction. Preserve raw Marlow history; never rewrite it to
+simulate native Thread rollback. Context, tool and memory changes must preserve
+the current profile and conversation scope.
 
-Cache-breaking forces dramatically higher costs. The ONLY time we alter context is during context compression.
-
-Slash commands that mutate system-prompt state (skills, tools, memory, etc.)
-must be **cache-aware**: default to deferred invalidation (change takes
-effect next session), with an explicit opt-in for immediate invalidation.
-
-### Background Process Notifications (Gateway)
-
-When `terminal(background=true, notify_on_complete=true)` is used, the gateway runs a watcher that
-detects process completion and triggers a new agent turn. Control verbosity of background process
-messages with `display.background_process_notifications`
-in config.yaml (or `MARLOW_BACKGROUND_NOTIFICATIONS` env var):
-
-- `all` — running-output updates + final message (default)
-- `result` — only the final completion message
-- `error` — only the final message when exit code != 0
-- `off` — no watcher messages at all
+AI work requires an explicit input, due AI job or authorized follow-up. Do not
+add idle AI heartbeats. `terminal(background=True)` is currently unsupported;
+use scoped Cron/delegation for supported triggered work.
 
 ---
 

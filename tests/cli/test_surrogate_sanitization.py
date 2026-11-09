@@ -9,11 +9,9 @@ import json
 import pytest
 from unittest.mock import MagicMock, patch
 
-from run_agent import (
-    _sanitize_surrogates,
-    _sanitize_messages_surrogates,
-    _sanitize_structure_surrogates,
-)
+from agent.message_sanitization import _sanitize_surrogates
+from agent.message_sanitization import _sanitize_messages_surrogates
+from agent.message_sanitization import _sanitize_structure_surrogates
 
 
 class TestSanitizeSurrogates:
@@ -288,48 +286,3 @@ class TestApiMessagesSurrogateRecovery:
         assert "\udce2" not in api_messages[1]["reasoning_content"]
         # Full payload must now serialize clean
         json.dumps(api_messages, ensure_ascii=False).encode("utf-8")
-
-
-class TestRunConversationSurrogateSanitization:
-    """Integration: verify run_conversation sanitizes user_message."""
-
-    @patch("run_agent.AIAgent._build_system_prompt")
-    @patch("run_agent.AIAgent._interruptible_streaming_api_call")
-    @patch("run_agent.AIAgent._interruptible_api_call")
-    def test_user_message_surrogates_sanitized(self, mock_api, mock_stream, mock_sys):
-        """Surrogates in user_message are stripped before API call."""
-        from run_agent import AIAgent
-
-        mock_sys.return_value = "system prompt"
-
-        # Mock streaming to return a simple response
-        mock_choice = MagicMock()
-        mock_choice.message.content = "response"
-        mock_choice.message.tool_calls = None
-        mock_choice.message.refusal = None
-        mock_choice.finish_reason = "stop"
-        mock_choice.message.reasoning_content = None
-
-        mock_response = MagicMock()
-        mock_response.choices = [mock_choice]
-        mock_response.usage = MagicMock(prompt_tokens=10, completion_tokens=5, total_tokens=15)
-        mock_response.model = "test-model"
-        mock_response.id = "test-id"
-
-        mock_stream.return_value = mock_response
-        mock_api.return_value = mock_response
-
-        agent = AIAgent(model="test/model", api_key="test-key", base_url="http://localhost:1234/v1", quiet_mode=True, skip_memory=True, skip_context_files=True)
-        agent.client = MagicMock()
-
-        # Pass a message with surrogates
-        result = agent.run_conversation(
-            user_message="test \udce2 message",
-            conversation_history=[],
-        )
-
-        # The message stored in history should have surrogates replaced
-        for msg in result.get("messages", []):
-            if msg.get("role") == "user":
-                assert "\udce2" not in msg["content"], "Surrogate leaked into stored message"
-                assert "\ufffd" in msg["content"], "Replacement char not in stored message"

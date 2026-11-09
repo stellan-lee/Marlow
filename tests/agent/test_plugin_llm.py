@@ -844,7 +844,7 @@ class TestAttribution:
         reflects the user's active main provider/model rather than
         misleading placeholders."""
         from agent import plugin_llm
-        import agent.auxiliary_client as ac
+        import agent.codex_tasks as ac
 
         monkeypatch.setattr(ac, "_read_main_provider", lambda: "openrouter")
         monkeypatch.setattr(ac, "_read_main_model", lambda: "anthropic/claude-3-5-sonnet")
@@ -862,7 +862,7 @@ class TestAttribution:
         """The provider's canonical model name should still flow through
         when no overrides are set."""
         from agent import plugin_llm
-        import agent.auxiliary_client as ac
+        import agent.codex_tasks as ac
 
         monkeypatch.setattr(ac, "_read_main_provider", lambda: "openrouter")
         monkeypatch.setattr(ac, "_read_main_model", lambda: "openai/gpt-4o")
@@ -881,7 +881,7 @@ class TestAttribution:
         AND the response has no .model, fall through to the safety
         placeholders so the result object never has empty strings."""
         from agent import plugin_llm
-        import agent.auxiliary_client as ac
+        import agent.codex_tasks as ac
 
         monkeypatch.setattr(ac, "_read_main_provider", lambda: "")
         monkeypatch.setattr(ac, "_read_main_model", lambda: "")

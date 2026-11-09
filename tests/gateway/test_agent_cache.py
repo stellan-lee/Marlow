@@ -429,8 +429,8 @@ class TestAgentCacheLifecycle:
 
         # First message — create and cache
         agent1 = AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
-            base_url="https://openrouter.ai/api/v1", provider="openrouter",
+            model="anthropic/claude-sonnet-4",
+
             max_iterations=5, quiet_mode=True, skip_context_files=True,
             skip_memory=True, platform="telegram",
         )
@@ -455,8 +455,8 @@ class TestAgentCacheLifecycle:
 
         old_sig = runner._agent_config_signature("anthropic/claude-sonnet-4", runtime, ["marlow-telegram"], "")
         agent1 = AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
-            base_url="https://openrouter.ai/api/v1", provider="openrouter",
+            model="anthropic/claude-sonnet-4",
+
             max_iterations=5, quiet_mode=True, skip_context_files=True,
             skip_memory=True, platform="telegram",
         )
@@ -479,8 +479,8 @@ class TestAgentCacheLifecycle:
         session_key = "telegram:12345"
 
         agent = AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
-            base_url="https://openrouter.ai/api/v1", provider="openrouter",
+            model="anthropic/claude-sonnet-4",
+
             max_iterations=5, quiet_mode=True, skip_context_files=True,
             skip_memory=True,
         )
@@ -505,55 +505,15 @@ class TestAgentCacheLifecycle:
             assert "session-A" not in runner._agent_cache
             assert "session-B" in runner._agent_cache
 
-    def test_reasoning_config_updates_in_place(self):
-        """Reasoning config can be set on a cached agent without eviction."""
-        from run_agent import AIAgent
 
-        agent = AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
-            base_url="https://openrouter.ai/api/v1", provider="openrouter",
-            max_iterations=5, quiet_mode=True, skip_context_files=True,
-            skip_memory=True,
-            reasoning_config={"enabled": True, "effort": "medium"},
-        )
-
-        # Simulate per-message reasoning update
-        agent.reasoning_config = {"enabled": True, "effort": "high"}
-        assert agent.reasoning_config["effort"] == "high"
-
-        # System prompt should not be affected by reasoning change
-        prompt1 = agent._build_system_prompt()
-        agent._cached_system_prompt = prompt1  # simulate run_conversation caching
-        agent.reasoning_config = {"enabled": True, "effort": "low"}
-        prompt2 = agent._cached_system_prompt
-        assert prompt1 is prompt2  # same object — not invalidated by reasoning change
-
-    def test_system_prompt_frozen_across_cache_reuse(self):
-        """The cached agent's system prompt stays identical across turns."""
-        from run_agent import AIAgent
-
-        agent = AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
-            base_url="https://openrouter.ai/api/v1", provider="openrouter",
-            max_iterations=5, quiet_mode=True, skip_context_files=True,
-            skip_memory=True, platform="telegram",
-        )
-
-        # Build system prompt (simulates first run_conversation)
-        prompt1 = agent._build_system_prompt()
-        agent._cached_system_prompt = prompt1
-
-        # Simulate second turn — prompt should be frozen
-        prompt2 = agent._cached_system_prompt
-        assert prompt1 is prompt2  # same object, not rebuilt
 
     def test_callbacks_update_without_cache_eviction(self):
         """Per-message callbacks can be set on cached agent."""
         from run_agent import AIAgent
 
         agent = AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
-            base_url="https://openrouter.ai/api/v1", provider="openrouter",
+            model="anthropic/claude-sonnet-4",
+
             max_iterations=5, quiet_mode=True, skip_context_files=True,
             skip_memory=True,
         )
@@ -989,8 +949,8 @@ class TestAgentCacheSpilloverLive:
         """A genuine AIAgent; no API calls are made during these tests."""
         from run_agent import AIAgent
         return AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
-            base_url="https://openrouter.ai/api/v1", provider="openrouter",
+            model="anthropic/claude-sonnet-4",
+
             max_iterations=5, quiet_mode=True,
             skip_context_files=True, skip_memory=True,
             platform="telegram",
@@ -1052,7 +1012,7 @@ class TestAgentCacheSpilloverLive:
         assert len(runner._agent_cache) == CAP + 1  # temporarily over cap
         # All existing agents still usable.
         for i, a in enumerate(agents):
-            assert a.client is not None, f"s{i} got closed while active!"
+            assert not a._closed, f"s{i} got closed while active!"
         # And we warned operators.
         assert any("mid-turn" in r.message for r in caplog.records)
 
@@ -1100,7 +1060,7 @@ class TestAgentCacheSpilloverLive:
         assert "sA" in runner._agent_cache
         assert runner._agent_cache["sA"][0] is a0_new  # the new one, not stale
         # Fresh agent is usable.
-        assert a0_new.client is not None
+        assert not a0_new._closed
 
         for a in (a0, a1, a2, a0_new):
             try:
@@ -1137,8 +1097,8 @@ class TestAgentCacheIdleResume:
         from run_agent import AIAgent
 
         agent = AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
-            base_url="https://openrouter.ai/api/v1", provider="openrouter",
+            model="anthropic/claude-sonnet-4",
+
             max_iterations=5, quiet_mode=True,
             skip_context_files=True, skip_memory=True,
             session_id="idle-resume-test-session",
@@ -1170,8 +1130,8 @@ class TestAgentCacheIdleResume:
         from tools import browser_tool as _bt
 
         agent = AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
-            base_url="https://openrouter.ai/api/v1", provider="openrouter",
+            model="anthropic/claude-sonnet-4",
+
             max_iterations=5, quiet_mode=True,
             skip_context_files=True, skip_memory=True,
             session_id="idle-resume-test-2",
@@ -1202,125 +1162,8 @@ class TestAgentCacheIdleResume:
             f"tabs and cookies gone on resume. Calls: {browser_calls}"
         )
 
-    def test_release_clients_closes_llm_client(self):
-        """release_clients IS expected to close the OpenAI/httpx client."""
-        from run_agent import AIAgent
 
-        agent = AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
-            base_url="https://openrouter.ai/api/v1", provider="openrouter",
-            max_iterations=5, quiet_mode=True,
-            skip_context_files=True, skip_memory=True,
-        )
-        # Clients are lazy-built; force one to exist so we can verify close.
-        assert agent.client is not None  # __init__ builds it
 
-        agent.release_clients()
-
-        # Post-release: client reference is dropped (memory freed).
-        assert agent.client is None
-
-    def test_close_vs_release_full_teardown_difference(self, monkeypatch):
-        """close() tears down task state; release_clients() does not.
-
-        This pins the semantic contract: session-expiry path uses close()
-        (full teardown — session is done), cache-eviction path uses
-        release_clients() (soft — session may resume).
-        """
-        from run_agent import AIAgent
-        import run_agent as _ra
-
-        # Agent A: evicted from cache (soft) — terminal survives.
-        # Agent B: session expired (hard) — terminal torn down.
-        agent_a = AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
-            base_url="https://openrouter.ai/api/v1", provider="openrouter",
-            max_iterations=5, quiet_mode=True,
-            skip_context_files=True, skip_memory=True,
-            session_id="soft-session",
-        )
-        agent_b = AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
-            base_url="https://openrouter.ai/api/v1", provider="openrouter",
-            max_iterations=5, quiet_mode=True,
-            skip_context_files=True, skip_memory=True,
-            session_id="hard-session",
-        )
-
-        vm_calls: list = []
-        # AIAgent.close() calls the ``cleanup_vm`` name bound into
-        # ``run_agent`` at import time, not ``tools.terminal_tool.cleanup_vm``
-        # directly — so patch the ``run_agent`` reference.
-        original_vm = _ra.cleanup_vm
-        _ra.cleanup_vm = lambda tid: vm_calls.append(tid)
-        try:
-            agent_a.release_clients()   # cache eviction
-            agent_b.close()              # session expiry
-        finally:
-            _ra.cleanup_vm = original_vm
-            try:
-                agent_a.close()
-            except Exception:
-                pass
-
-        # Only agent_b's task_id should appear in cleanup calls.
-        assert "hard-session" in vm_calls
-        assert "soft-session" not in vm_calls
-
-    def test_idle_evicted_session_rebuild_inherits_task_id(self, monkeypatch):
-        """After idle-TTL eviction, a fresh agent with the same session_id
-        gets the same task_id — so tool state (terminal/browser/bg procs)
-        that persisted across eviction is reachable via the new agent.
-        """
-        from gateway import run as gw_run
-        from run_agent import AIAgent
-
-        monkeypatch.setattr(gw_run, "_AGENT_CACHE_IDLE_TTL_SECS", 0.01)
-        runner = self._runner()
-
-        # Build an agent representing a stale (idle) session.
-        SESSION_ID = "long-lived-user-session"
-        old = AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
-            base_url="https://openrouter.ai/api/v1", provider="openrouter",
-            max_iterations=5, quiet_mode=True,
-            skip_context_files=True, skip_memory=True,
-            session_id=SESSION_ID,
-        )
-        old._last_activity_ts = 0.0  # force idle
-        runner._agent_cache["sKey"] = (old, "sig")
-
-        # Simulate the idle-TTL sweep firing.
-        runner._sweep_idle_cached_agents()
-        assert "sKey" not in runner._agent_cache
-
-        # Wait for the daemon thread doing release_clients() to finish.
-        import time as _t
-        _t.sleep(0.3)
-
-        # Old agent's client is gone (soft cleanup fired).
-        assert old.client is None
-
-        # User comes back — new agent built for the SAME session_id.
-        new_agent = AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
-            base_url="https://openrouter.ai/api/v1", provider="openrouter",
-            max_iterations=5, quiet_mode=True,
-            skip_context_files=True, skip_memory=True,
-            session_id=SESSION_ID,
-        )
-
-        # Same session_id means same task_id routed to tools.  The new
-        # agent inherits any per-task state (terminal sandbox etc.) that
-        # was preserved across eviction.
-        assert new_agent.session_id == old.session_id == SESSION_ID
-        # And it has a fresh working client.
-        assert new_agent.client is not None
-
-        try:
-            new_agent.close()
-        except Exception:
-            pass
 
 
 _FAKE_NOW = 10_000.0  # Fixed epoch for deterministic time assertions

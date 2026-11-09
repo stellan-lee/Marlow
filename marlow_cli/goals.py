@@ -401,20 +401,7 @@ def judge_goal(
         # No substantive reply this turn — almost certainly not done yet.
         return "continue", "empty response (nothing to evaluate)", False
 
-    try:
-        from agent.auxiliary_client import get_auxiliary_extra_body, get_text_auxiliary_client
-    except Exception as exc:
-        logger.debug("goal judge: auxiliary client import failed: %s", exc)
-        return "continue", "auxiliary client unavailable", False
-
-    try:
-        client, model = get_text_auxiliary_client("goal_judge")
-    except Exception as exc:
-        logger.debug("goal judge: get_text_auxiliary_client failed: %s", exc)
-        return "continue", "auxiliary client unavailable", False
-
-    if client is None or not model:
-        return "continue", "no auxiliary client configured", False
+    from agent.codex_tasks import call_llm
 
     # Build the prompt — pick the with-subgoals variant when applicable.
     clean_subgoals = [s.strip() for s in (subgoals or []) if s and s.strip()]
@@ -437,8 +424,8 @@ def judge_goal(
         )
 
     try:
-        resp = client.chat.completions.create(
-            model=model,
+        resp = call_llm(
+            task="goal_judge",
             messages=[
                 {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
@@ -446,7 +433,6 @@ def judge_goal(
             temperature=0,
             max_tokens=_goal_judge_max_tokens(),
             timeout=timeout,
-            extra_body=get_auxiliary_extra_body() or None,
         )
     except Exception as exc:
         logger.info("goal judge: API call failed (%s) — falling through to continue", exc)
