@@ -10,7 +10,7 @@ zero migration needed.
 
 Usage::
 
-    marlow profile create coder          # fresh profile + bundled skills
+    marlow profile create coder          # fresh profile with empty skills directory
     marlow profile create coder --clone  # also copy config, .env, SOUL.md, skills
     marlow profile create coder --clone-all  # full copy of source profile
     coder chat                           # use via wrapper alias
@@ -25,11 +25,11 @@ import re
 import shutil
 import stat
 import subprocess
-import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import List, Optional
 
+from agent.bundled_skills import NO_BUNDLED_SKILLS_MARKER
 from agent.skill_utils import is_excluded_skill_path
 
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
@@ -97,23 +97,6 @@ _CLONE_ALL_DEFAULT_EXCLUDE_ROOT: frozenset[str] = frozenset({
     "bin",
     "node_modules",
 })
-
-# Marker file written by `marlow profile create --no-skills`.  When present in
-# a profile's root, callers of seed_profile_skills() (fresh-create, `marlow
-# update`'s all-profile sync) skip bundled-skill seeding
-# for that profile. The user can still copy SKILL.md packages into the
-# profile's skills/ directory manually.
-# Delete the marker file to opt back in.
-NO_BUNDLED_SKILLS_MARKER = ".no-bundled-skills"
-
-
-def has_bundled_skills_opt_out(profile_dir: Path) -> bool:
-    """Return True if the profile opted out of bundled-skill seeding."""
-    try:
-        return (profile_dir / NO_BUNDLED_SKILLS_MARKER).exists()
-    except OSError:
-        return False
-
 
 def _clone_all_copytree_ignore(source_dir: Path):
     """Exclude infrastructure artifacts when cloning a profile via --clone-all.
@@ -493,7 +476,7 @@ def _count_skills(profile_dir: Path) -> int:
         return 0
     count = 0
     for md in skills_dir.rglob("SKILL.md"):
-        if is_excluded_skill_path(md):
+        if is_excluded_skill_path(md, skills_dir=skills_dir):
             continue
         count += 1
     return count
@@ -665,9 +648,8 @@ def create_profile(
     no_alias:
         If True, skip wrapper script creation.
     no_skills:
-        If True, create an empty profile with no bundled skills, and write
-        a marker file so ``marlow update`` skips re-seeding this profile's
-        skills. Mutually exclusive with ``clone_config``/``clone_all`` (those
+        If True, opt out of bundled on-demand skills for this profile.
+        Mutually exclusive with ``clone_config``/``clone_all`` (those
         explicitly copy skills from the source).
 
     Returns
@@ -765,18 +747,13 @@ def create_profile(
         except Exception:
             pass  # best-effort — don't fail profile creation over this
 
-    # Write the opt-out marker so seed_profile_skills() and `marlow update`'s
-    # all-profile sync loop both skip this profile for bundled-skill seeding.
     if no_skills:
-        try:
-            (profile_dir / NO_BUNDLED_SKILLS_MARKER).write_text(
-                "This profile opted out of bundled-skill seeding "
-                "(`marlow profile create --no-skills`).\n"
-                "Delete this file to re-enable sync on the next `marlow update`.\n",
-                encoding="utf-8",
-            )
-        except OSError:
-            pass  # best-effort — the feature still works via the empty skills/ dir
+        (profile_dir / NO_BUNDLED_SKILLS_MARKER).write_text(
+            "This profile opted out of bundled on-demand skills "
+            "(`marlow profile create --no-skills`).\n"
+            "Delete this file to make bundled on-demand skills available.\n",
+            encoding="utf-8",
+        )
 
     # Persist description if the caller provided one. Done last so a
     # partial-create failure doesn't strand a description file in an
@@ -800,51 +777,6 @@ def create_profile(
     _maybe_register_gateway_service(canon)
 
     return profile_dir
-
-
-def seed_profile_skills(profile_dir: Path, quiet: bool = False) -> Optional[dict]:
-    """Seed bundled skills into a profile via subprocess.
-
-    Uses subprocess because sync_skills() caches MARLOW_HOME at module level.
-    Returns the sync result dict, or None on failure.
-
-    Profiles that opted out of bundled skills (via ``marlow profile create
-    --no-skills`` — which writes ``.no-bundled-skills`` to the profile root)
-    are skipped and get an empty-result dict so callers can report
-    "opted out" instead of "failed".
-    """
-    if has_bundled_skills_opt_out(profile_dir):
-        return {
-            "copied": [],
-            "updated": [],
-            "user_modified": [],
-            "skipped_opt_out": True,
-        }
-    project_root = Path(__file__).parent.parent.resolve()
-    try:
-        result = subprocess.run(
-            [sys.executable, "-c",
-             "import json; from tools.skills_sync import sync_skills; "
-             "r = sync_skills(quiet=True); print(json.dumps(r))"],
-            env={**os.environ, "MARLOW_HOME": str(profile_dir)},
-            cwd=str(project_root),
-            capture_output=True, text=True, timeout=60,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return json.loads(result.stdout.strip())
-        if not quiet:
-            print(f"⚠ Skill seeding returned exit code {result.returncode}")
-            if result.stderr.strip():
-                print(f"  {result.stderr.strip()[:200]}")
-        return None
-    except subprocess.TimeoutExpired:
-        if not quiet:
-            print("⚠ Skill seeding timed out (60s)")
-        return None
-    except Exception as e:
-        if not quiet:
-            print(f"⚠ Skill seeding failed: {e}")
-        return None
 
 
 def delete_profile(name: str, yes: bool = False) -> Path:

@@ -293,7 +293,7 @@ def _find_skill_in_other_profiles(name: str) -> List[Tuple[str, Path]]:
             continue
         try:
             for skill_md in skills_dir.rglob("SKILL.md"):
-                if is_excluded_skill_path(skill_md):
+                if is_excluded_skill_path(skill_md, skills_dir=skills_dir):
                     continue
                 if skill_md.parent.name == name:
                     matches.append((profile_name, skill_md.parent))
@@ -445,10 +445,15 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
 
     # Create the skill directory
     skill_dir = _resolve_skill_dir(name, category)
+    skill_md = skill_dir / "SKILL.md"
+    if skill_md.exists() or skill_md.is_symlink():
+        return {
+            "success": False,
+            "error": f"A skill file already exists at '{skill_md}'.",
+        }
     skill_dir.mkdir(parents=True, exist_ok=True)
 
     # Write SKILL.md atomically
-    skill_md = skill_dir / "SKILL.md"
     _atomic_write_text(skill_md, content)
 
     result = {

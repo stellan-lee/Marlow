@@ -25,8 +25,8 @@ Use this skill when you need to:
 - Sign up for services or authenticate via email
 - Communicate with other agents or humans via email
 
-This is NOT for reading the user's personal email (use himalaya or Gmail for that).
 AgentMail gives the agent its own identity and inbox.
+Use an authorized mail integration to read the user's personal email.
 
 ## Setup
 

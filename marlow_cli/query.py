@@ -348,7 +348,6 @@ def run_query(args) -> int:
     """Execute a single query, retaining session history and approval policy."""
     from marlow_cli.config import load_config, read_raw_config
     from marlow_cli.fallback_config import get_fallback_chain
-    from tools.skills_sync import sync_skills
     from marlow_cli.mcp_startup import wait_for_mcp_discovery
     from marlow_cli.oneshot import _normalize_toolsets, _oneshot_clarify_callback, _resolve_query_runtime
     from marlow_cli.tools_config import _get_platform_tools
@@ -370,10 +369,6 @@ def run_query(args) -> int:
         if isinstance(checkpoint, bool):
             checkpoint = {"enabled": checkpoint}
 
-        try:
-            sync_skills(quiet=True)
-        except Exception:
-            logger.debug("Bundled skill sync failed", exc_info=True)
         wait_for_mcp_discovery()
 
         db = None

@@ -44,8 +44,9 @@ marlow-agent/
 │   ├── model-providers/  # Retained inference plugins (openai-codex, custom)
 │   ├── observability/    # Metrics / traces / logs plugin
 │   └── <others>/         # observability, browser/web, platforms, security
-├── optional-skills/      # Heavier/niche skills shipped but NOT active by default
-├── skills/               # Built-in skills bundled with the repo
+├── .agents/skills/       # Developer skills for the source checkout
+├── optional-skills/      # Shipped skills for manual installation
+├── skills/               # Shipped skills for on-demand lookup
 ├── cron/                 # Scheduler — jobs.py, scheduler.py
 ├── scripts/              # run_tests.sh, release.py, auxiliary scripts
 └── tests/                # Pytest suite (~17k tests across ~900 files as of May 2026)
@@ -391,16 +392,15 @@ plugins can be installed in the active profile.
 
 ## Skills
 
-Two parallel surfaces:
+New profiles start with an empty skill directory. The source tree has three skill locations.
 
-- **`skills/`** — built-in skills shipped and loadable by default.
-  Organized by category directories (e.g. `skills/apple/`, `skills/mcp/`).
-- **`optional-skills/`** — heavier or niche skills shipped with the repo but
-  NOT active by default. Users activate them by copying the desired skill
-  directory into `~/.marlow/skills/` or a project-local skills directory.
-  Retained categories include `autonomous-ai-agents`, `communication`,
-  `devops`, `email`, `mcp`, `research`, `software-development`, and
-  `web-development`.
+- **`skills/`** ships `native-mcp` and `webhook-subscriptions` for explicit
+  lookup. Use `skills_list`, `skill_view`, or the skill's named Gateway slash
+  command. These assets stay in the installation directory.
+- **`optional-skills/`** ships skills for manual installation. Copy the desired
+  directory into `$MARLOW_HOME/skills/` or a configured external skill directory.
+- **`.agents/skills/`** contains developer skills for the source checkout.
+  The `marlow-agent` developer skill stays outside the product packages.
 
 When reviewing skill PRs, check which directory they target — heavy-dep or
 niche skills belong in `optional-skills/`.
@@ -492,10 +492,8 @@ violate them.
    `.env.example` versions are usually stale and edits outside the
    skill's own block must be dropped during salvage.
 
-The full salvage / modernization checklist for external skill PRs
-lives in the `marlow-agent-dev` skill at
-`references/new-skill-pr-salvage.md` — load it before polishing
-contributor skill PRs.
+For the project development reference, see
+[the Marlow developer skill](.agents/skills/marlow-agent/SKILL.md).
 
 ---
 

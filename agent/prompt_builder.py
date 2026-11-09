@@ -130,8 +130,8 @@ DEFAULT_AGENT_IDENTITY = (
 
 MARLOW_AGENT_HELP_GUIDANCE = (
     "If the user asks about configuring, setting up, or using Marlow Agent "
-    "itself, load the `marlow-agent` skill with skill_view(name='marlow-agent') "
-    "before answering. Project guide: https://github.com/stellan-lee/Marlow#readme"
+    "itself, consult the project guide at https://github.com/stellan-lee/Marlow#readme "
+    "or inspect the relevant `marlow` command's help."
 )
 
 MEMORY_GUIDANCE = (
@@ -994,11 +994,6 @@ def build_skills_system_prompt(
             "Skills also encode the user's preferred approach, conventions, and quality standards "
             "for tasks like code review, planning, and testing — load them even for tasks you "
             "already know how to do, because the skill defines how it should be done here.\n"
-            "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
-            "or troubleshoot Marlow Agent itself — its CLI, config, models, providers, tools, "
-            "skills, gateway, plugins, or any feature — load the `marlow-agent` skill "
-            "first. It has the actual commands (e.g. `marlow config set …`, `marlow tools`, "
-            "`marlow setup`) so you don't have to guess or invent workarounds.\n"
             "\n"
             "<available_skills>\n"
             + "\n".join(index_lines) + "\n"

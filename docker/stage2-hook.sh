@@ -1,7 +1,7 @@
 #!/bin/sh
 # s6-overlay stage2 hook — runs as root after the supervision tree is
 # up but before user services start. Handles UID/GID remap, volume
-# chown, config seeding, and skills sync.
+# chown, and config seeding.
 #
 # Per-service privilege drop happens inside each service's `run` script
 # (and in main-wrapper.sh) via s6-setuidgid, not here.
@@ -270,17 +270,6 @@ if [ ! -f "$MARLOW_HOME/auth.json" ] && [ -n "${MARLOW_AUTH_JSON_BOOTSTRAP:-}" ]
     printf '%s' "$MARLOW_AUTH_JSON_BOOTSTRAP" > "$MARLOW_HOME/auth.json"
     chown marlow:marlow "$MARLOW_HOME/auth.json" 2>/dev/null || true
     chmod 600 "$MARLOW_HOME/auth.json"
-fi
-
-# --- Sync bundled skills ---
-# Invoke the venv's python by absolute path so we don't need a `sh -c`
-# wrapper to source the activate script. This is safe because
-# skills_sync.py doesn't depend on any environment exports beyond what
-# the python binary's own bin-stub already sets up (sys.path is rooted
-# at the venv's site-packages by virtue of running .venv/bin/python).
-if [ -d "$INSTALL_DIR/skills" ]; then
-    as_marlow "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/tools/skills_sync.py" \
-        || echo "[stage2] Warning: skills_sync.py failed; continuing"
 fi
 
 # --- Discover agent-browser's Chromium binary ---

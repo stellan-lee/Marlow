@@ -38,12 +38,13 @@ This is the most common question for new contributors. The answer is almost alwa
 
 ### Should the Skill be bundled?
 
-Bundled skills (in `skills/`) ship with every Marlow install. They should be **broadly useful to most users**:
+New profiles start with an empty skill directory. `skills/` contains the
+shipped reference skills for native MCP and webhook subscriptions. Users can
+find and load them on request from the installation directory.
 
-- Document handling, web research, common dev workflows, system administration
-- Used regularly by a wide range of people
-
-If your skill is official and useful but not universally needed (e.g., a paid service integration or a heavyweight dependency), put it in **`optional-skills/`**. It ships with the repository but is not copied into the active profile by default.
+Put official skills that require manual installation in **`optional-skills/`**.
+The Marlow contributor skill lives in **`.agents/skills/marlow-agent/`** for
+developers working in the source checkout.
 
 Specialized community skills should ship independently and can be copied into `~/.marlow/skills/` or a project-local skills directory.
 
@@ -187,8 +188,9 @@ marlow-agent/
 ├── scripts/                  # Install, release, and test helpers
 │   └── install.sh                # Linux/macOS installer
 │
-├── skills/                   # Bundled skills (copied to ~/.marlow/skills/ on install)
-├── optional-skills/          # Shipped optional skills (not activated by default)
+├── .agents/skills/            # Skills for developers working in the checkout
+├── skills/                   # Shipped skills for on-demand lookup
+├── optional-skills/          # Shipped skills for manual installation
 ├── tests/                    # Test suite
 │
 ├── cli-config.yaml.example   # Example configuration (copied to ~/.marlow/config.yaml)
@@ -202,7 +204,7 @@ marlow-agent/
 | `~/.marlow/config.yaml` | Settings (model, terminal, toolsets, compression, etc.) |
 | `~/.marlow/.env` | API keys and secrets |
 | `~/.marlow/auth.json` | Codex OAuth credentials |
-| `~/.marlow/skills/` | Active bundled, local, and agent-created skills |
+| `~/.marlow/skills/` | Installed local and user-requested skills |
 | `~/.marlow/memories/` | Persistent memory (MEMORY.md, USER.md) |
 | `~/.marlow/state.db` | SQLite session database |
 | `~/.marlow/sessions/` | Gateway routing index (`sessions.json`), request-dump breadcrumbs, gateway `*.jsonl` transcripts, and (optionally) per-session JSON snapshots when `sessions.write_json_snapshots: true` is set. The per-session snapshots are off by default; state.db is canonical. |
@@ -315,10 +317,10 @@ plugin vs core guidance.
 
 ## Adding a Skill
 
-Bundled skills live in `skills/` organized by category. Official optional skills use the same structure in `optional-skills/`:
+Shipped skills are organized by category under `skills/` and `optional-skills/`.
 
 ```
-skills/
+optional-skills/
 ├── research/
 │   └── arxiv/
 │       ├── SKILL.md              # Required: main instructions
@@ -385,12 +387,12 @@ How the agent confirms it worked.
 Skills can declare which OS platforms they support via the `platforms` frontmatter field. Skills with this field are automatically hidden from the system prompt, `skills_list()`, and slash commands on incompatible platforms.
 
 ```yaml
-platforms: [macos]            # macOS only (e.g., iMessage, Apple Reminders)
+platforms: [macos]            # macOS only
 platforms: [macos, linux]     # macOS and Linux
 platforms: [windows]          # Windows only
 ```
 
-If the field is omitted or empty, the skill loads on all platforms (backward compatible). See `skills/apple/` for examples of macOS-only skills.
+If the field is omitted or empty, the skill loads on all platforms.
 
 ### Conditional skill activation
 
@@ -463,10 +465,8 @@ Gateway and messaging sessions never collect secrets in-band; they instruct the 
 - The skill can still be useful if the user skips setup, but may degrade gracefully
 
 **When to declare command prerequisites:**
-- The skill relies on a CLI tool that may not be installed (e.g., `himalaya`, `openhue`, `ddgs`)
+- The skill relies on a CLI tool that may need separate installation
 - Treat command checks as guidance, not discovery-time hiding
-
-See `skills/gifs/gif-search/` and `skills/email/himalaya/` for examples.
 
 ### Skill authoring standards (HARDLINE)
 

@@ -314,6 +314,10 @@ class TestFindAllSkills:
 
 
 class TestSkillsList:
+    @pytest.fixture(autouse=True)
+    def empty_catalog(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MARLOW_BUNDLED_SKILLS", str(tmp_path / "catalog"))
+
     def test_empty_creates_directory(self, tmp_path):
         skills_dir = tmp_path / "skills"
         with patch("tools.skills_tool.SKILLS_DIR", skills_dir):

@@ -67,6 +67,23 @@ Use `marlow --help`, `marlow setup`, and the guides in this repository for confi
 
 ---
 
+## Skills
+
+New profiles start with zero installed skills. Place custom skills in the
+active profile's `skills/` directory or use `/learn` in a Gateway conversation
+to create a skill on request.
+
+The package includes `native-mcp` and `webhook-subscriptions` for on-demand
+lookup. Ask Marlow to find or load either skill, or invoke `/native-mcp` or
+`/webhook-subscriptions` in the Gateway. MCP and webhook commands work
+independently of the skills.
+
+On upgrade, Marlow hides unchanged bundled copies that it can verify against
+the old profile manifest. The files stay in place. Custom and modified copies
+remain available under the usual skill settings.
+
+---
+
 ## Querying Marlow
 
 Use `marlow chat -q "Describe this" --image ./photo.png` for a single query.

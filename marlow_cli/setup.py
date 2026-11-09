@@ -321,7 +321,7 @@ def _print_setup_summary(config: dict, marlow_home):
     # Task planning (always available, in-memory)
     tool_status.append(("Task Planning (todo)", True, None))
 
-    # Skills (always available -- bundled skills + user-created skills)
+    # Skills (always available for user skills and the on-demand catalog)
     tool_status.append(("Skills (view, create, edit)", True, None))
 
     # Print status

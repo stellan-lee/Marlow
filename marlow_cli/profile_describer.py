@@ -106,7 +106,7 @@ def _collect_skills(profile_dir: Path) -> list[str]:
         return []
     names: list[str] = []
     for md in skills_dir.rglob("SKILL.md"):
-        if is_excluded_skill_path(md):
+        if is_excluded_skill_path(md, skills_dir=skills_dir):
             continue
         try:
             rel = md.relative_to(skills_dir)
@@ -195,10 +195,11 @@ def describe_profile(
 
     skill_names = _collect_skills(profile_dir)
     skill_list = "\n".join(f"  - {n}" for n in skill_names) or "  (no skills installed)"
+    skills_dir = profile_dir / "skills"
     skill_count = sum(
-        1 for _ in (profile_dir / "skills").rglob("SKILL.md")
-        if not is_excluded_skill_path(_)
-    ) if (profile_dir / "skills").is_dir() else 0
+        1 for path in skills_dir.rglob("SKILL.md")
+        if not is_excluded_skill_path(path, skills_dir=skills_dir)
+    )
 
     # Read model + provider from the profile's config.
     try:

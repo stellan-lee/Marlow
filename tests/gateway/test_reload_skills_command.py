@@ -14,6 +14,7 @@ Verifies:
 """
 
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -47,6 +48,7 @@ def _make_runner():
     )
     adapter = MagicMock()
     adapter.send = AsyncMock()
+    adapter.enrich_authorized_event = AsyncMock(side_effect=lambda event: event)
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._voice_mode = {}
     runner.hooks = SimpleNamespace(
@@ -71,6 +73,7 @@ def _make_runner():
     runner.session_store.rewrite_transcript = MagicMock()
     runner.session_store.update_session = MagicMock()
     runner._running_agents = {}
+    runner._running_agents_ts = {}
     runner._pending_messages = {}
     runner._pending_approvals = {}
     runner._session_db = None
@@ -196,5 +199,27 @@ async def test_underscored_alias_not_flagged_unknown(monkeypatch):
     )
 
     result = await runner._handle_message(_make_event("/reload_skills"))
-    if result is not None:
-        assert "Unknown command" not in result
+    assert result == "ok"
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_loads_a_named_on_demand_skill(monkeypatch, tmp_path):
+    from agent import skill_commands
+    from tools import skills_tool
+
+    monkeypatch.setenv("MARLOW_HOME", str(tmp_path))
+    monkeypatch.setenv(
+        "MARLOW_BUNDLED_SKILLS", str(Path(__file__).resolve().parents[2] / "skills")
+    )
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", tmp_path / "skills")
+    monkeypatch.setattr(skill_commands, "_skill_commands", {})
+    runner = _make_runner()
+    runner._handle_message_with_agent = AsyncMock(return_value=None)
+
+    await runner._handle_message(_make_event("/native_mcp Check my MCP servers"))
+
+    runner._handle_message_with_agent.assert_awaited_once()
+    forwarded = runner._handle_message_with_agent.await_args.args[0]
+    assert 'user has invoked the "native-mcp" skill' in forwarded.text
+    assert "Check my MCP servers" in forwarded.text
+    assert "/native-mcp" not in skill_commands.get_skill_commands()

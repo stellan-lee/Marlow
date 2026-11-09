@@ -349,79 +349,33 @@ class TestCmdUpdateMigrationPrompt:
             assert "display.new_widget" in out
 
 
-class TestCmdUpdateProfileSkillSync:
-    """cmd_update syncs bundled skills to all profiles, including the active one.
+@patch("shutil.which", return_value=None)
+@patch("subprocess.run")
+def test_update_leaves_profile_skills_untouched(
+    mock_run, _mock_which, mock_args, tmp_path, monkeypatch
+):
+    from pathlib import Path
 
-    Regression guard for #16176: previously the active profile was excluded
-    from the seed_profile_skills loop, leaving it on stale skill content.
-    """
+    mock_run.side_effect = _make_run_side_effect(
+        branch="main", verify_ok=True, commit_count="1"
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    default_home = tmp_path / ".marlow"
+    active_home = default_home / "profiles" / "work"
+    monkeypatch.setenv("MARLOW_HOME", str(active_home))
+    default_skills = default_home / "skills"
+    active_skills = active_home / "skills"
+    default_skills.mkdir(parents=True)
+    custom_skill = active_skills / "custom" / "SKILL.md"
+    custom_skill.parent.mkdir(parents=True)
+    content = "---\nname: custom\n---\nUser skill.\n"
+    custom_skill.write_text(content, encoding="utf-8")
 
-    @patch("shutil.which", return_value=None)
-    @patch("subprocess.run")
-    def test_active_profile_included_in_skill_sync(
-        self, mock_run, _mock_which, mock_args, capsys
-    ):
-        from pathlib import Path
+    cmd_update(mock_args)
 
-        mock_run.side_effect = _make_run_side_effect(
-            branch="main", verify_ok=True, commit_count="1"
-        )
-
-        default_p = SimpleNamespace(name="default", path=Path("/fake/.marlow"))
-        active_p = SimpleNamespace(name="bit", path=Path("/fake/.marlow/profiles/bit"))
-        other_p = SimpleNamespace(name="work", path=Path("/fake/.marlow/profiles/work"))
-        all_profiles = [default_p, active_p, other_p]
-
-        synced_paths = []
-
-        def fake_seed(path, quiet=False):
-            synced_paths.append(path)
-            return {"copied": [], "updated": [], "user_modified": []}
-
-        empty_sync = {"copied": [], "updated": [], "user_modified": [], "cleaned": []}
-
-        with (
-            patch("marlow_cli.profiles.list_profiles", return_value=all_profiles),
-            patch("marlow_cli.profiles.seed_profile_skills", side_effect=fake_seed),
-            patch("tools.skills_sync.sync_skills", return_value=empty_sync),
-        ):
-            cmd_update(mock_args)
-
-        assert active_p.path in synced_paths, (
-            f"Active profile 'bit' must be included in skill sync; got: {synced_paths}"
-        )
-        assert set(synced_paths) == {p.path for p in all_profiles}, (
-            f"All profiles must be synced; got: {synced_paths}"
-        )
-
-    @patch("shutil.which", return_value=None)
-    @patch("subprocess.run")
-    def test_single_profile_default_is_synced(
-        self, mock_run, _mock_which, mock_args, capsys
-    ):
-        from pathlib import Path
-
-        mock_run.side_effect = _make_run_side_effect(
-            branch="main", verify_ok=True, commit_count="1"
-        )
-
-        default_p = SimpleNamespace(name="default", path=Path("/fake/.marlow"))
-        synced_paths = []
-
-        def fake_seed(path, quiet=False):
-            synced_paths.append(path)
-            return {"copied": [], "updated": [], "user_modified": []}
-
-        empty_sync = {"copied": [], "updated": [], "user_modified": [], "cleaned": []}
-
-        with (
-            patch("marlow_cli.profiles.list_profiles", return_value=[default_p]),
-            patch("marlow_cli.profiles.seed_profile_skills", side_effect=fake_seed),
-            patch("tools.skills_sync.sync_skills", return_value=empty_sync),
-        ):
-            cmd_update(mock_args)
-
-        assert default_p.path in synced_paths
+    assert list(default_skills.iterdir()) == []
+    assert list(active_skills.iterdir()) == [custom_skill.parent]
+    assert custom_skill.read_text(encoding="utf-8") == content
 
 
 class TestCmdUpdateBranchFlag:

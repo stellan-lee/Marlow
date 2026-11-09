@@ -21,6 +21,9 @@ dist/
 # CI/CD
 .github
 
+# Developer-only skills
+.agents/skills/
+
 # Environment files
 .env
 

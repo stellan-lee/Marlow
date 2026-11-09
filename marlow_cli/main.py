@@ -297,14 +297,6 @@ from marlow_cli import __version__, __release_date__
 logger = logging.getLogger(__name__)
 
 
-def _sync_bundled_skills_for_startup() -> bool:
-    """Sync bundled skills, skipping unchanged files in the sync helper."""
-    from tools.skills_sync import sync_skills
-
-    sync_skills(quiet=True)
-    return True
-
-
 def _relative_time(ts) -> str:
     """Format a timestamp as relative time (e.g., '2h ago', 'yesterday')."""
     if not ts:
@@ -600,11 +592,6 @@ def cmd_chat(args):
 
 def cmd_gateway(args):
     """Gateway management commands."""
-    try:
-        _sync_bundled_skills_for_startup()
-    except Exception:
-        logger.debug("Bundled skill sync failed", exc_info=True)
-
     from marlow_cli.gateway import gateway_command
 
     gateway_command(args)
@@ -2966,8 +2953,8 @@ def _restore_stashed_changes(
         print("Working tree reset to clean state.")
         print(f"Restore your changes later with: git stash apply {stash_ref}")
         # Don't sys.exit — the code update itself succeeded, only the stash
-        # restore had conflicts.  Let cmd_update continue with pip install,
-        # skill sync, and gateway restart.
+        # restore had conflicts. Let cmd_update continue with pip install
+        # and gateway restart.
         return False
 
     stash_selector = _resolve_stash_selector(git_cmd, cwd, stash_ref)
@@ -4085,7 +4072,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         # After git pull, source files on disk are newer than cached Python
         # modules in this process.  Reload marlow_constants so that any lazy
-        # import executed below (skills sync, gateway restart) sees new
+        # import executed below (gateway restart) sees new
         # attributes like display_marlow_home() added since the last release.
         try:
             import importlib
@@ -4094,68 +4081,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
             importlib.reload(_hc)
         except Exception:
             pass  # non-fatal — worst case a lazy import fails gracefully
-
-        # Sync bundled skills (copies new, updates changed, respects user deletions)
-        try:
-            from tools.skills_sync import sync_skills
-
-            print()
-            print("→ Syncing bundled skills...")
-            result = sync_skills(quiet=True)
-            if result["copied"]:
-                print(f"  + {len(result['copied'])} new: {', '.join(result['copied'])}")
-            if result.get("updated"):
-                print(
-                    f"  ↑ {len(result['updated'])} updated: {', '.join(result['updated'])}"
-                )
-            if result.get("user_modified"):
-                print(f"  ~ {len(result['user_modified'])} user-modified (kept)")
-            if result.get("cleaned"):
-                print(f"  − {len(result['cleaned'])} removed from manifest")
-            if not result["copied"] and not result.get("updated"):
-                print("  ✓ Skills are up to date")
-        except Exception as e:
-            logger.debug("Skills sync during update failed: %s", e)
-
-        # Sync bundled skills to all profiles (including the active one).
-        # seed_profile_skills() uses subprocess with an explicit MARLOW_HOME so
-        # it is not affected by sync_skills()'s module-level MARLOW_HOME cache,
-        # which means the active profile is reliably synced regardless of whether
-        # the caller's MARLOW_HOME env var points at the default or a named profile.
-        try:
-            from marlow_cli.profiles import (
-                list_profiles,
-                seed_profile_skills,
-            )
-
-            all_profiles = list_profiles()
-            if all_profiles:
-                print()
-                print("→ Syncing bundled skills to all profiles...")
-                for p in all_profiles:
-                    try:
-                        r = seed_profile_skills(p.path, quiet=True)
-                        if r and r.get("skipped_opt_out"):
-                            status = "opted out (--no-skills)"
-                        elif r:
-                            copied = len(r.get("copied", []))
-                            updated = len(r.get("updated", []))
-                            modified = len(r.get("user_modified", []))
-                            parts = []
-                            if copied:
-                                parts.append(f"+{copied} new")
-                            if updated:
-                                parts.append(f"↑{updated} updated")
-                            if modified:
-                                parts.append(f"~{modified} user-modified")
-                            status = ", ".join(parts) if parts else "up to date"
-                        else:
-                            status = "sync failed"
-                        print(f"  {p.name}: {status}")
-                    except Exception as pe:
-                        print(f"  {p.name}: error ({pe})")
-        except Exception:
-            pass  # profiles module not available or no profiles
 
         # Sync Honcho host blocks to all profiles
         try:
@@ -4953,7 +4878,6 @@ def cmd_profile(args):
         list_profiles,
         create_profile,
         delete_profile,
-        seed_profile_skills,
         set_active_profile,
         get_active_profile_name,
         check_alias_collision,
@@ -5083,25 +5007,8 @@ def cmd_profile(args):
                 except Exception:
                     pass  # Honcho plugin not installed or not configured
 
-            # Seed bundled skills (skip if --clone-all already copied them, or
-            # if --no-skills was passed — in which case seed_profile_skills()
-            # honors the marker file and returns skipped_opt_out=True).
-            if not clone_all:
-                result = seed_profile_skills(profile_dir)
-                if result and result.get("skipped_opt_out"):
-                    print(
-                        "No bundled skills seeded (--no-skills). "
-                        "Delete .no-bundled-skills in the profile to opt back in."
-                    )
-                elif result:
-                    copied = len(result.get("copied", []))
-                    print(f"{copied} bundled skills synced.")
-                else:
-                    print(
-                        "⚠ Skills could not be seeded. Run `{} update` to retry.".format(
-                            name
-                        )
-                    )
+            if no_skills:
+                print("Bundled on-demand skills disabled (--no-skills).")
 
             # Create wrapper alias
             if not no_alias:
@@ -7635,7 +7542,7 @@ Examples:
     profile_create.add_argument(
         "--no-skills",
         action="store_true",
-        help="Create an empty profile with no bundled skills (opts out of `marlow update` skill sync)",
+        help="Opt out of bundled on-demand skills for this profile",
     )
     profile_create.add_argument(
         "--description",

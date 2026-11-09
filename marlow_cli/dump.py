@@ -92,7 +92,7 @@ def _count_skills(marlow_home: Path) -> int:
         return 0
     count = 0
     for item in skills_dir.rglob("SKILL.md"):
-        if is_excluded_skill_path(item):
+        if is_excluded_skill_path(item, skills_dir=skills_dir):
             continue
         count += 1
     return count

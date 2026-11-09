@@ -164,9 +164,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --no-venv      Don't create virtual environment"
             echo "  --skip-setup   Skip interactive setup wizard"
             echo "  --skip-browser Skip Playwright/Chromium install (browser tools won't work)"
-            echo "  --no-skills    Start with a blank slate — seed no bundled skills, and"
-            echo "                   write \$MARLOW_HOME/.no-bundled-skills so future"
-            echo "                   'marlow update' runs never inject bundled skills either"
+            echo "  --no-skills    Opt out of bundled on-demand skills for this profile"
             echo "  --branch NAME  Git branch to install (default: main)"
             echo "  --commit SHA   Pin checkout to a specific commit after clone/update"
             echo "  --manifest     Print desktop bootstrap stage manifest as JSON"
@@ -259,7 +257,7 @@ restore_dirty_lockfiles() {
 }
 
 emit_manifest() {
-    printf '%s' '{"protocol_version":1,"stages":[{"name":"prerequisites","title":"System prerequisites","category":"runtime","needs_user_input":false},{"name":"repository","title":"Download Marlow Agent","category":"runtime","needs_user_input":false},{"name":"venv","title":"Create Python virtual environment","category":"runtime","needs_user_input":false},{"name":"python-deps","title":"Install Python dependencies","category":"runtime","needs_user_input":false},{"name":"node-deps","title":"Install browser-tool dependencies","category":"runtime","needs_user_input":false},{"name":"path","title":"Install marlow command","category":"runtime","needs_user_input":false},{"name":"config","title":"Prepare config and skills","category":"configuration","needs_user_input":false},{"name":"setup","title":"Configure API keys and settings","category":"configuration","needs_user_input":true},{"name":"gateway","title":"Configure gateway service","category":"configuration","needs_user_input":true},{"name":"complete","title":"Finish install","category":"runtime","needs_user_input":false}]}'
+    printf '%s' '{"protocol_version":1,"stages":[{"name":"prerequisites","title":"System prerequisites","category":"runtime","needs_user_input":false},{"name":"repository","title":"Download Marlow Agent","category":"runtime","needs_user_input":false},{"name":"venv","title":"Create Python virtual environment","category":"runtime","needs_user_input":false},{"name":"python-deps","title":"Install Python dependencies","category":"runtime","needs_user_input":false},{"name":"node-deps","title":"Install browser-tool dependencies","category":"runtime","needs_user_input":false},{"name":"path","title":"Install marlow command","category":"runtime","needs_user_input":false},{"name":"config","title":"Prepare profile configuration","category":"configuration","needs_user_input":false},{"name":"setup","title":"Configure API keys and settings","category":"configuration","needs_user_input":true},{"name":"gateway","title":"Configure gateway service","category":"configuration","needs_user_input":true},{"name":"complete","title":"Finish install","category":"runtime","needs_user_input":false}]}'
     printf '\n'
 }
 
@@ -1517,28 +1515,12 @@ SOUL_EOF
 
     log_success "Configuration directory ready: ~/.marlow/"
 
-    # Seed bundled skills into ~/.marlow/skills/ (manifest-based, one-time per skill)
     if [ "$NO_SKILLS" = true ]; then
-        # Blank-slate install: write the opt-out marker and skip seeding.
-        # skills_sync.py and `marlow update` both honor this marker, so the
-        # default profile stays empty across future updates too.
         printf '%s\n' \
-            "This profile opted out of bundled-skill seeding (installed with --no-skills)." \
-            "Delete this file to re-enable sync on the next 'marlow update'." \
-            > "$MARLOW_HOME/.no-bundled-skills" 2>/dev/null || true
-        log_info "Skipping bundled skills (--no-skills). Wrote $MARLOW_HOME/.no-bundled-skills"
-        log_info "  Future 'marlow update' runs will not inject bundled skills. Delete the marker to opt back in."
-    else
-        log_info "Syncing bundled skills to ~/.marlow/skills/ ..."
-        if "$INSTALL_DIR/venv/bin/python" "$INSTALL_DIR/tools/skills_sync.py" 2>/dev/null; then
-            log_success "Skills synced to ~/.marlow/skills/"
-        else
-            # Fallback: simple directory copy if Python sync fails
-            if [ -d "$INSTALL_DIR/skills" ] && [ ! "$(ls -A "$MARLOW_HOME/skills/" 2>/dev/null | grep -v '.bundled_manifest')" ]; then
-                cp -r "$INSTALL_DIR/skills/"* "$MARLOW_HOME/skills/" 2>/dev/null || true
-                log_success "Skills copied to ~/.marlow/skills/"
-            fi
-        fi
+            "This profile opted out of bundled on-demand skills (installed with --no-skills)." \
+            "Delete this file to make bundled on-demand skills available." \
+            > "$MARLOW_HOME/.no-bundled-skills" || return 1
+        log_info "Bundled on-demand skills disabled (--no-skills)."
     fi
 }
 

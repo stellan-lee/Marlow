@@ -125,30 +125,6 @@ def _read_bundled_manifest_names() -> Set[str]:
     return names
 
 
-def _suppressed_file() -> Path:
-    return _skills_dir() / ".curator_suppressed"
-
-
-def read_suppressed_names() -> Set[str]:
-    """Legacy archived built-in skills that the re-seeder leaves archived.
-
-    The file contains one skill name per line. It still prevents an update
-    from copying previously archived built-in skills back into the active set.
-    """
-    path = _suppressed_file()
-    if not path.exists():
-        return set()
-    names: Set[str] = set()
-    try:
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line and not line.startswith("#"):
-                names.add(line)
-    except OSError as e:
-        logger.debug("Failed to read curator suppression list: %s", e)
-    return names
-
-
 def _read_skill_name(skill_md: Path, fallback: str) -> str:
     """Parse the `name:` field from a SKILL.md YAML frontmatter."""
     try:

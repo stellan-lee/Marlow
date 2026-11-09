@@ -207,13 +207,24 @@ def get_bundled_skills_dir(default: Path | None = None) -> Path:
 
     Resolution order:
         1. ``MARLOW_BUNDLED_SKILLS`` env var (Nix wrapper / explicit override)
-        2. Wheel-installed ``<sysconfig data>/skills`` (pip install path)
+        2. Wheel-installed ``<sysconfig data>/skills`` (user or default scheme)
         3. Caller-supplied ``default`` (typically the source-checkout path)
         4. ``<MARLOW_HOME>/skills`` last-resort
     """
     override = os.getenv("MARLOW_BUNDLED_SKILLS", "").strip()
     if override:
         return Path(override)
+
+    user_scheme = sysconfig.get_preferred_scheme("user")
+    module_path = Path(__file__).resolve()
+    for key in ("purelib", "platlib"):
+        user_lib = Path(sysconfig.get_path(key, scheme=user_scheme))
+        if module_path.is_relative_to(user_lib.resolve()):
+            user_data = Path(sysconfig.get_path("data", scheme=user_scheme)) / "skills"
+            if user_data.is_dir():
+                return user_data
+            break
+
     packaged = _get_packaged_data_dir("skills")
     if packaged is not None:
         return packaged
