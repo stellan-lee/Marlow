@@ -134,8 +134,14 @@ class CodexEnvironment:
         if config_path.is_symlink():
             raise CodexConfigurationError("Codex config must not be a symlink")
         if not config_path.exists():
-            fd = os.open(config_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            os.close(fd)
+            try:
+                fd = os.open(config_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            except FileExistsError:
+                # Another process may have initialized this profile first.
+                if config_path.is_symlink():
+                    raise CodexConfigurationError("Codex config must not be a symlink")
+            else:
+                os.close(fd)
         try:
             config = tomllib.loads(config_path.read_text(encoding="utf-8"))
         except tomllib.TOMLDecodeError as exc:

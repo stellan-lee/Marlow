@@ -134,6 +134,44 @@ def test_profiles_do_not_share_homes_or_threads(tmp_path):
     assert not (a.codex_home / "auth.json").exists()
 
 
+def test_concurrent_profile_config_creation_preserves_winning_file(tmp_path, monkeypatch):
+    profile = tmp_path / "profile"
+    config_path = profile / "runtime/codex/config.toml"
+    contents = 'model = "gpt-5.4"\n'
+    open_file = os.open
+
+    def create_config_first(path, flags, *args, **kwargs):
+        if path == config_path and flags & os.O_CREAT:
+            config_path.write_text(contents, encoding="utf-8")
+        return open_file(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", create_config_first)
+    environment = CodexEnvironment.build(profile, parent={})
+
+    assert environment.config == {"model": "gpt-5.4"}
+    assert config_path.read_text(encoding="utf-8") == contents
+
+
+def test_concurrent_profile_config_symlink_is_rejected(tmp_path, monkeypatch):
+    profile = tmp_path / "profile"
+    config_path = profile / "runtime/codex/config.toml"
+    personal_config = tmp_path / "personal.toml"
+    contents = 'model = "gpt-5.4"\n'
+    personal_config.write_text(contents, encoding="utf-8")
+    open_file = os.open
+
+    def link_config_first(path, flags, *args, **kwargs):
+        if path == config_path and flags & os.O_CREAT:
+            config_path.symlink_to(personal_config)
+        return open_file(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", link_config_first)
+    with pytest.raises(CodexConfigurationError, match="must not be a symlink"):
+        CodexEnvironment.build(profile, parent={})
+
+    assert personal_config.read_text(encoding="utf-8") == contents
+
+
 def test_environment_allowlist_and_provider_credentials_stay_out_of_shell(tmp_path):
     e = CodexEnvironment.build(
         tmp_path / "p",
