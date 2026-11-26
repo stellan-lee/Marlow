@@ -55,7 +55,6 @@ dev = ["debugpy==1.8.20", "pytest==9.0.2", "pytest-asyncio==1.3.0", "pytest-time
 messaging = ["python-telegram-bot[webhooks]==22.6", "discord.py==2.7.1", "aiohttp==3.13.3", "brotlicffi==1.2.0.1", "slack-bolt==1.27.0", "slack-sdk==3.40.1", "qrcode==7.4.2"]
 slack = ["slack-bolt==1.27.0", "slack-sdk==3.40.1", "aiohttp==3.13.3"]
 teams = ["microsoft-teams-apps==2.0.16", "msal==1.38.0"]
-honcho = ["honcho-ai==2.0.1"]
 # CVE-2026-48710 (BadHost): Starlette is pulled transitively by mcp's
 # sse-starlette / HTTP-SSE stack. Before
 # 1.0.1, a malformed Host header makes `request.url.path` desync from the path
@@ -71,11 +70,11 @@ all = [
   # session can use, things needed before the agent loop is alive
   # (terminal/CLI), and skill deps that packagers (AUR, Homebrew)
   # need in the wheel. Anything an opt-in backend (provider, search,
-  # memory, messaging platform, terminal sandbox) needs
+  # messaging platform, terminal sandbox) needs
   # MUST live exclusively in `LAZY_DEPS` and resolve at first use —
   # otherwise one quarantined PyPI release breaks every fresh install.
   #
-  # Optional messaging and memory backends install lazily.
+  # Optional messaging backends install lazily.
   "marlow-agent[dev]",
   "marlow-agent[mcp]",
 ]
@@ -88,6 +87,7 @@ marlow-agent = "run_agent:main"
 py-modules = ["run_agent", "model_tools", "toolsets", "batch_runner", "toolset_distributions", "marlow_constants", "marlow_state", "marlow_time", "marlow_logging", "utils", "mcp_serve", "mcp_oauth"]
 
 [tool.setuptools.package-data]
+agent = ["runtime_instructions/AGENTS.md"]
 marlow_cli = ["scripts/install.sh", "data/*.json"]
 gateway = ["assets/**/*"]
 plugins = [

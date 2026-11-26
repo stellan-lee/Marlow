@@ -3,7 +3,7 @@
 Ported from cline/cline#10343 (src/standalone/memory-monitor.ts).
 
 The gateway is a long-lived process that accumulates memory as it caches
-agent instances, session transcripts, tool schemas, memory providers, MCP
+agent instances, session transcripts, tool schemas, MCP
 connections, etc.  A slow leak in any of those subsystems is invisible
 in a single log line — you only see it by watching RSS climb over hours.
 

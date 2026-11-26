@@ -31,6 +31,9 @@ class RuntimeState:
         with self.connect() as db:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS session_scopes (session TEXT PRIMARY KEY, scope TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS session_memory_access (
+                    session TEXT PRIMARY KEY, access TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS threads (
                     scope TEXT PRIMARY KEY, thread_id TEXT, turn_id TEXT,
                     status TEXT NOT NULL DEFAULT 'idle', updated REAL NOT NULL);
@@ -72,10 +75,10 @@ class RuntimeState:
             finally:
                 fcntl.flock(stream, fcntl.LOCK_UN)
 
-    def claim_scope(self):
+    def claim_scope(self, *, memory_access=None) -> bool:
         session = json.loads(self.scope).get("session")
         if not session:
-            return
+            return False
         with self.connect() as db:
             if json.loads(self.scope).get("ephemeral_turn"):
                 pending = db.execute(
@@ -118,6 +121,28 @@ class RuntimeState:
                 raise PermissionError(
                     "Session belongs to a different user, channel, conversation or project"
                 )
+
+            # Resumed Threads may contain earlier file-tool results. Access
+            # changes must start a new session before reading any old context.
+            access = json.dumps(memory_access)
+            newly_bound = db.execute(
+                "INSERT OR IGNORE INTO session_memory_access(session,access) VALUES(?,?)",
+                (session, access),
+            ).rowcount
+            (previous_access,) = db.execute(
+                "SELECT access FROM session_memory_access WHERE session=?", (session,)
+            ).fetchone()
+            if previous_access != access:
+                raise PermissionError("Session memory access changed; start a new session")
+            if newly_bound:
+                # Legacy Threads can contain context injected under the old
+                # Memory system. Keep prior runs and raw history for audit.
+                db.execute(
+                    "UPDATE threads SET thread_id=NULL,turn_id=NULL "
+                    "WHERE scope=? AND status NOT IN ('running','needs_verification')",
+                    (self.scope,),
+                )
+            return bool(newly_bound)
 
     def mapping(self):
         with self.connect() as db:

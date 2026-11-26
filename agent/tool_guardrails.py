@@ -45,7 +45,6 @@ MUTATING_TOOL_NAMES = frozenset(
         "write_file",
         "patch",
         "todo",
-        "memory",
         "skill_manage",
         "browser_click",
         "browser_type",
@@ -207,12 +206,6 @@ def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str
             if exit_code is not None and exit_code != 0:
                 return True, f" [exit {exit_code}]"
         return False, ""
-
-    if tool_name == "memory":
-        data = safe_json_loads(result)
-        if isinstance(data, dict):
-            if data.get("success") is False and "exceed the limit" in data.get("error", ""):
-                return True, " [full]"
 
     lower = result[:500].lower()
     if '"error"' in lower or '"failed"' in lower or result.startswith("Error"):

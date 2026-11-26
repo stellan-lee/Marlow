@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
-# The skills index is wrapped in this tag pair inside the stable tier.
 _SKILLS_BLOCK_RE = re.compile(r"<available_skills>.*?</available_skills>", re.DOTALL)
 
 
@@ -17,26 +16,11 @@ def _bytes(s: str) -> int:
 def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
     """Offline Marlow context sizes. Codex's own prompt is not measurable here."""
     from agent.codex_environment import managed_environment
-    from marlow_cli.config import load_config
-    from tools.memory_tool import MemoryStore
+    from agent.memory_workspace import LOCAL_OWNER, memory_instructions
     from model_tools import get_tool_definitions
     from agent.codex_bridge import BUSINESS_TOOLS
 
     e = managed_environment()
-    cfg = load_config()
-    memory_cfg = cfg.get("memory") or {}
-    store = MemoryStore()
-    store.load_from_disk()
-    memory = (
-        store.format_for_system_prompt("memory") or ""
-        if memory_cfg.get("memory_enabled", True)
-        else ""
-    )
-    user = (
-        store.format_for_system_prompt("user") or ""
-        if memory_cfg.get("user_profile_enabled", True)
-        else ""
-    )
     soul = e.profile / "SOUL.md"
     identity = (
         soul.read_text(encoding="utf-8")[:16000]
@@ -50,22 +34,26 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
         )
         if tool.get("function", {}).get("name") in BUSINESS_TOOLS
     ]
-    context = identity + memory + user
+    instructions = ""
+    if platform in {"cli", "sdk"}:
+        instructions = memory_instructions(
+            e.profile / "memory-workspaces" / LOCAL_OWNER / "memory", writable=True
+        )
+    context = identity + instructions
     measure = lambda text: {"chars": len(text), "bytes": _bytes(text)}
     return {
         "platform": platform,
         "model": e.config.get("model", ""),
         "system_prompt": measure(context),
         "skills_index": measure(""),
-        "memory": measure(memory),
-        "user_profile": measure(user),
+        "instructions": measure(instructions),
         "tools": {
             "count": len(tools),
             "json_bytes": _bytes(json.dumps(tools, ensure_ascii=False)),
         },
         "sections": [
             ("Marlow identity", len(identity), _bytes(identity)),
-            ("Marlow memory/profile", len(memory + user), _bytes(memory + user)),
+            ("Trusted memory instructions", len(instructions), _bytes(instructions)),
         ],
         "codex_prompt": "unknown; Codex owns its prompt and dynamic context",
     }
@@ -90,16 +78,8 @@ def render_breakdown(data: Dict[str, Any]) -> str:
     lines.append("")
     lines.append("  Major blocks:")
     si = data["skills_index"]
-    mem = data["memory"]
-    up = data["user_profile"]
     lines.append(
         f"    skills index       : {si['bytes']:>8,} B  ({_fmt_kb(si['bytes'])})"
-    )
-    lines.append(
-        f"    memory             : {mem['bytes']:>8,} B  ({_fmt_kb(mem['bytes'])})"
-    )
-    lines.append(
-        f"    user profile       : {up['bytes']:>8,} B  ({_fmt_kb(up['bytes'])})"
     )
     lines.append("")
     lines.append("  Prompt tiers:")

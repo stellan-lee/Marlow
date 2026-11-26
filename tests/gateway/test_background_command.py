@@ -252,7 +252,6 @@ class TestRunBackgroundTask:
         with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}), \
              patch("run_agent.AIAgent") as MockAgent:
             mock_agent_instance = MagicMock()
-            mock_agent_instance.shutdown_memory_provider = MagicMock()
             mock_agent_instance.close = MagicMock()
             mock_agent_instance.run_conversation.return_value = mock_result
             MockAgent.return_value = mock_agent_instance
@@ -420,7 +419,6 @@ class TestRunBackgroundTask:
         with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}), \
              patch("run_agent.AIAgent") as MockAgent:
             mock_agent_instance = MagicMock()
-            mock_agent_instance.shutdown_memory_provider = MagicMock()
             mock_agent_instance.close = MagicMock()
             mock_agent_instance.run_conversation.side_effect = RuntimeError("boom")
             MockAgent.return_value = mock_agent_instance

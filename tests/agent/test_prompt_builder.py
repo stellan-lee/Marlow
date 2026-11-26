@@ -22,36 +22,8 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
-    MEMORY_GUIDANCE,
-    SESSION_SEARCH_GUIDANCE,
     PLATFORM_HINTS,
 )
-
-
-# =========================================================================
-# Guidance constants
-# =========================================================================
-
-
-class TestGuidanceConstants:
-    def test_memory_guidance_discourages_task_logs(self):
-        assert "durable facts" in MEMORY_GUIDANCE
-        assert "Do NOT save task progress" in MEMORY_GUIDANCE
-        assert "session_search" in MEMORY_GUIDANCE
-        assert "like a diary" not in MEMORY_GUIDANCE
-        assert ">80%" not in MEMORY_GUIDANCE
-
-    def test_session_search_guidance_is_simple_cross_session_recall(self):
-        assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
-        assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
-
-    def test_session_search_guidance_is_framed_as_lower_priority(self):
-        # session_search must be ranked below the current request, long-term
-        # memory, and the user profile — it is supporting evidence, not primary.
-        text = SESSION_SEARCH_GUIDANCE.lower()
-        assert "lower-priority" in text
-        assert "defer to" in text
-        assert "memory" in text and "profile" in text
 
 
 # =========================================================================

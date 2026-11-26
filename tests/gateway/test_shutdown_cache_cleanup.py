@@ -1,13 +1,4 @@
-"""Regression tests for gateway shutdown cleaning up cached agent memory providers (issue #11205).
-
-When the gateway shuts down, ``stop()`` called ``_finalize_shutdown_agents()``
-which only drained agents in ``_running_agents``.  Idle agents sitting in
-``_agent_cache`` (LRU cache) were never cleaned up, so their
-``MemoryProvider.on_session_end()`` hooks never fired.
-
-The fix adds an explicit sweep of ``_agent_cache`` after
-``_finalize_shutdown_agents`` in the ``_stop_impl`` coroutine.
-"""
+"""Gateway shutdown closes resources held by idle cached agents."""
 
 import asyncio
 import threading
@@ -67,19 +58,7 @@ class _FakeGateway:
         for agent in agents.values():
             self._cleanup_agent_resources(agent)
 
-    def _cleanup_agent_resources(self, agent):
-        if agent is None:
-            return
-        try:
-            if hasattr(agent, "shutdown_memory_provider"):
-                agent.shutdown_memory_provider()
-        except Exception:
-            pass
-        try:
-            if hasattr(agent, "close"):
-                agent.close()
-        except Exception:
-            pass
+    _cleanup_agent_resources = gw_mod.GatewayRunner._cleanup_agent_resources
 
     def _evict_cached_agent(self, key):
         pass
@@ -87,7 +66,6 @@ class _FakeGateway:
 
 def _make_mock_agent():
     a = MagicMock()
-    a.shutdown_memory_provider = MagicMock()
     a.close = MagicMock()
     return a
 
@@ -97,13 +75,11 @@ def _make_mock_agent():
 # ---------------------------------------------------------------------------
 
 class TestCachedAgentCleanupOnShutdown:
-    """Verify that ``stop()`` calls ``_cleanup_agent_resources`` on idle
-    cached agents, triggering ``shutdown_memory_provider()`` (which calls
-    ``on_session_end``)."""
+    """Gateway shutdown closes idle cached agents."""
 
     @pytest.mark.asyncio
-    async def test_cached_agent_memory_provider_shut_down(self):
-        """A cached agent's shutdown_memory_provider is called during gateway stop."""
+    async def test_cached_agent_closed(self):
+        """A cached agent's close is called during gateway stop."""
         gw = _FakeGateway()
         agent = _make_mock_agent()
         gw._agent_cache["session-1"] = (agent, "sig-123")
@@ -111,7 +87,7 @@ class TestCachedAgentCleanupOnShutdown:
         # Call the real stop() from GatewayRunner
         await gw_mod.GatewayRunner.stop(gw)
 
-        agent.shutdown_memory_provider.assert_called_once()
+        agent.close.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_cache_cleared_after_shutdown(self):
@@ -146,7 +122,7 @@ class TestCachedAgentCleanupOnShutdown:
         await gw_mod.GatewayRunner.stop(gw)
 
         for a in agents:
-            a.shutdown_memory_provider.assert_called_once()
+            a.close.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_cleanup_survives_agent_exception(self):
@@ -154,7 +130,6 @@ class TestCachedAgentCleanupOnShutdown:
         gw = _FakeGateway()
 
         bad = _make_mock_agent()
-        bad.shutdown_memory_provider.side_effect = RuntimeError("boom")
         bad.close.side_effect = RuntimeError("boom")
 
         good = _make_mock_agent()
@@ -165,7 +140,7 @@ class TestCachedAgentCleanupOnShutdown:
         await gw_mod.GatewayRunner.stop(gw)
 
         # The good agent should still be cleaned up
-        good.shutdown_memory_provider.assert_called_once()
+        good.close.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_plain_agent_not_tuple(self):
@@ -176,7 +151,7 @@ class TestCachedAgentCleanupOnShutdown:
 
         await gw_mod.GatewayRunner.stop(gw)
 
-        agent.shutdown_memory_provider.assert_called_once()
+        agent.close.assert_called_once()
         assert len(gw._agent_cache) == 0
 
     @pytest.mark.asyncio
@@ -196,7 +171,7 @@ class TestRunningAgentsNotDoubleCleaned:
     @pytest.mark.asyncio
     async def test_running_and_cached_agent_cleaned_at_least_once(self):
         """An agent in both _running_agents and _agent_cache gets
-        shutdown_memory_provider called at least once."""
+        close called at least once."""
         gw = _FakeGateway()
         shared = _make_mock_agent()
 
@@ -207,4 +182,4 @@ class TestRunningAgentsNotDoubleCleaned:
 
         # Called at least once — either from _finalize_shutdown_agents
         # or from the cache sweep (or both)
-        assert shared.shutdown_memory_provider.call_count >= 1
+        assert shared.close.call_count >= 1

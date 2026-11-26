@@ -2,7 +2,7 @@
 
 Converts Codex `item/*` notifications into the standard
 OpenAI-shaped `{role, content, tool_calls, tool_call_id}` entries used in
-session history and background memory review.
+session history.
 
 Codex emits items with a discriminator field `type`:
   - userMessage         → {role: "user", content}
@@ -107,7 +107,7 @@ class CodexEventProjector:
             return self._project_user_message(item)
 
         # Unknown / rare items (plan, hookPrompt, collabAgentToolCall, etc.)
-        # — record as opaque assistant note so memory review can still see
+        # — record as opaque assistant note so session history can still preserve
         # *something* happened, but don't fabricate tool_call structure.
         return self._project_opaque(item, item_type)
 

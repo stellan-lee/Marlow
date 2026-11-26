@@ -150,7 +150,7 @@ class TestChildSystemPrompt(unittest.TestCase):
 
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):
-        result = _strip_blocked_tools(["terminal", "file", "delegation", "clarify", "memory", "code_execution"])
+        result = _strip_blocked_tools(["terminal", "file", "delegation", "clarify", "code_execution"])
         self.assertEqual(sorted(result), ["file", "terminal"])
 
     def test_preserves_allowed_toolsets(self):
@@ -815,7 +815,7 @@ class TestSubagentCostRollup(unittest.TestCase):
 
 class TestBlockedTools(unittest.TestCase):
     def test_blocked_tools_constant(self):
-        for tool in ["delegate_task", "clarify", "memory", "send_message", "execute_code"]:
+        for tool in ["delegate_task", "clarify", "send_message", "execute_code"]:
             self.assertIn(tool, DELEGATE_BLOCKED_TOOLS)
 
     def test_constants(self):

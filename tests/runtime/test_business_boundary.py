@@ -48,54 +48,6 @@ def test_stop_during_startup_dispatches_no_model_turn(profile, monkeypatch):
     agent.close()
 
 
-@pytest.mark.parametrize("local", [True, False])
-def test_memory_recall_egress_and_raw_history(profile, local):
-    from run_agent import AIAgent
-    from agent.memory_manager import MemoryManager
-    from agent.memory_provider import MemoryProvider
-
-    class Provider(MemoryProvider):
-        name = "fixture"
-
-        def is_available(self):
-            return True
-
-        def initialize(self, session_id, **kwargs):
-            pass
-
-        def get_tool_schemas(self):
-            return []
-
-        def prefetch(self, query, session_id="", **kwargs):
-            return "RECALL_PRIVATE_MARKER"
-
-    endpoint = "http://127.0.0.1:9999" if local else "https://provider.invalid/v1"
-    config = profile / "runtime/codex/config.toml"
-    config.parent.mkdir(parents=True, exist_ok=True)
-    config.write_text(
-        'model_provider="fixture"\n[model_providers.fixture]\nname="Fixture"\nwire_api="responses"\nbase_url="'
-        + endpoint
-        + '"\nrequires_openai_auth=false\n'
-    )
-    agent = AIAgent(
-        enabled_toolsets=[], skip_memory=False, automatic_memory_ingestion_enabled=False
-    )
-    manager = MemoryManager()
-    manager.add_provider(Provider())
-    agent._memory_manager = manager
-    agent._memory_sync_enabled = False
-    result = agent.run_conversation("authorized recall query")
-    assert result["completed"], result
-    dispatched = next(
-        event for event in events(profile) if event["method"] == "turn/start"
-    )
-    assert ("RECALL_PRIVATE_MARKER" in json.dumps(dispatched["params"])) is local
-    assert "RECALL_PRIVATE_MARKER" not in json.dumps(
-        agent._session_db.get_messages(agent.session_id)
-    )
-    agent.close()
-
-
 def test_profile_directory_plugins_load_and_keep_relative_imports_separate(tmp_path):
     from marlow_constants import set_marlow_home_override, reset_marlow_home_override
     from run_agent import AIAgent
@@ -236,3 +188,80 @@ async def test_telegram_static_sticker_is_native_input_without_auxiliary_inferen
     assert Path(event.media_urls[0]).read_bytes().startswith(b"RIFF")
     assert "Inspect" in event.text
     assert not (profile / "runtime/codex/fixture-events.jsonl").exists()
+
+
+def test_memory_access_change_cannot_resume_thread_or_history(profile):
+    from agent.memory_workspace import gateway_memory_principal
+    from run_agent import AIAgent
+
+    routing = dict(
+        platform="telegram",
+        user_id="alice",
+        chat_id="private-chat",
+        session_id="stable",
+        enabled_toolsets=[],
+    )
+    owner = AIAgent(
+        **routing,
+        chat_type="dm",
+        memory_principal=gateway_memory_principal("telegram", "alice"),
+    )
+    try:
+        assert owner.environment.memory is not None
+        assert owner.run_conversation("private input")["completed"]
+    finally:
+        owner.close()
+
+    denied = AIAgent(**routing, chat_type="group")
+    try:
+        assert denied.environment.memory is None
+        result = denied.run_conversation("public input")
+        assert not result["completed"]
+        assert "Session memory access changed" in result["error"]
+        assert denied._session_messages == []
+    finally:
+        denied.close()
+    assert sum(event["method"] == "turn/start" for event in events(profile)) == 1
+
+
+def test_legacy_memory_access_restrictions_are_preserved(profile):
+    from agent.codex_execution import allowed_path
+    from run_agent import AIAgent
+
+    read_only = AIAgent(enabled_toolsets=[], memory_write_mode="read-only")
+    try:
+        note = read_only.environment.memory / "note.md"
+        assert allowed_path(read_only, str(note)) == note
+        with pytest.raises(PermissionError):
+            allowed_path(read_only, str(note), write=True)
+        filesystem = read_only.environment.overrides()["permissions"]["marlow"]["filesystem"]
+        assert filesystem[str(note.parent)] == "read"
+    finally:
+        read_only.close()
+
+    with (profile / "config.yaml").open("a") as config:
+        config.write("memory:\n  memory_enabled: false\n  user_profile_enabled: false\n")
+    disabled = AIAgent(enabled_toolsets=[])
+    try:
+        assert disabled.environment.memory is None
+    finally:
+        disabled.close()
+
+
+def test_upgrade_opens_clean_native_thread_and_preserves_session_history(profile):
+    agent = new_agent(session_id="legacy")
+    try:
+        db = agent._get_session_db_for_recall()
+        db.create_session("legacy", "sdk")
+        db.append_message("legacy", "user", "Earlier visible message")
+        agent.state.thread("legacy-native-thread")
+        assert agent.run_conversation("Continue")["completed"]
+        assert any(
+            row.get("content") == "Earlier visible message"
+            for row in db.get_messages("legacy")
+        )
+    finally:
+        agent.close()
+    recorded = events(profile)
+    assert any(event["method"] == "thread/start" for event in recorded)
+    assert not any(event["method"] == "thread/resume" for event in recorded)

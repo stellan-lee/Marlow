@@ -164,7 +164,7 @@ def build_top_level_parser():
         "--ignore-rules",
         action="store_true",
         default=False,
-        help="Skip auto-injection of AGENTS.md, .cursorrules, and memory",
+        help="Skip optional context rules and persistent memory access",
     )
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
@@ -285,7 +285,7 @@ def build_top_level_parser():
         "--ignore-rules",
         action="store_true",
         default=argparse.SUPPRESS,
-        help="Skip auto-injection of AGENTS.md, .cursorrules, and memory. Combine with --ignore-user-config for a fully isolated run.",
+        help="Skip optional context rules and persistent memory access. Combine with --ignore-user-config for a fully isolated run.",
     )
     chat_parser.add_argument(
         "--source",

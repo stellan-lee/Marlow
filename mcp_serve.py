@@ -469,17 +469,12 @@ def create_mcp_server(
         instructions=(
             "Marlow Agent messaging bridge. Use these tools to interact with "
             "conversations across Telegram, Discord, Slack, Feishu, email, "
-            "webhooks, and plugin-provided platforms, and to recall and manage "
-            "Work Experience for the current project."
+            "webhooks, and plugin-provided platforms."
         ),
         **server_options,
     )
 
     bridge = event_bridge or EventBridge()
-
-    from agent.transports.work_experience_mcp import register_work_experience_tools
-
-    register_work_experience_tools(mcp)
 
     # -- conversations_list ------------------------------------------------
 

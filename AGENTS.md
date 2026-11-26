@@ -30,7 +30,7 @@ marlow-agent/
 ├── marlow_constants.py   # get_marlow_home(), display_marlow_home() — profile-aware paths
 ├── marlow_logging.py     # setup_logging() — agent.log / errors.log / gateway.log (profile-aware)
 ├── batch_runner.py       # Parallel batch processing
-├── agent/                # Codex adapter, isolated environment, business memory and policy
+├── agent/                # Codex adapter, isolated environment, scoped file access and policy
 ├── marlow_cli/           # CLI subcommands, setup wizard, plugin loader and single-query entry points
 ├── tools/                # Tool implementations — auto-discovered via tools/registry.py
 │   └── environments/     # Terminal backends (local, docker, ssh)
@@ -39,7 +39,6 @@ marlow-agent/
 │   │                     #   and signed webhook. Discord ships as a platform plugin.
 │   └── builtin_hooks/    # Extension point for always-registered gateway hooks (none shipped)
 ├── plugins/              # Plugin system (see "Plugins" section below)
-│   ├── memory/           # Memory-provider plugins (honcho)
 │   ├── observability/    # Metrics / traces / logs plugin
 │   └── <others>/         # observability, browser/web, platforms, security
 ├── .agents/skills/       # Developer skills for the source checkout
@@ -142,7 +141,7 @@ Gateway slash commands are registered in `marlow_cli/commands.py` and
 dispatched by `gateway/run.py`. Telegram and Slack build their menus from
 the same registry. Use `marlow_cli.config.save_config_value()` for atomic,
 typed profile setting changes. Explicit `/learn` requests can create a
-skill. Background memory review uses memory tools.
+skill.
 
 ---
 
@@ -190,7 +189,7 @@ The registry handles schema collection, dispatch, availability checking, and err
 
 **State files**: If a tool stores persistent state (caches, logs, checkpoints), use `get_marlow_home()` for the base directory — never `Path.home() / ".marlow"`. This ensures each profile gets its own state.
 
-**Agent-level tools** (todo, memory): intercepted by `run_agent.py` before `handle_function_call()`. See `tools/todo_tool.py` for the pattern.
+**Agent-level tools** (todo): intercepted by `run_agent.py` before `handle_function_call()`. See `tools/todo_tool.py` for the pattern.
 
 ---
 
@@ -233,7 +232,7 @@ Reference: #2810 (bounds pass), #9801 (SHA pinning + audit CI).
 explicit environment variables and project/skill allowlists. Model and provider
 settings belong exclusively in the profile's `runtime/codex/config.toml`.
 Retired YAML inference fields fail with migration guidance and are not silently
-translated. Memory, tools, channels, delegation and Cron retain their existing
+translated. Tools, channels, delegation and Cron retain their existing
 business configuration.
 
 ### .env variables (SECRETS ONLY — API keys, tokens, passwords):
@@ -299,23 +298,6 @@ as a side effect of importing `model_tools.py`. Code paths that read plugin
 state without importing `model_tools.py` first must call `discover_plugins()`
 explicitly (it's idempotent).
 
-### Memory-provider plugins (`plugins/memory/<name>/`)
-
-Separate discovery system for pluggable memory backends. The built-in
-provider is **honcho**.
-
-Each provider implements the `MemoryProvider` ABC (see `agent/memory_provider.py`)
-and is orchestrated by `agent/memory_manager.py`. Lifecycle hooks include
-`sync_turn(turn_messages)`, `prefetch(query)`, `shutdown()`, and optional
-`post_setup(marlow_home, config)` for setup-wizard integration.
-
-**CLI commands via `plugins/memory/<name>/cli.py`:** if a memory plugin
-defines `register_cli(subparser)`, `discover_plugin_cli_commands()` finds
-it at argparse setup time and wires it into `marlow <plugin>`. The
-framework only exposes CLI commands for the **currently active** memory
-provider (read from `memory.provider` in config.yaml), so disabled
-providers don't clutter `marlow --help`.
-
 **Rule (Teknium, May 2026):** plugins MUST NOT modify core files
 (`run_agent.py`, `cli.py`, `gateway/run.py`, `marlow_cli/main.py`, etc.).
 If a plugin needs a capability the framework doesn't expose, expand the
@@ -323,22 +305,10 @@ generic plugin surface (new hook, new ctx method) — never hardcode
 plugin-specific logic into core. PR #5295 removed 95 lines of hardcoded
 honcho argparse from `main.py` for exactly this reason.
 
-**No new in-tree memory providers (policy, May 2026):** the set of
-built-in memory providers under `plugins/memory/` is closed. New memory
-backends must ship as **standalone plugin repos** that users install
-into `~/.marlow/plugins/` (or via pip entry points) — they implement
-the same `MemoryProvider` ABC, register through the same discovery
-path, and integrate via `marlow memory setup` / `post_setup()` without
-landing in this tree. PRs that add a new directory under
-`plugins/memory/` will be closed with a pointer to publish the
-provider as its own repo. Existing in-tree providers stay; bug fixes
-to them are welcome.
-
 ### Model configuration
 
 Model-provider and context-engine plugins are retired. Custom inference
-providers use Codex native Responses configuration only. Business plugins and
-memory providers remain supported inside their trusted profile scope.
+providers use Codex native Responses configuration only. Business plugins run within their trusted profile scope.
 
 ## Skills
 
@@ -456,7 +426,7 @@ platforms inherit from.
 
 Current toolset keys: `admin_approval`, `browser`, `clarify`,
 `code_execution`, `context_engine`, `cronjob`, `debugging`,
-`delegation`, `file`, `memory`, `messaging`, `moa`, `safe`,
+`delegation`, `file`, `messaging`, `moa`, `safe`,
 `search`, `session_search`, `skills`, `terminal`, `todo`, `vision`,
 and `web`.
 
@@ -483,7 +453,7 @@ Two shapes:
 Roles:
 
 - `role="leaf"` (default) — focused worker. Cannot call `delegate_task`,
-  `clarify`, `memory`, `send_message`, `execute_code`.
+  `clarify`, `send_message`, `execute_code`.
 - `role="orchestrator"` — retains `delegate_task` so it can spawn its
   own workers. Gated by `delegation.orchestrator_enabled` (default true)
   and bounded by `delegation.max_spawn_depth` (default 2).
@@ -524,8 +494,7 @@ Hardening invariants:
 - Grace window: 120s for one-shot jobs whose fire time was missed.
 - File lock at `~/.marlow/cron/.tick.lock` prevents duplicate ticks
   across processes.
-- Cron sessions pass `skip_memory=True` by default; memory providers
-  intentionally do not run during cron.
+- Cron sessions receive no private memory grant.
 
 Cron deliveries are **not** mirrored into the target gateway session —
 they land in their own cron session with a header/footer frame so the
@@ -546,6 +515,17 @@ add idle AI heartbeats. `terminal(background=True)` is currently unsupported;
 use scoped Cron/delegation for supported triggered work.
 
 ---
+
+### Long-term memory
+
+The host grants a persistent Markdown directory to the local profile owner or
+an authorized private Gateway identity. The agent uses ordinary file tools
+and chooses when to read or edit its files. Keep the trusted instructions in
+`agent/runtime_instructions/AGENTS.md` and load them through
+`developerInstructions`. Workspace discovery restrictions remain in effect.
+Session history, business authorization, and audit records retain their
+existing ownership. Run `marlow memory migrate` to import legacy data into
+the authorized workspace or preserve it in the operator archive.
 
 ## Profiles: Multi-Instance Support
 

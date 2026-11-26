@@ -2,7 +2,7 @@
 from tests.runtime.test_codex_runtime import profile, new_agent
 
 
-def test_reset_clears_turn_usage_and_memory_context(profile):
+def test_reset_clears_turn_usage_and_starts_new_thread(profile):
     agent = new_agent()
     first = agent.run_conversation('first')
     old_session = agent.session_id

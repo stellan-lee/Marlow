@@ -44,10 +44,8 @@ _MARLOW_CORE_TOOLS = [
     "browser_type", "browser_scroll", "browser_back",
     "browser_press", "browser_get_images",
     "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
-    # Planning & memory
-    "todo", "memory",
-    # Work Experience governance
-    "experience_decision",
+    # Planning
+    "todo",
     # Session history search
     "session_search",
     # Clarifying questions
@@ -148,12 +146,6 @@ TOOLSETS = {
         "includes": []
     },
     
-    "memory": {
-        "description": "Persistent memory across sessions (personal notes + user profile)",
-        "tools": ["memory"],
-        "includes": []
-    },
-
     "context_engine": {
         "description": "Runtime tools exposed by the active context engine",
         "tools": [],
@@ -190,8 +182,6 @@ TOOLSETS = {
         "includes": []
     },
 
-    # "honcho" toolset removed — Honcho is now a memory provider plugin.
-    # Tools are injected via MemoryManager, not the toolset system.
 
     # Scenario-specific toolsets
     

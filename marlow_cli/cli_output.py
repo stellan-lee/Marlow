@@ -2,7 +2,7 @@
 
 Extracts the identical ``print_info/success/warning/error`` and ``prompt()``
 functions previously duplicated across setup.py, tools_config.py,
-mcp_config.py, and memory_setup.py.
+and mcp_config.py.
 """
 
 from marlow_cli.colors import Colors, color
@@ -47,8 +47,8 @@ def prompt(
 ) -> str:
     """Prompt the user for input with optional default and password masking.
 
-    Replaces the four independent ``_prompt()`` / ``prompt()`` implementations
-    in setup.py, tools_config.py, mcp_config.py, and memory_setup.py.
+    Replaces the independent ``_prompt()`` / ``prompt()`` implementations
+    in setup.py, tools_config.py, and mcp_config.py.
 
     Returns the user's input (stripped), or *default* if the user presses Enter.
     Returns empty string on Ctrl-C or EOF.

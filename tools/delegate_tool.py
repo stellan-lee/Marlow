@@ -46,7 +46,6 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
     [
         "delegate_task",  # no recursive delegation
         "clarify",  # no user interaction
-        "memory",  # no writes to shared MEMORY.md
         "send_message",  # no cross-platform side effects
         "execute_code",  # children should reason step-by-step, not write scripts
     ]
@@ -588,7 +587,6 @@ def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
     blocked_toolset_names = {
         "delegation",
         "clarify",
-        "memory",
         "code_execution",
     }
     return [t for t in toolsets if t not in blocked_toolset_names]
@@ -1994,31 +1992,6 @@ def delegate_task(
             # Sort by task_index so results match input order
             results.sort(key=lambda r: r["task_index"])
 
-        # Notify parent's memory provider of delegation outcomes
-        if (
-            parent_agent
-            and hasattr(parent_agent, "_memory_manager")
-            and parent_agent._memory_manager
-        ):
-            for entry in results:
-                try:
-                    _task_goal = (
-                        task_list[entry["task_index"]]["goal"]
-                        if entry["task_index"] < len(task_list)
-                        else ""
-                    )
-                    parent_agent._memory_manager.on_delegation(
-                        task=_task_goal,
-                        result=entry.get("summary", "") or "",
-                        child_session_id=(
-                            getattr(children[entry["task_index"]][2], "session_id", "")
-                            if entry["task_index"] < len(children)
-                            else ""
-                        ),
-                    )
-                except Exception:
-                    pass
-
         # Fire subagent_stop hooks once per child, serialised on the parent thread.
         # This keeps Python-plugin and shell-hook callbacks off of the worker threads
         # that ran the children, so hook authors don't need to reason about
@@ -2318,10 +2291,10 @@ def _build_top_level_description() -> str:
         "status) and verify it yourself — fetch the URL, stat the file, read "
         "back the content — before telling the user the operation succeeded.\n"
         "- Leaf subagents (role='leaf', the default) CANNOT call: "
-        "delegate_task, clarify, memory, send_message, execute_code.\n"
+        "delegate_task, clarify, send_message, execute_code.\n"
         "- Orchestrator subagents (role='orchestrator') retain "
         "delegate_task so they can spawn their own workers, but still "
-        "cannot use clarify, memory, send_message, or execute_code. "
+        "cannot use clarify, send_message, or execute_code. "
         f"Orchestrators are bounded by max_spawn_depth={max_depth} for this "
         f"user and can be disabled globally via "
         "delegation.orchestrator_enabled=false.\n"

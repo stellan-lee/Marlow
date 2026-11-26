@@ -2,8 +2,8 @@
 
 Marlow can serve every authorized Telegram source outside the exact configured
 super-admin conversation as a guest-facing digital twin of the profile owner.
-Guest turns combine a global role prompt, the existing per-chat or per-topic
-prompt, and scoped Work Experience recall.
+Guest turns combine a global role prompt with the existing per-chat or per-topic
+prompt.
 
 This feature changes context, not authorization. It does not widen Telegram
 allowlists or mention gates, grant admin permissions, expose personal memory,
@@ -36,7 +36,6 @@ chat. Other users in the same chat remain guests.
 
 ```yaml
 experience:
-  mode: assist
   telegram_digital_twin:
     enabled: true
     system_prompt: >-
@@ -56,30 +55,16 @@ The prompt order is:
 3. The matching `telegram.channel_prompts` entry.
 4. The gateway's existing global ephemeral system prompt, when configured.
 
-The channel prompt specializes the global guest role. Prompt text cannot
-override tool policies, identity checks, approval routing, or Work Experience
-governance.
+The channel prompt specializes the global guest role. Existing tool policies,
+identity checks, and approval routing govern each action.
 
-## Work Experience behavior
+## Conversation and file access
 
-Every dispatched Telegram turn that is not the exact super-admin source becomes
-eligible for the same bounded, relevance-based Work Experience retrieval used
-by the local owner. Recall still requires:
-
-- global `experience.mode` set to `shadow` or `assist`;
-- an explicit project policy allowing recall;
-- injection consent for `assist` mode;
-- matching repository and project scope;
-- an allowed provider-egress policy; and
-- active, approved lessons that meet the confidence threshold.
-
-Guest turns never capture experience. Marlow does not inject the profile
-owner's personal memory, private conversation history, or the complete
-experience database. The personal-memory and cross-session-search toolsets are
-also removed from guest agents.
+Guest turns use a separate session and file workspace. They receive no private
+memory grant and cannot resume the owner's Codex Thread. Cross-session search
+is unavailable in guest mode.
 
 ## Rollback
 
 Set `experience.telegram_digital_twin.enabled: false`. Existing Telegram
-message routing, the super-admin conversation, per-channel prompts, and
-owner-bound DM recall remain unchanged.
+message routing and per-channel prompts still apply.

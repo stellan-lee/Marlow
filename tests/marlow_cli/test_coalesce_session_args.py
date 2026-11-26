@@ -111,8 +111,8 @@ class TestCoalesceSessionNameArgs:
             ["-c", "my", "setup"]
         ) == ["-c", "my", "setup"]
 
-    def test_stops_at_experience_subcommand(self):
-        """Governance commands must not be consumed as session-name text."""
+    def test_stops_at_memory_subcommand(self):
+        """Migration commands must not be consumed as session-name text."""
         assert _coalesce_session_name_args(
-            ["-c", "my", "session", "experience", "list"]
-        ) == ["-c", "my session", "experience", "list"]
+            ["-c", "my", "session", "memory", "migrate"]
+        ) == ["-c", "my session", "memory", "migrate"]

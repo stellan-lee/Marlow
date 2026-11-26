@@ -18,7 +18,6 @@ CONFIGURABLE_TOOLSETS=[
 ("moa","🧠 Mixture of Agents","multi-agent aggregation"),
 ("skills","📚 Skills","local SKILL.md discovery and management"),
 ("todo","📋 Task Planning","task planning"),
-("memory","💾 Memory","local and configured external memory"),
 ("context_engine","🧩 Context Engine","active context-engine tools"),
 ("session_search","🔎 Session Search","search past conversations"),
 ("clarify","❓ Clarifying Questions","request user input"),

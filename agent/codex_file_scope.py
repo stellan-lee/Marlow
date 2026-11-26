@@ -43,7 +43,11 @@ def permits_delivery(path):
     from marlow_constants import get_marlow_home
 
     profile = get_marlow_home().absolute()
-    if path.is_relative_to(profile / "runtime"):
+    if (
+        path.is_relative_to(profile / "runtime")
+        or path.is_relative_to(profile / "memory-workspaces")
+        or path.is_relative_to(profile / "memory-migration")
+    ):
         return False
     # Credential stores are private even outside the current profile layout.
     if any(part in {".codex", ".ssh", ".aws", ".gnupg"} for part in path.parts):
@@ -59,12 +63,22 @@ def permits_delivery(path):
     return None  # deterministic operator paths still apply their normal policy
 
 
+def _gateway_delivery_environment(owner, source):
+    from agent.codex_environment import gateway_environment
+
+    get_scope = getattr(owner, "_guest_workspace_scope", None)
+    if get_scope is None:
+        handler = getattr(owner, "_message_handler", None)
+        runner = getattr(handler, "__self__", None)
+        get_scope = getattr(runner, "_guest_workspace_scope", None)
+    scope = get_scope(source) if get_scope is not None else None
+    return gateway_environment(source, workspace_scope=scope)
+
+
 def gateway_delivery_scope(function):
     @functools.wraps(function)
     async def scoped(self, event, *args, **kwargs):
-        from agent.codex_environment import gateway_environment
-
-        environment = gateway_environment(event.source)
+        environment = _gateway_delivery_environment(self, event.source)
         with file_scope([
             environment.workspace,
             *(path for path, _ in environment.projects),
@@ -159,13 +173,12 @@ def source_delivery_scope(function):
     @functools.wraps(function)
     async def scoped(*args, **kwargs):
         import inspect
-        from agent.codex_environment import gateway_environment
 
         arguments = inspect.signature(function).bind_partial(*args, **kwargs).arguments
         source = arguments.get("source")
         if source is None:
             source = arguments["event"].source
-        environment = gateway_environment(source)
+        environment = _gateway_delivery_environment(arguments.get("self"), source)
         with file_scope([
             environment.workspace,
             *(path for path, _ in environment.projects),

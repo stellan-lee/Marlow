@@ -624,37 +624,6 @@ class TestCursesRadiolist:
 # ── Provider discovery helpers ───────────────────────────────────────────
 
 
-class TestProviderDiscovery:
-    """Test provider plugin discovery and config helpers."""
-
-    def test_get_current_memory_provider_default(self, tmp_path, monkeypatch):
-        """Empty config returns empty string."""
-        monkeypatch.setenv("MARLOW_HOME", str(tmp_path))
-        config_file = tmp_path / "config.yaml"
-        config_file.write_text("memory:\n  provider: ''\n")
-        from marlow_cli.plugins_cmd import _get_current_memory_provider
-        result = _get_current_memory_provider()
-        assert result == ""
-
-
-    def test_save_memory_provider(self, tmp_path, monkeypatch):
-        """Saving a memory provider persists to config.yaml."""
-        monkeypatch.setenv("MARLOW_HOME", str(tmp_path))
-        config_file = tmp_path / "config.yaml"
-        config_file.write_text("memory:\n  provider: ''\n")
-        from marlow_cli.plugins_cmd import _save_memory_provider
-        _save_memory_provider("honcho")
-        content = yaml.safe_load(config_file.read_text())
-        assert content["memory"]["provider"] == "honcho"
-
-
-    def test_discover_memory_providers_empty(self):
-        """Discovery returns empty list when import fails."""
-        with patch("plugins.memory.discover_memory_providers",
-                    side_effect=ImportError("no module")):
-            from marlow_cli.plugins_cmd import _discover_memory_providers
-            result = _discover_memory_providers()
-            assert result == []
 
 
 
@@ -674,3 +643,31 @@ class TestNoAutoActivation:
         # The old code had: "Even with default config, check if a plugin registered one"
         # The fix removes this. Verify it's gone.
         assert "Even with default config, check if a plugin registered one" not in source
+
+
+def test_plugin_toggle_persists_general_plugin_selection(monkeypatch):
+    from marlow_cli import plugins_cmd
+    from marlow_cli import curses_ui
+
+    monkeypatch.setattr(plugins_cmd, "_discover_all_plugins", lambda: [
+        ("first", "1", "First plugin", "user", None),
+        ("second", "1", "Second plugin", "user", None),
+    ])
+    monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: {"first"})
+    monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: {"hidden"})
+    monkeypatch.setattr(plugins_cmd.sys.stdin, "isatty", lambda: True)
+    saved_enabled = []
+    saved_disabled = []
+    monkeypatch.setattr(plugins_cmd, "_save_enabled_set", saved_enabled.append)
+    monkeypatch.setattr(plugins_cmd, "_save_disabled_set", saved_disabled.append)
+
+    def choose(title, labels, selected):
+        assert title == "Plugins"
+        assert labels == ["first — First plugin", "second — Second plugin"]
+        assert selected == {0}
+        return {1}
+
+    monkeypatch.setattr(curses_ui, "curses_checklist", choose)
+    plugins_cmd.cmd_toggle()
+    assert saved_enabled == [{"second"}]
+    assert saved_disabled == [{"hidden", "first"}]

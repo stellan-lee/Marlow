@@ -113,7 +113,7 @@ class TestConfigFilePermissions(unittest.TestCase):
             home_mode = stat.S_IMODE(os.stat(home).st_mode)
             self.assertEqual(home_mode, 0o700)
 
-            for subdir in ("cron", "sessions", "logs", "memories"):
+            for subdir in ("cron", "sessions", "logs"):
                 subdir_mode = stat.S_IMODE(os.stat(home / subdir).st_mode)
                 self.assertEqual(subdir_mode, 0o700, f"{subdir} should be 0700")
 

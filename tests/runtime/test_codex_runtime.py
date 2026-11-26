@@ -499,7 +499,7 @@ def test_oneshot_stdout_is_only_final_result(profile):
             "-z",
             "explicit input",
             "-t",
-            "memory",
+            "file",
         ],
         cwd=Path(__file__).parents[2],
         env=dict(os.environ),
@@ -541,3 +541,22 @@ def test_mcp_results_scrub_secrets_and_preserve_pixels(profile):
     finally:
         bridge.close()
         agent.close()
+
+
+def test_workspace_trust_entries_cannot_enable_native_discovery(tmp_path):
+    profile = tmp_path / "profile"
+    environment = CodexEnvironment.build(profile, workspace_scope="a" * 32)
+    config = environment.codex_home / "config.toml"
+    config.write_text(
+        f"[projects.{json.dumps(str(environment.workspace))}]\n"
+        'trust_level="trusted"\n'
+    )
+    restarted = CodexEnvironment.build(profile, workspace_scope="b" * 32)
+    projects = restarted.overrides()["projects"]
+    assert projects == {
+        str(environment.workspace): {"trust_level": "untrusted"},
+        str(restarted.workspace): {"trust_level": "untrusted"},
+    }
+    config.write_text(f"[projects.{json.dumps(str(tmp_path))}]\ntrust_level='trusted'\n")
+    with pytest.raises(CodexConfigurationError, match="host-controlled fields: projects"):
+        CodexEnvironment.build(profile)

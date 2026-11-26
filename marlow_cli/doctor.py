@@ -55,15 +55,6 @@ def _has_provider_env_config(content: str) -> bool:
     return any(key in content for key in _PROVIDER_ENV_HINTS)
 
 
-def _honcho_is_configured_for_doctor() -> bool:
-    """Return True when Honcho is configured, even if this process has no active session."""
-    try:
-        from plugins.memory.honcho.client import HonchoClientConfig
-
-        cfg = HonchoClientConfig.from_global_config()
-        return bool(cfg.enabled and (cfg.api_key or cfg.base_url))
-    except Exception:
-        return False
 
 
 def _doctor_tool_availability_detail(toolset: str) -> str:
@@ -71,18 +62,6 @@ def _doctor_tool_availability_detail(toolset: str) -> str:
     return ""
 
 
-def _apply_doctor_tool_availability_overrides(available: list[str], unavailable: list[dict]) -> tuple[list[str], list[dict]]:
-    """Adjust runtime-gated tool availability for doctor diagnostics."""
-    updated_available = list(available)
-    updated_unavailable = []
-    for item in unavailable:
-        name = item.get("name")
-        if name == "honcho" and _honcho_is_configured_for_doctor():
-            if "honcho" not in updated_available:
-                updated_available.append("honcho")
-            continue
-        updated_unavailable.append(item)
-    return updated_available, updated_unavailable
 
 
 def check_ok(text: str, detail: str = ""):
@@ -568,7 +547,7 @@ def run_doctor(args):
         check_warn(f"{_DHH} not found", "(will be created on first use)")
 
     # Check expected subdirectories
-    expected_subdirs = ["cron", "sessions", "logs", "skills", "memories"]
+    expected_subdirs = ["cron", "sessions", "logs", "skills"]
     for subdir_name in expected_subdirs:
         subdir_path = marlow_home / subdir_name
         if subdir_path.exists():
@@ -603,28 +582,9 @@ def run_doctor(args):
             check_ok(f"Created {_DHH}/SOUL.md with basic template")
             fixed_count += 1
 
-    # Check memory directory
-    memories_dir = marlow_home / "memories"
-    if memories_dir.exists():
-        check_ok(f"{_DHH}/memories/ directory exists")
-        memory_file = memories_dir / "MEMORY.md"
-        user_file = memories_dir / "USER.md"
-        if memory_file.exists():
-            size = len(memory_file.read_text(encoding="utf-8").strip())
-            check_ok(f"MEMORY.md exists ({size} chars)")
-        else:
-            check_info("MEMORY.md not created yet (will be created when the agent first writes a memory)")
-        if user_file.exists():
-            size = len(user_file.read_text(encoding="utf-8").strip())
-            check_ok(f"USER.md exists ({size} chars)")
-        else:
-            check_info("USER.md not created yet (will be created when the agent first writes a memory)")
-    else:
-        check_warn(f"{_DHH}/memories/ not found", "(will be created on first use)")
-        if should_fix:
-            memories_dir.mkdir(parents=True, exist_ok=True)
-            check_ok(f"Created {_DHH}/memories/")
-            fixed_count += 1
+    check_info("Memory is managed by the agent in scoped Markdown files")
+    if (marlow_home / "memories").exists():
+        check_info("Legacy memory data is present. Run marlow memory migrate.")
 
     # Check SQLite session store
     state_db_path = marlow_home / "state.db"
@@ -936,7 +896,6 @@ def run_doctor(args):
         from model_tools import check_tool_availability, TOOLSET_REQUIREMENTS
 
         available, unavailable = check_tool_availability()
-        available, unavailable = _apply_doctor_tool_availability_overrides(available, unavailable)
 
         for tid in available:
             info = TOOLSET_REQUIREMENTS.get(tid, {})
@@ -956,67 +915,6 @@ def run_doctor(args):
             issues.append("Run 'marlow setup' to configure missing API keys for full tool access")
     except Exception as e:
         check_warn("Could not check tool availability", f"({e})")
-
-    _section("Memory Provider")
-    from plugins.memory import RETIRED_MEMORY_PROVIDER, RETIRED_MEMORY_PROVIDER_MESSAGE
-
-    _active_memory_provider = ""
-    try:
-        import yaml as _yaml
-        _mem_cfg_path = MARLOW_HOME / "config.yaml"
-        if _mem_cfg_path.exists():
-            with open(_mem_cfg_path, encoding="utf-8") as _f:
-                _raw_cfg = _yaml.safe_load(_f) or {}
-            _active_memory_provider = (_raw_cfg.get("memory") or {}).get("provider", "")
-    except Exception:
-        pass
-
-    if not _active_memory_provider:
-        check_ok("Built-in memory active", "(no external provider configured — this is fine)")
-    elif _active_memory_provider == "honcho":
-        try:
-            from plugins.memory.honcho.client import HonchoClientConfig, resolve_config_path
-            hcfg = HonchoClientConfig.from_global_config()
-            _honcho_cfg_path = resolve_config_path()
-
-            if not _honcho_cfg_path.exists():
-                check_warn("Honcho config not found", "run: marlow memory setup")
-            elif not hcfg.enabled:
-                check_info(f"Honcho disabled (set enabled: true in {_honcho_cfg_path} to activate)")
-            elif not (hcfg.api_key or hcfg.base_url):
-                _fail_and_issue(
-                    "Honcho API key or base URL not set",
-                    "run: marlow memory setup",
-                    "No Honcho API key — run 'marlow memory setup'",
-                    issues,
-                )
-            else:
-                from plugins.memory.honcho.client import get_honcho_client, reset_honcho_client
-                reset_honcho_client()
-                try:
-                    get_honcho_client(hcfg)
-                    check_ok(
-                        "Honcho connected",
-                        f"workspace={hcfg.workspace_id} mode={hcfg.recall_mode} freq={hcfg.write_frequency}",
-                    )
-                except Exception as _e:
-                    _fail_and_issue("Honcho connection failed", str(_e), f"Honcho unreachable: {_e}", issues)
-        except ImportError:
-            _fail_and_issue(
-                "honcho-ai not installed",
-                "pip install honcho-ai",
-                "Honcho is set as memory provider but honcho-ai is not installed",
-                issues,
-            )
-        except Exception as _e:
-            check_warn("Honcho check failed", str(_e))
-    elif _active_memory_provider == RETIRED_MEMORY_PROVIDER:
-        check_warn(RETIRED_MEMORY_PROVIDER_MESSAGE)
-    else:
-        check_warn(
-            f"Unsupported memory provider '{_active_memory_provider}'",
-            "run: marlow memory setup",
-        )
 
     try:
         from marlow_cli.profiles import list_profiles, _get_wrapper_dir, profile_exists

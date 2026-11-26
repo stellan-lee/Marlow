@@ -707,10 +707,10 @@ def setup_agent_settings(config: dict):
         "To manage this, sessions can automatically reset after a period of inactivity"
     )
     print_info(
-        "or at a fixed time each day. When a reset happens, the agent saves important"
+        "or at a fixed time each day. A reset starts a fresh conversation context."
     )
     print_info(
-        "things to its persistent memory first — but the conversation context is cleared."
+        "Agent-managed memory files persist across session resets."
     )
     print_info("")
     print_info("You can also manually reset anytime by typing /reset in chat.")

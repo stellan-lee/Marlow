@@ -30,7 +30,6 @@ BUSINESS_TOOLS = frozenset({
     "browser_console",
     "browser_vision",
     "vision_analyze",
-    "memory",
     "session_search",
     "todo",
     "clarify",
@@ -40,7 +39,6 @@ BUSINESS_TOOLS = frozenset({
     "skills_list",
     "skill_view",
     "skill_manage",
-    "experience_decision",
     "request_admin_approval",
 })
 

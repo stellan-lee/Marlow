@@ -1,9 +1,9 @@
 """Best-effort, metadata-only usage telemetry helpers.
 
 The session database owns persistence.  This module owns classification so
-tool execution, recall, and experience integration use the same vocabulary.
+tool execution uses a consistent vocabulary.
 Telemetry must never block the user's task and must never receive prompts,
-arguments, results, or recalled content.
+arguments, or results.
 """
 
 from __future__ import annotations
@@ -23,20 +23,12 @@ def _source_for_agent(agent: Any) -> str:
     return "curator" if platform == "curator" else "user_task"
 
 
-def _tool_shape(agent: Any, tool_name: str, args: dict[str, Any]) -> tuple[str, str, str, Optional[str]]:
+def _tool_shape(tool_name: str, args: dict[str, Any]) -> tuple[str, str, str, Optional[str]]:
     """Return ``(subsystem, action, item_name, parent_name)``."""
     if tool_name == "skill_view":
         return "skill", "load", str(args.get("name") or tool_name), None
     if tool_name == "skill_manage":
         return "skill", "edit", str(args.get("name") or tool_name), None
-    if tool_name == "memory":
-        return "memory", "write", str(args.get("target") or "memory"), "builtin"
-
-    manager = getattr(agent, "_memory_manager", None)
-    if manager is not None and manager.has_tool(tool_name):
-        provider = manager.provider_name_for_tool(tool_name) or "external"
-        return "memory", "call", tool_name, provider
-
     try:
         from tools.registry import registry
 
@@ -63,7 +55,7 @@ def record_tool_usage_event(
         return
     try:
         subsystem, action, item_name, parent_name = _tool_shape(
-            agent, tool_name, args or {}
+            tool_name, args or {}
         )
         session_id = str(getattr(agent, "session_id", "") or "") or None
         event_key = None

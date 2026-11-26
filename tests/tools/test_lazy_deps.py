@@ -95,10 +95,10 @@ class TestAllowlist:
                     f"{feature}: spec {spec!r} fails safety check"
 
     def test_feature_install_command_returns_pip_invocation(self):
-        cmd = ld.feature_install_command("memory.honcho")
+        cmd = ld.feature_install_command("platform.telegram")
         assert cmd is not None
         assert cmd.startswith("uv pip install")
-        assert "honcho-ai" in cmd
+        assert "python-telegram-bot" in cmd
 
     def test_feature_install_command_unknown(self):
         assert ld.feature_install_command("not.real") is None
@@ -111,7 +111,7 @@ class TestAllowlist:
 
 class TestSecurityGating:
     def test_disabled_via_config_raises(self, monkeypatch):
-        # Pretend honcho is missing AND lazy installs are disabled.
+        # Pretend the test package is missing and lazy installs are disabled.
         monkeypatch.setitem(ld.LAZY_DEPS, "test.feat", ("packageX>=1.0,<2",))
         monkeypatch.setattr(ld, "_is_satisfied", lambda spec: False)
         monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: False)
@@ -305,13 +305,13 @@ class TestActiveFeatures:
         assert ld.active_features() == []
 
     def test_finds_features_with_at_least_one_package_installed(self, monkeypatch):
-        # Pretend only honcho-ai is installed; nothing else.
+        # Pretend only the Telegram package is installed.
         monkeypatch.setattr(
             ld, "_is_present",
-            lambda spec: ld._pkg_name_from_spec(spec) == "honcho-ai",
+            lambda spec: ld._pkg_name_from_spec(spec) == "python-telegram-bot",
         )
         active = ld.active_features()
-        assert "memory.honcho" in active
+        assert "platform.telegram" in active
         # Backends the user never enabled stay quiet.
         assert "platform.slack" not in active
 

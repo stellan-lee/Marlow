@@ -153,7 +153,7 @@ class TestCreateProfile:
     def test_creates_directory_with_subdirs(self, profile_env):
         profile_dir = create_profile("coder", no_alias=True)
         assert profile_dir.is_dir()
-        for subdir in ["memories", "sessions", "skills", "logs",
+        for subdir in ["sessions", "skills", "logs",
                         "plans", "workspace", "cron"]:
             assert (profile_dir / subdir).is_dir(), f"Missing subdir: {subdir}"
 
@@ -624,68 +624,8 @@ class TestRenameProfile:
         assert new_dir.is_dir()
         assert new_dir == tmp_path / ".marlow" / "profiles" / "newname"
 
-    def test_renames_root_honcho_host_without_changing_ai_peer(self, profile_env):
-        tmp_path = profile_env
-        create_profile("ssi_health", no_alias=True)
-        honcho_path = tmp_path / ".marlow" / "honcho.json"
-        honcho_path.write_text(json.dumps({
-            "hosts": {
-                "marlow.ssi_health": {
-                    "recallMode": "hybrid",
-                    "writeFrequency": "async",
-                    "sessionStrategy": "per-session",
-                    "saveMessages": True,
-                    "peerName": "user-peer",
-                    "aiPeer": "ssi_health",
-                    "workspace": "marlow",
-                    "enabled": True,
-                }
-            }
-        }))
 
-        with patch("marlow_cli.profiles.check_alias_collision", return_value="skip"):
-            rename_profile("ssi_health", "heimdall")
 
-        cfg = json.loads(honcho_path.read_text())
-        assert "marlow.ssi_health" not in cfg["hosts"]
-        assert cfg["hosts"]["marlow_heimdall"]["aiPeer"] == "ssi_health"
-        assert cfg["hosts"]["marlow_heimdall"]["peerName"] == "user-peer"
-
-    def test_pins_ai_peer_when_absent_on_honcho_host_rename(self, profile_env):
-        tmp_path = profile_env
-        create_profile("ssi_health", no_alias=True)
-        honcho_path = tmp_path / ".marlow" / "honcho.json"
-        honcho_path.write_text(json.dumps({
-            "hosts": {
-                "marlow.ssi_health": {"workspace": "marlow", "enabled": True}
-            }
-        }))
-
-        with patch("marlow_cli.profiles.check_alias_collision", return_value="skip"):
-            rename_profile("ssi_health", "heimdall")
-
-        cfg = json.loads(honcho_path.read_text())
-        assert "marlow.ssi_health" not in cfg["hosts"]
-        assert cfg["hosts"]["marlow_heimdall"]["aiPeer"] == "ssi_health"
-        assert cfg["hosts"]["marlow_heimdall"]["workspace"] == "marlow"
-
-    def test_does_not_overwrite_existing_honcho_host_on_rename(self, profile_env):
-        tmp_path = profile_env
-        create_profile("ssi_health", no_alias=True)
-        honcho_path = tmp_path / ".marlow" / "honcho.json"
-        honcho_path.write_text(json.dumps({
-            "hosts": {
-                "marlow.ssi_health": {"aiPeer": "ssi_health"},
-                "marlow_heimdall": {"aiPeer": "heimdall"},
-            }
-        }))
-
-        with patch("marlow_cli.profiles.check_alias_collision", return_value="skip"):
-            rename_profile("ssi_health", "heimdall")
-
-        cfg = json.loads(honcho_path.read_text())
-        assert cfg["hosts"]["marlow.ssi_health"]["aiPeer"] == "ssi_health"
-        assert cfg["hosts"]["marlow_heimdall"]["aiPeer"] == "heimdall"
 
     def test_default_raises_value_error(self, profile_env):
         with pytest.raises(ValueError, match="default"):

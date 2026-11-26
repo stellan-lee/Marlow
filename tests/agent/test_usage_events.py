@@ -2,42 +2,22 @@
 
 from types import SimpleNamespace
 
-from agent.memory_manager import MemoryManager
-from agent.memory_provider import MemoryProvider
 from agent.usage_events import record_tool_usage_event
 from marlow_state import SessionDB
 
 
-class _MemoryProvider(MemoryProvider):
-    @property
-    def name(self) -> str:
-        return "honcho"
-
-    def is_available(self) -> bool:
-        return True
-
-    def initialize(self, session_id: str, **kwargs) -> None:
-        return None
-
-    def get_tool_schemas(self):
-        return [{"name": "honcho_search", "parameters": {}}]
-
-
-def _agent(db, *, platform="cli", manager=None):
+def _agent(db, *, platform="cli"):
     return SimpleNamespace(
         _session_db=db,
-        _memory_manager=manager,
         session_id="s1",
         platform=platform,
     )
 
 
-def test_classifies_skills_mcp_and_memory_without_payloads(tmp_path, monkeypatch):
+def test_classifies_skills_and_mcp_without_payloads(tmp_path, monkeypatch):
     db = SessionDB(db_path=tmp_path / "state.db")
     db.create_session(session_id="s1", source="cli")
-    manager = MemoryManager()
-    manager.add_provider(_MemoryProvider())
-    agent = _agent(db, manager=manager)
+    agent = _agent(db)
 
     from tools.registry import registry
 
@@ -51,7 +31,6 @@ def test_classifies_skills_mcp_and_memory_without_payloads(tmp_path, monkeypatch
     calls = [
         ("skill_view", {"name": "debugging"}, "skill-call"),
         ("mcp_github_search", {"query": "secret"}, "mcp-call"),
-        ("honcho_search", {"query": "secret"}, "memory-call"),
     ]
     for name, args, call_id in calls:
         record_tool_usage_event(
@@ -70,7 +49,6 @@ def test_classifies_skills_mcp_and_memory_without_payloads(tmp_path, monkeypatch
     ] == [
         ("skill", "load", "debugging", None),
         ("mcp", "call", "mcp_github_search", "github"),
-        ("memory", "call", "honcho_search", "honcho"),
     ]
     assert all(row["metadata_json"] is None for row in rows)
     assert all(row["duration_ms"] == 125 for row in rows)

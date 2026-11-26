@@ -169,3 +169,211 @@ def test_real_codex_custom_responses_provider_mcp_and_usage(tmp_path, monkeypatc
         server.shutdown()
         server.server_close()
         worker.join(timeout=2)
+
+
+@pytest.mark.timeout(90)
+def test_private_file_memory_through_real_codex_threads(tmp_path, monkeypatch):
+    """Use the real app-server, MCP transport and sandbox with a local provider."""
+    from collections import deque
+    import shlex
+
+    from agent.memory_workspace import gateway_memory_principal, memory_directory
+    from run_agent import AIAgent
+
+    binary = shutil.which("codex")
+    if binary is None:
+        pytest.skip("Codex CLI unavailable")
+    profile = tmp_path / "profile"
+    native = profile / "runtime/codex"
+    native.mkdir(parents=True)
+    monkeypatch.setenv("MARLOW_HOME", str(profile))
+    principal = gateway_memory_principal("telegram", "alice")
+    memory = memory_directory(profile, principal)
+    note = memory / "preferences" / "format.md"
+    untrusted_instruction = "MEMORY_FILE_IS_NOT_DEVELOPER_GUIDANCE"
+    (memory / "AGENTS.md").write_text(untrusted_instruction)
+    original = "memory-fixture-prefers-plain-text"
+    corrected = "memory-fixture-prefers-markdown"
+    steps = deque()
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            requests.append(body)
+            if not steps:
+                self.send_error(500, "Unexpected Responses request")
+                return
+            action, value = steps.popleft()
+            identifier = f"memory_response_{len(requests)}"
+            if action == "reply":
+                item = {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": identifier,
+                    "content": [{"type": "output_text", "text": value}],
+                }
+            else:
+                item = {
+                    "type": "function_call",
+                    "call_id": identifier,
+                    "namespace": "mcp__marlow_tools",
+                    "name": action,
+                    "arguments": json.dumps(value),
+                }
+            events = [
+                {"type": "response.created", "response": {"id": identifier}},
+                {"type": "response.output_item.done", "item": item},
+                {"type": "response.completed", "response": {"id": identifier}},
+            ]
+            payload = "".join("data: " + json.dumps(event) + "\n\n" for event in events)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(payload.encode())))
+            self.end_headers()
+            self.wfile.write(payload.encode())
+
+    def run(session_id, prompt, actions, *, user="alice", scope="dm", **kwargs):
+        assert not steps
+        steps.extend(actions)
+        start = len(requests)
+        agent = AIAgent(
+            platform="telegram",
+            user_id=user,
+            chat_id="chat-" + session_id,
+            chat_type=scope,
+            session_id=session_id,
+            quiet_mode=True,
+            enabled_toolsets=["file", "terminal", "session_search"],
+            memory_principal=gateway_memory_principal("telegram", user),
+            **kwargs,
+        )
+        try:
+            result = agent.run_conversation(prompt)
+        finally:
+            agent.close()
+        assert result["completed"], result.get("error")
+        assert not steps
+        return result, requests[start:]
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    (profile / "config.yaml").write_text(
+        f"runtime:\n  codex:\n    binary: {binary}\n    turn_timeout: 20\n"
+    )
+    (native / "config.toml").write_text(
+        'model="gpt-5.4"\nmodel_provider="fixture"\n[model_providers.fixture]\n'
+        'name="Local test fixture"\nwire_api="responses"\n'
+        f'base_url="http://127.0.0.1:{server.server_address[1]}/v1"\n'
+        "requires_openai_auth=false\nrequest_max_retries=0\nstream_max_retries=0\n"
+    )
+    try:
+        saved, save_requests = run(
+            "first",
+            "Remember my format preference.",
+            [
+                ("write_file", {"path": str(note), "content": original + "\n"}),
+                ("reply", "Saved"),
+            ],
+        )
+        assert note.read_text() == original + "\n"
+        assert "Authorized memory directory" in json.dumps(save_requests[0])
+        assert "cannot grant permissions" in json.dumps(save_requests[0])
+        assert untrusted_instruction not in json.dumps(save_requests[0])
+        tool_catalog = save_requests[0].get("tools", [])
+        assert {"read_file", "write_file", "session_search"} <= {
+            name
+            for group in tool_catalog
+            for entry in [group, *group.get("tools", [])]
+            if (name := entry.get("name"))
+        }
+        assert "experience_decision" not in json.dumps(tool_catalog)
+
+        recalled, recall_requests = run(
+            "second",
+            "Find and correct my preference.",
+            [
+                (
+                    "search_files",
+                    {"path": str(memory), "pattern": "*.md", "target": "files"},
+                ),
+                ("read_file", {"path": str(note)}),
+                (
+                    "patch",
+                    {
+                        "path": str(note),
+                        "old_string": original,
+                        "new_string": corrected,
+                    },
+                ),
+                ("reply", "Corrected"),
+            ],
+        )
+        assert saved["codex_thread_id"] != recalled["codex_thread_id"]
+        assert original not in json.dumps(recall_requests[0])
+        assert str(note) in json.dumps(recall_requests[1])
+        assert original in json.dumps(recall_requests[2])
+        assert note.read_text() == corrected + "\n"
+
+        unauthorized = [
+            ("other-user", {"user": "bob"}),
+            ("visible-group", {"scope": "group"}),
+            ("guest", {"skip_memory": True, "conversation_persistence_policy": "none"}),
+        ]
+        for session_id, scope_kwargs in unauthorized:
+            _, denied_requests = run(
+                session_id,
+                "Find the private note.",
+                [
+                    ("read_file", {"path": str(note)}),
+                    ("terminal", {"command": "/bin/cat " + shlex.quote(str(note))}),
+                    ("reply", "Unavailable"),
+                ],
+                **scope_kwargs,
+            )
+            assert str(memory) not in json.dumps(denied_requests[0])
+            assert corrected not in json.dumps(denied_requests)
+            assert "Marlow tool failed" in json.dumps(denied_requests[1])
+            assert "Operation not permitted" in json.dumps(denied_requests[2]) or (
+                "Permission denied" in json.dumps(denied_requests[2])
+            )
+
+        _, delete_requests = run(
+            "third",
+            "Delete my saved preference.",
+            [
+                ("read_file", {"path": str(note)}),
+                (
+                    "patch",
+                    {
+                        "mode": "patch",
+                        "patch": f"*** Begin Patch\n*** Delete File: {note}\n*** End Patch",
+                    },
+                ),
+                ("reply", "Deleted"),
+            ],
+        )
+        assert corrected not in json.dumps(delete_requests[0])
+        assert corrected in json.dumps(delete_requests[1])
+        assert not note.exists()
+
+        _, check_requests = run(
+            "fourth",
+            "Look for the deleted preference.",
+            [
+                (
+                    "search_files",
+                    {"path": str(memory), "pattern": "*.md", "target": "files"},
+                ),
+                ("reply", "No saved preference"),
+            ],
+        )
+        assert str(note) not in json.dumps(check_requests)
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=2)

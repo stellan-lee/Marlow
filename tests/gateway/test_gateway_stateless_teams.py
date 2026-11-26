@@ -17,7 +17,7 @@ from gateway.platforms.base import (
     MessageEvent,
     SendResult,
 )
-from gateway.run import _canonical_teams_thread_lane, _work_experience_turn_kwargs
+from gateway.run import _canonical_teams_thread_lane
 from gateway.session import SessionSource, build_session_key
 
 
@@ -144,7 +144,6 @@ def _runner() -> tuple[object, object]:
     runner._set_session_env = lambda _context: None
     runner._should_send_voice_reply = lambda *_args, **_kwargs: False
     runner._send_voice_reply = AsyncMock()
-    runner._capture_gateway_honcho_if_configured = lambda *args, **kwargs: None
     runner._emit_gateway_run_progress = AsyncMock()
     runner._is_super_admin_source = lambda _source: False
     runner._recover_telegram_topic_thread_id = AsyncMock(return_value=None)
@@ -268,13 +267,3 @@ def test_canonical_teams_thread_lane_key_uses_graph_locator() -> None:
     bad_snapshot = _snapshot()
     bad_snapshot.metadata["team_id"] = ""
     assert _canonical_teams_thread_lane(bad_snapshot) is None
-
-
-def test_work_experience_teams_boundary_uses_raw_authenticated_request() -> None:
-    assert _work_experience_turn_kwargs(
-        _teams_source(),
-        raw_user_message="@Marlow plan?",
-    ) == {
-        "raw_user_message": "@Marlow plan?",
-        "turn_origin": "teams",
-    }

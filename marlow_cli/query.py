@@ -317,10 +317,7 @@ def _finalize_query(agent, db, result, source):
     try:
         invoke_hook("on_session_finalize", session_id=agent.session_id, platform=source)
     finally:
-        try:
-            agent.shutdown_memory_provider((result or {}).get("messages") or None)
-        finally:
-            agent.close()
+        agent.close()
     if agent.session_id and db.get_session(agent.session_id):
         db.end_session(agent.session_id, "cli_close")
 

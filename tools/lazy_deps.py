@@ -76,9 +76,6 @@ logger = logging.getLogger(__name__)
 LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # ─── Web search backends ───────────────────────────────────────────────
 
-    # ─── Memory providers ──────────────────────────────────────────────────
-    "memory.honcho": ("honcho-ai==2.0.1",),
-
     # ─── Messaging platforms (lazy-installable on demand) ──────────────────
     "platform.telegram": ("python-telegram-bot[webhooks]==22.6",),
     # brotlicffi gives aiohttp a working 2-arg Decompressor.process() for
@@ -193,7 +190,7 @@ def _pkg_name_from_spec(spec: str) -> str:
 def _specifier_from_spec(spec: str) -> str:
     """Extract just the version-specifier portion of a pip spec.
 
-    ``"honcho-ai==2.0.1"`` → ``"==2.0.1"``
+    ``"httpx==0.28.1"`` → ``"==0.28.1"``
     ``"mautrix[encryption]>=0.20,<1"`` → ``">=0.20,<1"``
     ``"package"`` → ``""`` (no version constraint)
     """

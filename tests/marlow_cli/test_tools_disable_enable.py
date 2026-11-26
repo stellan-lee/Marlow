@@ -11,26 +11,26 @@ from marlow_cli.tools_config import tools_disable_enable_command
 class TestToolsDisableBuiltin:
 
     def test_disable_removes_toolset_from_platform(self):
-        config = {"platform_toolsets": {"cli": ["web", "memory", "terminal"]}}
+        config = {"platform_toolsets": {"cli": ["web", "file", "terminal"]}}
         with patch("marlow_cli.tools_config.load_config", return_value=config), \
              patch("marlow_cli.tools_config.save_config") as mock_save:
             tools_disable_enable_command(Namespace(tools_action="disable", names=["web"], platform="cli"))
         saved = mock_save.call_args[0][0]
         assert "web" not in saved["platform_toolsets"]["cli"]
-        assert "memory" in saved["platform_toolsets"]["cli"]
+        assert "file" in saved["platform_toolsets"]["cli"]
 
     def test_disable_multiple_toolsets(self):
-        config = {"platform_toolsets": {"cli": ["web", "memory", "terminal"]}}
+        config = {"platform_toolsets": {"cli": ["web", "file", "terminal"]}}
         with patch("marlow_cli.tools_config.load_config", return_value=config), \
              patch("marlow_cli.tools_config.save_config") as mock_save:
-            tools_disable_enable_command(Namespace(tools_action="disable", names=["web", "memory"], platform="cli"))
+            tools_disable_enable_command(Namespace(tools_action="disable", names=["web", "file"], platform="cli"))
         saved = mock_save.call_args[0][0]
         assert "web" not in saved["platform_toolsets"]["cli"]
-        assert "memory" not in saved["platform_toolsets"]["cli"]
+        assert "file" not in saved["platform_toolsets"]["cli"]
         assert "terminal" in saved["platform_toolsets"]["cli"]
 
     def test_disable_already_absent_is_idempotent(self):
-        config = {"platform_toolsets": {"cli": ["memory"]}}
+        config = {"platform_toolsets": {"cli": ["file"]}}
         with patch("marlow_cli.tools_config.load_config", return_value=config), \
              patch("marlow_cli.tools_config.save_config") as mock_save:
             tools_disable_enable_command(Namespace(tools_action="disable", names=["web"], platform="cli"))
@@ -44,7 +44,7 @@ class TestToolsDisableBuiltin:
 class TestToolsEnableBuiltin:
 
     def test_enable_adds_toolset_to_platform(self):
-        config = {"platform_toolsets": {"cli": ["memory"]}}
+        config = {"platform_toolsets": {"cli": ["file"]}}
         with patch("marlow_cli.tools_config.load_config", return_value=config), \
              patch("marlow_cli.tools_config.save_config") as mock_save:
             tools_disable_enable_command(Namespace(tools_action="enable", names=["web"], platform="cli"))
@@ -120,7 +120,7 @@ class TestToolsMixedTargets:
 
     def test_disable_builtin_and_mcp_together(self):
         config = {
-            "platform_toolsets": {"cli": ["web", "memory"]},
+            "platform_toolsets": {"cli": ["web", "file"]},
             "mcp_servers": {"github": {"command": "npx"}},
         }
         with patch("marlow_cli.tools_config.load_config", return_value=config), \
@@ -136,7 +136,7 @@ class TestToolsMixedTargets:
 
     def test_builtin_toggle_does_not_persist_implicit_mcp_defaults(self):
         config = {
-            "platform_toolsets": {"cli": ["web", "memory"]},
+            "platform_toolsets": {"cli": ["web", "file"]},
             "mcp_servers": {"exa": {"url": "https://mcp.exa.ai/mcp"}},
         }
         with patch("marlow_cli.tools_config.load_config", return_value=config), \
@@ -148,7 +148,7 @@ class TestToolsMixedTargets:
             ))
         saved = mock_save.call_args[0][0]
         assert "web" not in saved["platform_toolsets"]["cli"]
-        assert "memory" in saved["platform_toolsets"]["cli"]
+        assert "file" in saved["platform_toolsets"]["cli"]
         assert "exa" not in saved["platform_toolsets"]["cli"]
 
 
@@ -158,12 +158,12 @@ class TestToolsMixedTargets:
 class TestToolsList:
 
     def test_list_shows_enabled_toolsets(self, capsys):
-        config = {"platform_toolsets": {"cli": ["web", "memory"]}}
+        config = {"platform_toolsets": {"cli": ["web", "file"]}}
         with patch("marlow_cli.tools_config.load_config", return_value=config):
             tools_disable_enable_command(Namespace(tools_action="list", platform="cli"))
         out = capsys.readouterr().out
         assert "web" in out
-        assert "memory" in out
+        assert "file" in out
 
     def test_list_shows_mcp_excluded_tools(self, capsys):
         config = {
@@ -202,7 +202,7 @@ class TestToolsValidation:
         assert "Unknown toolset 'nonexistent_toolset'" in out
 
     def test_unknown_toolset_does_not_corrupt_config(self):
-        config = {"platform_toolsets": {"cli": ["web", "memory"]}}
+        config = {"platform_toolsets": {"cli": ["web", "file"]}}
         with patch("marlow_cli.tools_config.load_config", return_value=config), \
              patch("marlow_cli.tools_config.save_config") as mock_save:
             tools_disable_enable_command(
@@ -210,10 +210,10 @@ class TestToolsValidation:
             )
         saved = mock_save.call_args[0][0]
         assert "web" in saved["platform_toolsets"]["cli"]
-        assert "memory" in saved["platform_toolsets"]["cli"]
+        assert "file" in saved["platform_toolsets"]["cli"]
 
     def test_mixed_valid_and_invalid_applies_valid_only(self):
-        config = {"platform_toolsets": {"cli": ["web", "memory"]}}
+        config = {"platform_toolsets": {"cli": ["web", "file"]}}
         with patch("marlow_cli.tools_config.load_config", return_value=config), \
              patch("marlow_cli.tools_config.save_config") as mock_save:
             tools_disable_enable_command(
@@ -221,4 +221,4 @@ class TestToolsValidation:
             )
         saved = mock_save.call_args[0][0]
         assert "web" not in saved["platform_toolsets"]["cli"]
-        assert "memory" in saved["platform_toolsets"]["cli"]
+        assert "file" in saved["platform_toolsets"]["cli"]

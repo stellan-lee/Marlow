@@ -46,13 +46,12 @@ def test_breakdown_keys_and_shape(isolated_home):
         "model",
         "system_prompt",
         "skills_index",
-        "memory",
-        "user_profile",
+        "instructions",
         "tools",
         "sections",
     }
     assert data["platform"] == "cli"
-    for key in ("system_prompt", "skills_index", "memory", "user_profile"):
+    for key in ("system_prompt", "skills_index", "instructions"):
         assert data[key]["bytes"] >= 0
         assert data[key]["chars"] >= 0
     assert data["tools"]["count"] >= 0
@@ -82,16 +81,18 @@ def test_skills_index_reflects_installed_skills(isolated_home):
     assert data["skills_index"]["bytes"] == 0  # skills are loaded explicitly through MCP
 
 
-def test_memory_and_profile_are_attributed(isolated_home):
-    """Memory and user-profile blocks are measured separately."""
+def test_memory_files_do_not_enter_context_sizes(isolated_home):
+    """On-demand memory data is excluded from the trusted context report."""
+    before = compute_prompt_breakdown("cli")
     _seed_memory(
         isolated_home,
         memory_text="Project uses pytest.\n",
         user_text="User is a developer.\n",
     )
     data = compute_prompt_breakdown("cli")
-    assert data["memory"]["bytes"] > 0
-    assert data["user_profile"]["bytes"] > 0
+    assert data["system_prompt"] == before["system_prompt"]
+    assert "memory" not in data
+    assert "user_profile" not in data
 
 
 def test_skills_block_regex_matches_tagged_block():

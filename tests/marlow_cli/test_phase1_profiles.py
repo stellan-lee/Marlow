@@ -4,7 +4,6 @@ import logging
 
 from agent.skill_utils import iter_skill_index_files
 from marlow_cli.config import ensure_marlow_home, load_config, save_config_value
-from plugins.memory import discover_memory_providers, load_memory_provider
 
 
 def test_fresh_profile_does_not_advertise_retired_features(tmp_path, monkeypatch):
@@ -13,16 +12,13 @@ def test_fresh_profile_does_not_advertise_retired_features(tmp_path, monkeypatch
     config = load_config()
     assert {"tts", "stt", "voice", "curator", "personalities"}.isdisjoint(config)
     assert {"skin", "personality", "tui_status_indicator"}.isdisjoint(config["display"])
-    assert config["memory"]["provider"] == ""
+    assert {"memory", "honcho"}.isdisjoint(config)
 
     import model_tools
 
     names = model_tools.TOOL_TO_TOOLSET_MAP
     assert {"image_generate", "text_to_speech", "computer_use"}.isdisjoint(names)
     assert {"vision_analyze", "browser_navigate", "cronjob", "delegate_task"} <= names.keys()
-    providers = {provider[0] for provider in discover_memory_providers()}
-    assert "honcho" in providers
-    assert "holographic" not in providers
 
 
 def test_legacy_profile_preserves_data_and_reports_retired_provider(
@@ -40,10 +36,7 @@ def test_legacy_profile_preserves_data_and_reports_retired_provider(
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("# Skill")
 
-    with caplog.at_level(logging.WARNING):
-        assert load_memory_provider(load_config()["memory"]["provider"]) is None
-
-    assert "no longer supported" in caplog.text
+    assert load_config()["memory"]["provider"] == "holographic"
     assert config_path.read_text() == legacy_config
     assert database.read_bytes() == b"legacy provider data"
     assert list(iter_skill_index_files(tmp_path / "skills", "SKILL.md")) == [current]

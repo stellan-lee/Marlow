@@ -2,7 +2,7 @@
 
 This module is the single source of truth for prompt-injection / promptware /
 exfiltration patterns used across the context-assembly scanners
-(``agent/prompt_builder.py``, ``tools/memory_tool.py``) and the tool-result
+(``agent/prompt_builder.py``) and the tool-result
 delimiter system in ``agent/tool_dispatch_helpers.py``.
 
 Pattern philosophy

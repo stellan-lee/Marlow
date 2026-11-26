@@ -5,8 +5,7 @@ Marlow Plugin System
 Discovers, loads, and manages plugins from four sources:
 
 1. **Bundled plugins** – ``<repo>/plugins/<name>/`` (shipped with marlow-agent;
-   ``memory/`` and ``context_engine/`` subdirs are excluded — they have their
-   own discovery paths)
+   retired provider directories are excluded)
 2. **User plugins**   – ``~/.marlow/plugins/<name>/``
 3. **Project plugins** – ``./.marlow/plugins/<name>/`` (opt-in via
    ``MARLOW_ENABLE_PROJECT_PLUGINS``)
@@ -249,10 +248,7 @@ class PluginManifest:
     # ``backend``: pluggable backend for an existing core tool (e.g.
     #              web search). Built-in (bundled) backends auto-load;
     #              user-installed still gated by ``plugins.enabled``.
-    # ``exclusive``: category with exactly one active provider (memory).
-    #              Selection via ``<category>.provider`` config key; the
-    #              category's own discovery system handles loading and the
-    #              general scanner skips these.
+    # ``exclusive``: retired provider plugins are recorded but never loaded.
     # ``platform``: gateway messaging platform adapter (e.g. IRC). Bundled
     #              platform plugins auto-load so every shipped platform is
     #              available out of the box; user-installed platform plugins
@@ -400,7 +396,7 @@ class PluginContext:
         handler_fn: Callable | None = None,
         description: str = "",
     ) -> None:
-        """Register a CLI subcommand (e.g. ``marlow honcho ...``).
+        """Register a CLI subcommand for this plugin.
 
         The *setup_fn* receives an argparse subparser and should add any
         arguments/sub-subparsers.  If *handler_fn* is provided it is set
@@ -722,8 +718,7 @@ class PluginManager:
         #   - category: ``plugins/web/ddgs/plugin.yaml`` (backend)
         #
         # ``memory/``, ``context_engine/``, and ``model-providers/`` are
-        # skipped at the top level — they have their own discovery systems
-        # (plugins/memory/__init__.py, providers/__init__.py). ``platforms/``
+        # retired and skipped at the top level. ``platforms/``
         # is a category holding platform adapters (scanned one level deeper
         # below).
         repo_plugins = get_bundled_plugins_dir()
@@ -789,17 +784,15 @@ class PluginManager:
                 logger.debug("Skipping disabled plugin '%s'", lookup_key)
                 continue
 
-            # Exclusive plugins (memory providers) have their own
-            # discovery/activation path. The general loader records the
-            # manifest for introspection but does not load the module.
+            # Retired exclusive providers remain visible for diagnostics.
             if manifest.kind == "exclusive":
                 loaded = LoadedPlugin(manifest=manifest, enabled=False)
                 loaded.error = (
-                    "exclusive plugin — activate via <category>.provider config"
+                    "exclusive provider plugins are retired; run marlow memory migrate"
                 )
                 self._plugins[lookup_key] = loaded
                 logger.debug(
-                    "Skipping '%s' (exclusive, handled by category discovery)",
+                    "Skipping '%s' (retired exclusive provider)",
                     lookup_key,
                 )
                 continue
@@ -973,12 +966,8 @@ class PluginManager:
                 )
                 kind = "standalone"
 
-            # Auto-coerce user-installed memory providers to kind="exclusive"
-            # so they're routed to plugins/memory discovery instead of being
-            # loaded by the general PluginManager (which has no
-            # register_memory_provider on PluginContext). Mirrors the
-            # heuristic in plugins/memory/__init__.py:_is_memory_provider_dir.
-            # Bundled memory providers are already skipped via skip_names.
+            # Recognize legacy providers before import so old installations
+            # receive the retirement diagnostic without executing their code.
             if kind == "standalone" and "kind" not in data:
                 init_file = plugin_dir / "__init__.py"
                 if init_file.exists():

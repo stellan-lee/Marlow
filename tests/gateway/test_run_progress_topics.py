@@ -615,17 +615,6 @@ class QueuedCommentaryAgent:
         }
 
 
-class BackgroundReviewAgent:
-    def __init__(self, **kwargs):
-        self.background_review_callback = kwargs.get("background_review_callback")
-        self.tools = []
-
-    def run_conversation(self, message, conversation_history=None, task_id=None):
-        if self.background_review_callback:
-            self.background_review_callback("💾 Skill 'prospect-scanner' created.")
-        return {"final_response": "done", "messages": [], "api_calls": 1}
-
-
 class VerboseAgent:
     """Agent that emits a tool call with args whose JSON exceeds 200 chars."""
 
@@ -973,21 +962,6 @@ async def test_run_agent_queued_message_does_not_treat_commentary_as_final(
 
 
 @pytest.mark.asyncio
-async def test_run_agent_defers_background_review_notification_until_release(
-    monkeypatch, tmp_path
-):
-    adapter, result = await _run_with_agent(
-        monkeypatch,
-        tmp_path,
-        BackgroundReviewAgent,
-        session_id="sess-bg-review-order",
-        config_data={"display": {"interim_assistant_messages": True}},
-    )
-    assert result["final_response"] == "done"
-    assert adapter.sent == []
-
-
-@pytest.mark.asyncio
 async def test_base_processing_releases_post_delivery_callback_after_main_send():
     """Post-delivery callbacks on the adapter fire after the main response."""
     adapter = ProgressCaptureAdapter()
@@ -1001,8 +975,8 @@ async def test_base_processing_releases_post_delivery_callback_after_main_send()
     def _post_delivery_cb():
         released.append(True)
         adapter.sent.append({
-            "chat_id": "bg-review",
-            "content": "💾 Skill 'prospect-scanner' created.",
+            "chat_id": "cleanup",
+            "content": "Response cleanup finished.",
             "reply_to": None,
             "metadata": None,
         })
@@ -1021,7 +995,7 @@ async def test_base_processing_releases_post_delivery_callback_after_main_send()
     adapter._post_delivery_callbacks[session_key] = _post_delivery_cb
     await adapter._process_message_background(event, session_key)
     sent_texts = [call["content"] for call in adapter.sent]
-    assert sent_texts == ["done", "💾 Skill 'prospect-scanner' created."]
+    assert sent_texts == ["done", "Response cleanup finished."]
     assert released == [True]
 
 

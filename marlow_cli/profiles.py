@@ -36,7 +36,6 @@ _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 # Directories bootstrapped inside every new profile
 _PROFILE_DIRS = [
-    "memories",
     "sessions",
     "skills",
     "logs",
@@ -55,14 +54,6 @@ _CLONE_CONFIG_FILES = [
     "config.yaml",
     ".env",
     "SOUL.md",
-]
-
-# Subdirectory files copied during --clone (path relative to profile root).
-# Memory files are part of the agent's curated identity — just as important
-# as SOUL.md for continuity when cloning a profile.
-_CLONE_SUBDIR_FILES = [
-    "memories/MEMORY.md",
-    "memories/USER.md",
 ]
 
 # Runtime files stripped after --clone-all (shouldn't carry over).
@@ -183,7 +174,7 @@ _MARLOW_SUBCOMMANDS = frozenset({
     "chat", "model", "gateway", "setup", "login", "logout",
     "status", "cron", "doctor", "dump", "config", "pairing", "skills", "tools",
     "mcp", "sessions", "insights", "version", "update", "uninstall",
-    "profile", "plugins", "honcho",
+    "profile", "plugins", "memory",
 })
 
 
@@ -722,14 +713,6 @@ def create_profile(
             source_skills = source_dir / "skills"
             if source_skills.is_dir():
                 shutil.copytree(source_skills, profile_dir / "skills", dirs_exist_ok=True)
-
-            # Clone memory and other subdirectory files
-            for relpath in _CLONE_SUBDIR_FILES:
-                src = source_dir / relpath
-                if src.exists():
-                    dst = profile_dir / relpath
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src, dst)
 
     # Seed a default SOUL.md so the user has a file to customize immediately.
     # Skipped when the profile already has one (from --clone / --clone-all).
@@ -1365,64 +1348,6 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
 # Rename
 # ---------------------------------------------------------------------------
 
-def _migrate_honcho_profile_host(old_name: str, new_name: str, new_dir: Path) -> None:
-    """Rename Honcho host blocks for a renamed profile without changing peers."""
-    old_host = f"marlow_{old_name}"
-    legacy_old_host = f"marlow.{old_name}"
-    new_host = f"marlow_{new_name}"
-
-    candidates = [
-        new_dir / "honcho.json",
-        _get_default_marlow_home() / "honcho.json",
-        Path.home() / ".honcho" / "config.json",
-    ]
-
-    seen: set[Path] = set()
-    for path in candidates:
-        try:
-            resolved = path.resolve()
-        except OSError:
-            resolved = path
-        if resolved in seen or not path.is_file():
-            continue
-        seen.add(resolved)
-
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-
-        hosts = raw.get("hosts")
-        if not isinstance(hosts, dict):
-            continue
-        source_host = old_host if old_host in hosts else legacy_old_host
-        if source_host not in hosts:
-            continue
-
-        if new_host in hosts:
-            print(f"⚠ Honcho host block not migrated: {new_host} already exists in {path}")
-            continue
-
-        block = hosts[source_host]
-        if isinstance(block, dict) and "aiPeer" not in block:
-            if source_host.startswith("marlow_"):
-                bare = source_host.split("_", 1)[1]
-            else:
-                bare = source_host.split(".", 1)[1] if "." in source_host else source_host
-            block["aiPeer"] = bare
-        hosts[new_host] = hosts.pop(source_host)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        try:
-            tmp.write_text(json.dumps(raw, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-            tmp.replace(path)
-        except OSError:
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
-            continue
-
-        print(f"✓ Honcho host updated: {source_host} → {new_host}")
 
 
 def rename_profile(old_name: str, new_name: str) -> Path:
@@ -1456,9 +1381,6 @@ def rename_profile(old_name: str, new_name: str) -> Path:
     # 2. Rename directory
     old_dir.rename(new_dir)
     print(f"✓ Renamed {old_dir.name} → {new_dir.name}")
-
-    # 3. Update profile-scoped Honcho host blocks, preserving aiPeer identity
-    _migrate_honcho_profile_host(old_canon, new_canon, new_dir)
 
     # 4. Update wrapper script
     remove_wrapper_script(old_canon)
