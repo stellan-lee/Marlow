@@ -40,7 +40,10 @@ def show_status(args) -> None:
     except Exception:
         config = {}
 
-    model, provider, base_url = _configured_model(config)
+    try:
+        model, provider, base_url = _configured_model(config)
+    except Exception:
+        model, provider, base_url = "", "", ""
     try:
         from marlow_cli.auth import get_codex_auth_status
 
@@ -66,10 +69,16 @@ def show_status(args) -> None:
     print(f"  Model:        {model or '(not set)'}")
     if base_url:
         print(f"  Endpoint:     {base_url}")
-    print(
-        f"  Codex OAuth:  {check_mark(bool(codex.get('logged_in')))} "
-        f"{'logged in' if codex.get('logged_in') else 'not logged in'}"
-    )
+    if codex.get("version"):
+        print(f"  Codex CLI:    {codex['version']}")
+    status = codex.get("status")
+    if status in {"codex_missing", "incompatible"}:
+        print(f"  Codex runtime: {check_mark(False)} {status}")
+    else:
+        print(
+            f"  Codex OAuth:  {check_mark(bool(codex.get('logged_in')))} "
+            f"{'logged in' if codex.get('logged_in') else 'not logged in'}"
+        )
     if codex.get("auth_store"):
         print(f"    Auth store: {codex['auth_store']}")
     if codex.get("error") and not codex.get("logged_in"):

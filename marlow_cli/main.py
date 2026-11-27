@@ -877,7 +877,7 @@ def _print_version_info(*, check_updates: bool = True) -> None:
     # Show Python version
     print(f"Python: {sys.version.split()[0]}")
 
-    print("Agent runtime: Codex app-server (supported CLI: 0.159.2)")
+    print("Agent runtime: Codex app-server (compatibility checked at startup)")
 
     if not check_updates:
         return

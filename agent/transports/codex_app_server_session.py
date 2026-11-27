@@ -25,6 +25,7 @@ call is synchronous; Codex owns its reasoning and tool loop.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 import threading
 import time
 from dataclasses import dataclass, field
@@ -45,6 +46,97 @@ logger = logging.getLogger(__name__)
 # wedge watchdog, etc.). Small enough to keep error messages legible, large
 # enough to surface a config/provider/auth diagnostic.
 _STDERR_TAIL_LINES = 12
+
+
+def validate_codex_runtime(client, environment, *, cwd, bridge_enabled=False) -> dict:
+    """Verify the app-server contract before authentication or starting a thread."""
+    stage = "initialize"
+    try:
+        initialized = client.initialize(
+            client_name="marlow",
+            client_title="Marlow Agent",
+            client_version=_get_marlow_version(),
+            capabilities={"experimentalApi": True},
+        )
+        if (
+            not isinstance(initialized, dict)
+            or not isinstance(initialized.get("codexHome"), str)
+            or Path(initialized["codexHome"]).resolve() != environment.codex_home.resolve()
+        ):
+            raise ValueError("Codex did not confirm the managed state home")
+
+        stage = "config/read"
+        effective = client.request(
+            "config/read", {"includeLayers": True, "cwd": str(cwd)}, timeout=10
+        )
+        if not isinstance(effective, dict) or not isinstance(effective.get("config"), dict):
+            raise ValueError("Missing effective runtime configuration")
+        config = effective["config"]
+        overrides = getattr(client, "configuration_overrides", environment.overrides())
+        required = {
+            "allow_login_shell": False,
+            "allow_symlinked_codex_home": False,
+            "cli_auth_credentials_store": "file",
+            "mcp_oauth_credentials_store": "file",
+            "project_doc_max_bytes": 0,
+            "default_permissions": "marlow",
+            "approval_policy": "on-request",
+            "approvals_reviewer": "user",
+            "web_search": "disabled",
+            "shell_environment_policy.inherit": "none",
+            "shell_environment_policy.experimental_use_profile": False,
+            "shell_environment_policy.set": overrides["shell_environment_policy"]["set"],
+            "permissions.marlow.network.enabled": environment.execution_network,
+            "skills.bundled.enabled": False,
+            "skills.include_instructions": False,
+        }
+        required.update({key: value for key, value in overrides.items() if key.startswith("features.")})
+        for key, expected in required.items():
+            actual = config
+            for part in key.split("."):
+                actual = actual.get(part) if isinstance(actual, dict) else None
+            if type(actual) is not type(expected) or actual != expected:
+                raise ValueError("Enforced runtime setting was not confirmed: " + key)
+
+        permissions = (config.get("permissions") or {}).get("marlow") or {}
+        filesystem = permissions.get("filesystem") or {}
+        actual_filesystem = {key: value for key, value in filesystem.items() if value is not None}
+        if actual_filesystem != overrides["permissions"]["marlow"]["filesystem"]:
+            raise ValueError("Enforced filesystem permissions were not confirmed")
+        if permissions.get("extends") or permissions.get("workspace_roots"):
+            raise ValueError("Unexpected inherited permissions or workspace roots")
+        for field in ("hooks", "notify"):
+            if config.get(field):
+                raise ValueError("System/managed configuration enables an executable source: " + field)
+        servers = config.get("mcp_servers") or {}
+        if not isinstance(servers, dict) or set(servers) - ({"marlow-tools"} if bridge_enabled else set()):
+            raise ValueError("System/managed configuration enables unapproved MCP servers")
+
+        stage = "skills/list"
+        discovered = client.request(
+            "skills/list", {"cwds": [str(cwd)], "forceReload": True}, timeout=10
+        )
+        entries = discovered.get("data") if isinstance(discovered, dict) else None
+        if (
+            not isinstance(entries, list)
+            or len(entries) != 1
+            or not isinstance(entries[0], dict)
+            or entries[0].get("cwd") != str(cwd)
+        ):
+            raise ValueError("Missing native skill discovery result for the managed workspace")
+        if entries[0].get("skills") != [] or entries[0].get("errors") != []:
+            raise ValueError("Unapproved native skills or discovery errors detected")
+        return effective
+    except Exception as exc:
+        version = getattr(client, "version", "unknown")
+        detail = str(exc)
+        if stage == "initialize":
+            diagnostic = "\n".join(client.stderr_tail(_STDERR_TAIL_LINES))
+            if diagnostic:
+                detail += "\n" + diagnostic
+        raise ValueError(environment.redact(
+            f"Codex {version} compatibility check failed during {stage}: {detail}"
+        )) from None
 
 
 @dataclass
@@ -228,82 +320,13 @@ class CodexAppServerSession:
                 environment=self.environment,
                 mcp_servers=self._bridge.config() if self._bridge else None,
             )
-        initialized = self._client.initialize(
-            client_name="marlow",
-            client_title="Marlow Agent",
-            client_version=_get_marlow_version(),
-            capabilities={"experimentalApi": True},
-        )
-        if (
-            initialized.get("codexHome")
-            and __import__("pathlib").Path(initialized["codexHome"]).resolve()
-            != self.environment.codex_home.resolve()
-        ):
-            raise ValueError("Codex initialized with a different state home")
-        effective = self._client.request(
-            "config/read", {"includeLayers": True, "cwd": self._cwd}, timeout=10
+        effective = validate_codex_runtime(
+            self._client, self.environment, cwd=self._cwd, bridge_enabled=bool(self._bridge)
         )
         self.configuration_layers = [
             layer.get("name") for layer in effective.get("layers", [])
         ]
-        config = effective.get("config") or {}
-        expected = {
-            "allow_login_shell": False,
-            "cli_auth_credentials_store": "file",
-            "mcp_oauth_credentials_store": "file",
-            "project_doc_max_bytes": 0,
-        }
-        for key, value in expected.items():
-            if config.get(key) != value:
-                raise ValueError(
-                    "System/managed configuration conflicts with enforced runtime setting: "
-                    + key
-                )
-        shell = config.get("shell_environment_policy") or {}
-        if shell.get("inherit") != "none":
-            raise ValueError("Shell environment inheritance could not be disabled")
-        discovered = self._client.request(
-            "skills/list", {"cwds": [self._cwd], "forceReload": True}, timeout=10
-        )
-        if any(
-            item.get("skills") or item.get("errors")
-            for item in discovered.get("data", [])
-        ):
-            raise ValueError(
-                "Unapproved native skills or discovery errors detected; use Marlow explicit skill sources"
-            )
-        # Fail if unmanaged executable sources survived the enforced overrides.
-        for field in ("hooks", "notify"):
-            if config.get(field):
-                raise ValueError(
-                    "System/managed configuration enables an unsupported executable source: "
-                    + field
-                )
-        if (
-            config.get("plugins")
-            and (config.get("features") or {}).get("plugins") is not False
-        ):
-            raise ValueError(
-                "System/managed plugins cannot be disabled on this Codex version"
-            )
-        features = config.get("features") or {}
-        for key, enforced in self.environment.overrides().items():
-            if key.startswith("features.") and (
-                enforced is False or enforced == {"enabled": False}
-            ):
-                actual = features.get(key.removeprefix("features."))
-                if actual is True or (
-                    isinstance(actual, dict) and actual.get("enabled") is True
-                ):
-                    raise ValueError(
-                        "System/managed configuration enables a forbidden capability: "
-                        + key
-                    )
-        servers = config.get("mcp_servers") or {}
-        if set(servers) - ({"marlow-tools"} if self._bridge else set()):
-            raise ValueError(
-                "System/managed configuration enables unapproved MCP servers"
-            )
+        config = effective["config"]
         self.effective_provider = config.get("model_provider")
         providers = config.get("model_providers") or {}
         actual_provider = providers.get(self.effective_provider) or {}

@@ -524,14 +524,20 @@ def run_doctor(args):
     try:
         from marlow_cli.auth import get_codex_auth_status
         codex_status = get_codex_auth_status()
+        if codex_status.get("version"):
+            check_info(f"Codex CLI {codex_status['version']}")
         if codex_status.get("logged_in"):
             check_ok("OpenAI Codex auth", "(logged in)")
+        elif codex_status.get("status") in {"codex_missing", "incompatible"}:
+            check_fail("Codex runtime", f"({codex_status['status']})")
+            if codex_status.get("error"):
+                check_info(codex_status["error"])
+            issues.append("Resolve the Codex runtime error reported above")
         else:
             check_warn("OpenAI Codex auth", "(not logged in)")
             if codex_status.get("error"):
                 check_info(codex_status["error"])
-            if not _safe_which("codex"):
-                check_info("codex CLI not installed (optional; only needed to import an existing login)")
+            check_info("Run 'marlow login' for this profile")
     except Exception as exc:
         check_warn("OpenAI Codex auth", f"(could not check: {exc})")
 

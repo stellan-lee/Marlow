@@ -11,10 +11,11 @@ metadata:
 
 This skill is for developers working in the Marlow source checkout.
 
-Marlow Agent is an open-source AI agent framework that runs in your terminal and messaging platforms. It provides autonomous coding and task execution through tool calling, using the sole managed Codex app-server adapter on Linux and macOS. The current supported CLI version is 0.159.2.
+Marlow Agent is an open-source AI agent framework that runs in your terminal and messaging platforms. It provides autonomous coding and task execution through tool calling, using a compatible managed Codex app-server on Linux and macOS.
 
-Runtime implementation and limits: see `docs/architecture/phase-2-codex-runtime.md`
-and `docs/architecture/phase-2-validation.md`. Marlow owns business authorization,
+Runtime compatibility and validation are described in
+`docs/architecture/codex-runtime-compatibility.md` and
+`docs/architecture/phase-2-validation.md`. Marlow owns business authorization,
 identity, memory access and history. Codex owns file-based memory, reasoning, model retries and compaction.
 Do not add auxiliary clients, provider fallback or a second tool reasoning loop.
 

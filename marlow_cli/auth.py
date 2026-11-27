@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 from typing import Any
-import shutil
 import subprocess
-from agent.codex_environment import CodexEnvironment
+from agent.codex_environment import CodexEnvironment, resolve_codex_binary
 
 
 class AuthError(RuntimeError):
@@ -57,19 +56,21 @@ def _run_auth(command):
     e = environment()
     from marlow_cli.config import load_config
 
-    binary = ((load_config().get("runtime") or {}).get("codex") or {}).get(
-        "binary"
-    ) or shutil.which("codex")
-    if not binary:
-        raise AuthError("Install Codex CLI 0.159.2 before login", code="codex_missing")
+    try:
+        binary = resolve_codex_binary((load_config().get("runtime") or {}).get("codex") or {})
+    except FileNotFoundError as exc:
+        raise AuthError(str(exc), code="codex_missing") from exc
     from agent.transports.codex_app_server import check_codex_binary
 
     ok, message = check_codex_binary(binary, environment=e.env)
     if not ok:
-        raise AuthError(message, code="unsupported_codex")
-    return subprocess.run(
-        [binary, *e.arguments(), *command], env=e.env, cwd=e.workspace, check=False
-    ).returncode
+        raise AuthError(e.redact(message), code="invalid_codex")
+    try:
+        return subprocess.run(
+            [binary, *e.arguments(), *command], env=e.env, cwd=e.workspace, check=False
+        ).returncode
+    except OSError as exc:
+        raise AuthError(e.redact(str(exc)), code="invalid_codex") from exc
 
 
 def login_command(args):
@@ -87,23 +88,40 @@ def logout_command(args):
 
 def get_codex_auth_status():
     from agent.transports.codex_app_server import CodexAppServerClient
-
-    e = environment()
+    from agent.transports.codex_app_server_session import validate_codex_runtime
+    from agent.redact import redact_sensitive_text
     from marlow_cli.config import load_config
 
-    binary = ((load_config().get("runtime") or {}).get("codex") or {}).get(
-        "binary"
-    ) or shutil.which("codex")
-    if not binary:
-        return {"logged_in": False, "status": "codex_missing"}
+    e = None
+    version = None
     try:
+        settings = (load_config().get("runtime") or {}).get("codex") or {}
+        try:
+            binary = resolve_codex_binary(settings)
+        except FileNotFoundError as exc:
+            return {
+                "logged_in": False, "status": "codex_missing",
+                "error": redact_sensitive_text(str(exc), force=True),
+            }
+        e = environment()
         with CodexAppServerClient(codex_bin=binary, environment=e) as client:
-            client.initialize()
+            version = client.version
+            validate_codex_runtime(client, e, cwd=str(e.workspace))
             result = client.request("account/read", {"refreshToken": False}, timeout=10)
         ready = bool(result.get("account")) or result.get("requiresOpenaiAuth") is False
-        return {"logged_in": ready, "status": "ready" if ready else "auth_required"}
-    except Exception:
-        return {"logged_in": False, "status": "unavailable"}
+        return {
+            "logged_in": ready,
+            "status": "ready" if ready else "auth_required",
+            "version": version,
+        }
+    except Exception as exc:
+        message = e.redact(str(exc)) if e is not None else redact_sensitive_text(str(exc), force=True)
+        return {
+            "logged_in": False,
+            "status": "incompatible",
+            "version": version,
+            "error": message,
+        }
 
 
 def get_auth_status(provider_id=None):

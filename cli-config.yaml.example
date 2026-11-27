@@ -1,7 +1,7 @@
 # Copy to ~/.marlow/config.yaml (or the selected Marlow profile).
 # Model/provider configuration is native Codex TOML in:
 #   <profile>/runtime/codex/config.toml
-# Install Codex 0.159.2 and run `marlow login` for independent profile auth.
+# Install a compatible Codex CLI and run `marlow login` for profile authentication.
 runtime:
   codex:
     binary: ""                 # absolute path, or discover codex on host PATH

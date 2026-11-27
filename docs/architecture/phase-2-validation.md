@@ -2,6 +2,7 @@
 
 > 本文保留 Phase 2 的历史验证结果。当前的 Markdown 记忆架构和迁移步骤见
 > [Memory](../../README.md#memory)。
+> Codex CLI 的当前接入要求见 [兼容性设计](codex-runtime-compatibility.md)。
 
 ## 基线与交付状态
 

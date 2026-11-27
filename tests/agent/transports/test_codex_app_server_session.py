@@ -8,12 +8,14 @@ deadline timeouts. These tests pin all of that without spawning real codex.
 from __future__ import annotations
 
 import time
+import tomllib
 from unittest.mock import patch
 from typing import Any, Optional
 
 import pytest
 
 import agent.transports.codex_app_server_session as session_mod
+from agent.codex_environment import _toml
 from agent.transports.codex_app_server_session import (
     CodexAppServerSession,
     _approval_choice_to_codex_decision,
@@ -28,6 +30,7 @@ class FakeClient:
     def __init__(self, *, codex_bin: str = "codex", codex_home=None, environment=None, mcp_servers=None) -> None:
         self.codex_bin = codex_bin
         self.codex_home = codex_home
+        self.version = "0.172.0"
         self.requests: list[tuple[str, dict]] = []
         self.notifications_responses: list[dict] = []
         self.responses: list[tuple[Any, dict]] = []
@@ -41,17 +44,19 @@ class FakeClient:
     # API matching CodexAppServerClient
     def initialize(self, **kwargs):
         self._initialized = True
-        return {"userAgent": "fake/0.0.0", "codexHome": str(__import__("agent.codex_environment", fromlist=["CodexEnvironment"]).CodexEnvironment.build().codex_home),
+        return {"userAgent": "fake/0.0.0", "codexHome": str(self.environment.codex_home),
                 "platformOs": "linux", "platformFamily": "unix"}
 
     def request(self, method: str, params: Optional[dict] = None, timeout: float = 30.0):
         self.requests.append((method, params or {}))
         if method == 'config/read':
-            return {'config': {'allow_login_shell':False,'cli_auth_credentials_store':'file','mcp_oauth_credentials_store':'file','project_doc_max_bytes':0,'shell_environment_policy':{'inherit':'none'}}}
+            return {"config": tomllib.loads("\n".join(
+                f"{key}={_toml(value)}" for key, value in self.environment.overrides().items()
+            ))}
         if method == 'account/read':
             return {'requiresOpenaiAuth':False}
         if method == 'skills/list':
-            return {'data':[]}
+            return {"data": [{"cwd": cwd, "skills": [], "errors": []} for cwd in params["cwds"]]}
         if self._request_handler is not None:
             return self._request_handler(method, params or {})
         # Sensible defaults for protocol methods used by the session
@@ -111,10 +116,12 @@ class FakeClient:
 
 
 def make_session(client: FakeClient, **kwargs) -> CodexAppServerSession:
-    return CodexAppServerSession(
+    session = CodexAppServerSession(
         client_factory=lambda **kw: client,
         **kwargs,
     )
+    client.environment = session.environment
+    return session
 
 
 # ---- choice mapping ----
@@ -143,6 +150,24 @@ class TestTurnInputCoercion:
 # ---- lifecycle ----
 
 class TestLifecycle:
+    @pytest.mark.parametrize("rows", [[], [{"cwd": "/other/workspace", "skills": [], "errors": []}]])
+    def test_missing_workspace_skill_discovery_blocks_thread_start(self, rows):
+        client = FakeClient()
+        session = make_session(client)
+        original_request = client.request
+
+        def request(method, params=None, timeout=30.0):
+            if method == "skills/list":
+                return {"data": rows}
+            return original_request(method, params, timeout)
+
+        with patch.object(client, "request", side_effect=request), pytest.raises(
+            ValueError, match=r"0\.172\.0.*skills/list.*managed workspace",
+        ):
+            session.ensure_started()
+        assert [method for method, _ in client.requests] == ["config/read"]
+        session.close()
+
     def test_ensure_started_is_idempotent(self):
         client = FakeClient()
         s = make_session(client)
