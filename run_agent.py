@@ -8,7 +8,6 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-import shutil
 import threading
 import time
 import uuid
@@ -18,7 +17,7 @@ from agent.codex_environment import (
     CodexEnvironment,
     CodexConfigurationError,
     CodexAuthenticationError,
-    SUPPORTED_CODEX_VERSION,
+    resolve_codex_binary,
 )
 from agent.codex_state import RuntimeState
 from agent.history_privacy import StreamingContextScrubber, sanitize_context
@@ -609,17 +608,9 @@ class AIAgent:
 
     def _new_session(self, thread_id):
         from agent.codex_bridge import BusinessBridge
-        from agent.transports.codex_app_server import check_codex_binary
         from agent.transports.codex_app_server_session import CodexAppServerSession
 
-        binary = self.runtime_config.get("binary") or shutil.which("codex")
-        if not binary:
-            raise RuntimeError("Codex CLI required; install supported Codex 0.159.2")
-        ok, version = check_codex_binary(binary)
-        if not ok or version != ".".join(map(str, SUPPORTED_CODEX_VERSION)):
-            raise RuntimeError(
-                "Unsupported Codex CLI; this release supports 0.159.2 only"
-            )
+        binary = resolve_codex_binary(self.runtime_config)
         self._bridge = BusinessBridge(self)
         from tools.terminal_tool import _get_approval_callback
 

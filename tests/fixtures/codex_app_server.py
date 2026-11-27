@@ -5,12 +5,20 @@ import json
 import os
 from pathlib import Path
 import sys
+import tomllib
 import uuid
 
+VERSION = "0.159.2"
+CONFIG_OVERRIDES = {}
+
 if "--version" in sys.argv:
-    print("codex-cli 0.159.2")
+    print(f"codex-cli {VERSION}")
     raise SystemExit(0)
 
+config = tomllib.loads(
+    "\n".join(value for flag, value in zip(sys.argv, sys.argv[1:]) if flag == "-c")
+)
+config.update(CONFIG_OVERRIDES)
 root = Path(os.environ["CODEX_HOME"])
 record = root / "fixture-events.jsonl"
 thread_id = None
@@ -45,16 +53,9 @@ for line in sys.stdin:
     if method == "initialize":
         result = {"codexHome": str(root), "userAgent": "fixture"}
     elif method == "config/read":
-        result = {
-            "config": {
-                "allow_login_shell": False,
-                "cli_auth_credentials_store": "file",
-                "mcp_oauth_credentials_store": "file",
-                "project_doc_max_bytes": 0,
-                "shell_environment_policy": {"inherit": "none"},
-            },
-            "layers": [],
-        }
+        result = {"config": config, "layers": []}
+    elif method == "skills/list":
+        result = {"data": [{"cwd": cwd, "skills": [], "errors": []} for cwd in params["cwds"]]}
     elif method == "account/read":
         result = {"requiresOpenaiAuth": False, "account": None}
     elif method in {"thread/start", "thread/resume"}:

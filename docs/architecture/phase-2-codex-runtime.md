@@ -3,6 +3,8 @@
 > The memory sections record the Phase 2 implementation. See
 > [Memory](../../README.md#memory) for the current agent-managed Markdown
 > architecture and migration procedure.
+> See [Codex CLI compatibility](codex-runtime-compatibility.md) for the
+> current binary selection and startup checks.
 
 ## 1. Background and context
 

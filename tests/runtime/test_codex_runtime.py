@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -21,11 +22,20 @@ from agent.transports.codex_app_server_session import (
 
 
 @pytest.fixture
-def profile(tmp_path, monkeypatch):
+def profile(tmp_path, monkeypatch, request):
     root = tmp_path / "profile"
     root.mkdir()
     fake = tmp_path / "fixture-codex"
-    shutil.copy(Path(__file__).parents[1] / "fixtures" / "codex_app_server.py", fake)
+    source = (Path(__file__).parents[1] / "fixtures" / "codex_app_server.py").read_text(
+        encoding="utf-8"
+    )
+    version = getattr(request, "param", "0.159.2")
+    fake.write_text(
+        source.replace("#!/usr/bin/python3", f"#!{sys.executable}", 1).replace(
+            'VERSION = "0.159.2"', f'VERSION = "{version}"'
+        ),
+        encoding="utf-8",
+    )
     fake.chmod(0o700)
     (root / "config.yaml").write_text(
         "runtime:\n  codex:\n    binary: " + str(fake) + "\n    turn_timeout: 1\n",
@@ -105,6 +115,7 @@ def test_named_profile_cannot_grant_other_profiles_memory_as_project(tmp_path, t
         )
 
 
+@pytest.mark.parametrize("profile", ["0.159.2", "0.172.0"], indirect=True)
 def test_protocol_turn_usage_raw_history_and_restart(profile, monkeypatch):
     monkeypatch.setenv("PERSONAL_MARKER", "must-not-inherit")
     agent = new_agent(session_id="stable")
@@ -131,6 +142,27 @@ def test_protocol_turn_usage_raw_history_and_restart(profile, monkeypatch):
             ("completed",),
             ("completed",),
         ]
+
+
+@pytest.mark.parametrize("profile", ["0.172.0"], indirect=True)
+def test_incompatible_codex_config_blocks_conversation(profile):
+    binary = profile.parent / "fixture-codex"
+    binary.write_text(
+        binary.read_text(encoding="utf-8").replace(
+            "CONFIG_OVERRIDES = {}", 'CONFIG_OVERRIDES = {"allow_login_shell": True}'
+        ),
+        encoding="utf-8",
+    )
+    agent = new_agent()
+    try:
+        result = agent.run_conversation("test an incompatible runtime configuration")
+    finally:
+        agent.close()
+
+    assert not result["completed"]
+    assert "0.172.0" in result["error"]
+    assert "allow_login_shell" in result["error"]
+    assert {record["method"] for record in events(profile)} == {"initialize", "config/read"}
 
 
 @pytest.mark.parametrize("prompt", ["EXIT_FIXTURE", "HANG_FIXTURE"])
@@ -407,15 +439,28 @@ def test_native_command_is_approved_before_rpc_and_noninteractive_denies(
     agent.close()
 
 
-def test_actual_tool_subprocess_home_project_symlink_and_scope_denials(tmp_path):
+@pytest.fixture
+def sandbox_private_root(tmp_path):
+    if sys.platform == "darwin":
+        # Codex's macOS process sandbox grants OS scratch access. Put the
+        # synthetic private and read-only files outside that shared area.
+        with tempfile.TemporaryDirectory(prefix=".marlow-sandbox-test-", dir=Path.home()) as path:
+            yield Path(path).resolve()
+    else:
+        yield tmp_path
+
+
+def test_actual_tool_subprocess_home_project_symlink_and_scope_denials(
+    tmp_path, sandbox_private_root,
+):
     binary = shutil.which("codex")
     if binary is None:
         pytest.skip("Codex CLI unavailable")
-    personal = tmp_path / "personal"
+    personal = sandbox_private_root / "personal"
     personal.mkdir()
     marker = personal / "secret-marker"
     marker.write_text("PERSONAL_PRIVATE_FILE")
-    project = tmp_path / "authorized"
+    project = sandbox_private_root / "authorized"
     project.mkdir()
     (project / "readable").write_text("AUTHORIZED_PROJECT_CONTROL")
     e = CodexEnvironment.build(

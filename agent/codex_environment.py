@@ -17,7 +17,6 @@ from typing import Mapping
 
 from marlow_constants import get_marlow_home
 
-SUPPORTED_CODEX_VERSION = (0, 159, 2)
 # Codex owns inference configuration; executable extensions and permission
 # configuration are host policy, never accepted from model configuration.
 MODEL_KEYS = frozenset({
@@ -59,6 +58,19 @@ class CodexConfigurationError(ValueError):
 
 class CodexAuthenticationError(PermissionError):
     pass
+
+
+def resolve_codex_binary(settings: Mapping | None = None) -> str:
+    """Select the profile's executable before entering its restricted PATH."""
+    configured = (settings or {}).get("binary")
+    binary = shutil.which(configured or "codex")
+    if binary is None:
+        target = configured or "codex on PATH"
+        raise FileNotFoundError(
+            f"Codex CLI executable not found: {target}. Install Codex CLI or set "
+            "runtime.codex.binary to an executable path."
+        )
+    return os.path.abspath(binary)
 
 
 def _private_directory(path: Path) -> Path:

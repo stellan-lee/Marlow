@@ -24,10 +24,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-# Default minimum codex version we test against. The PR sets this from the
-# `codex --version` parsed at install time; bumping is a one-line change here.
-MIN_CODEX_VERSION = (0, 159, 2)
-
 
 @dataclass
 class CodexAppServerError(RuntimeError):
@@ -73,15 +69,17 @@ class CodexAppServerClient:
         env: Optional[dict[str, str]] = None,
         environment=None,
     ) -> None:
-        self._codex_bin = codex_bin
-        from agent.codex_environment import CodexEnvironment
+        from agent.codex_environment import CodexEnvironment, resolve_codex_binary
 
         if env is not None or codex_home is not None:
             raise ValueError("Use a managed CodexEnvironment, not raw env/CODEX_HOME")
+        codex_bin = resolve_codex_binary({"binary": codex_bin})
+        self._codex_bin = codex_bin
         self.environment = environment or CodexEnvironment.build()
         ok, message = check_codex_binary(codex_bin, environment=self.environment.env)
         if not ok:
-            raise ValueError(message)
+            raise ValueError(self.environment.redact(message))
+        self.version = message
         spawn_env = dict(self.environment.env)
         cmd = [codex_bin, "app-server", "--stdio", "--strict-config"]
         import shutil
@@ -102,17 +100,23 @@ class CodexAppServerClient:
             if set(mcp_servers) != {"marlow-tools"}:
                 raise ValueError("Only the host-scoped Marlow bridge may be configured")
             cmd += ["-c", "mcp_servers=" + _toml(mcp_servers)]
+        self.configuration_overrides = overrides
 
-        self._proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-            env=spawn_env,
-            cwd=str(self.environment.workspace),
-            start_new_session=True,
-        )
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+                env=spawn_env,
+                cwd=str(self.environment.workspace),
+                start_new_session=True,
+            )
+        except OSError as exc:
+            raise RuntimeError(self.environment.redact(
+                f"Codex {self.version} failed during app-server startup: {exc}"
+            )) from None
         self._next_id = 1
         self._id_lock = threading.Lock()
         self._pending: dict[int, _Pending] = {}
@@ -213,7 +217,7 @@ class CodexAppServerClient:
             with self._pending_lock:
                 self._pending.pop(rid, None)
             raise TimeoutError(
-                f"codex app-server method {method!r} timed out after {timeout}s"
+                f"Codex {self.version} app-server method {method!r} timed out after {timeout}s"
             )
         finally:
             with self._pending_lock:
@@ -222,7 +226,9 @@ class CodexAppServerClient:
             err = msg["error"]
             raise CodexAppServerError(
                 code=err.get("code", -1),
-                message=err.get("message", ""),
+                message=self.environment.redact(
+                    f"Codex {self.version} failed during {method}: {err.get('message', '')}"
+                ),
                 data=err.get("data"),
             )
         return msg.get("result", {})
@@ -392,13 +398,16 @@ def parse_codex_version(output: str) -> Optional[tuple[int, int, int]]:
 
 def check_codex_binary(
     codex_bin: str = "codex",
-    min_version: tuple[int, int, int] = MIN_CODEX_VERSION,
     *,
     environment=None,
 ) -> tuple[bool, str]:
-    """Verify codex CLI is installed and meets minimum version.
+    """Check executable availability and report its version for diagnostics.
 
-    Returns (ok, message). Used by setup wizard and runtime startup."""
+    Runtime configuration and protocol checks establish compatibility.
+    Returns (ok, version or error). Used by login and runtime startup.
+    """
+    from agent.redact import redact_sensitive_text
+
     try:
         proc = subprocess.run(
             [codex_bin, "--version"],
@@ -414,14 +423,18 @@ def check_codex_binary(
         )
     except subprocess.TimeoutExpired:
         return False, "codex --version timed out"
+    except OSError as exc:
+        return False, redact_sensitive_text(f"Cannot execute Codex CLI: {exc}", force=True)
     if proc.returncode != 0:
-        return False, f"codex --version exited {proc.returncode}: {proc.stderr.strip()}"
+        return False, redact_sensitive_text(
+            f"codex --version exited {proc.returncode}: {proc.stderr.strip()}", force=True
+        )
     version = parse_codex_version(proc.stdout)
     if version is None:
-        return False, f"could not parse codex version from: {proc.stdout!r}"
-    if version != MIN_CODEX_VERSION:
-        return False, (
-            f"Unsupported Codex {'.'.join(map(str, version))}; this release supports "
-            "0.159.2 only. Install: npm i -g @openai/codex@0.159.2"
+        return False, redact_sensitive_text(
+            f"could not parse codex version from: {proc.stdout!r}", force=True
         )
-    return True, ".".join(map(str, version))
+    import re
+
+    detected = re.search(r"\d+\.\d+\.\d+(?:[-+][\w.-]+)?", proc.stdout)
+    return True, detected.group(0)

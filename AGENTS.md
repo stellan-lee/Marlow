@@ -57,7 +57,9 @@ Browse with `marlow logs [--follow] [--level ...] [--session ...]`.
 
 ## Codex-only execution
 
-Codex CLI 0.159.2 is the only supported inference runtime. Read
+Codex app-server is the sole inference runtime. Validate CLI compatibility
+through the runtime contract in
+`docs/architecture/codex-runtime-compatibility.md`. Read
 `docs/architecture/phase-2-codex-runtime.md` and
 `docs/architecture/phase-2-validation.md` for configuration, migration and
 validation evidence. Never reintroduce an inference client, provider router,

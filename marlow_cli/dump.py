@@ -242,7 +242,7 @@ def run_dump(args):
     lines.append(f"version:          {ver_str}")
     lines.append(f"os:               {os_info}")
     lines.append(f"python:           {sys.version.split()[0]}")
-    lines.append("runtime:          Codex app-server 0.159.2")
+    lines.append("runtime:          Codex app-server (compatibility checked at startup)")
     lines.append(f"profile:          {profile}")
     lines.append(f"marlow_home:      {display_marlow_home()}")
     lines.append(f"model:            {model}")

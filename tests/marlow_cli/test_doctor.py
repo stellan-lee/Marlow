@@ -238,13 +238,9 @@ def test_run_doctor_accepts_bare_custom_provider(monkeypatch, tmp_path):
     assert "model.provider 'custom' is not a recognised provider" not in out
 
 
-class TestDoctorCodexCliHintPlacement:
-    """The `codex CLI not installed` hint belongs under OpenAI Codex auth.
+class TestDoctorCodexRuntimeDiagnostics:
 
-    The hint should be emitted directly after the retained Codex auth row.
-    """
-
-    def _run(self, monkeypatch, tmp_path, *, codex_logged_in: bool, codex_cli_present: bool) -> str:
+    def _run(self, monkeypatch, tmp_path, codex_status) -> str:
         home = tmp_path / ".marlow"
         home.mkdir(parents=True, exist_ok=True)
         (home / "config.yaml").write_text("memory: {}\n", encoding="utf-8")
@@ -262,38 +258,36 @@ class TestDoctorCodexCliHintPlacement:
         monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
 
         from marlow_cli import auth as _auth_mod
-        monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {"logged_in": codex_logged_in})
-
-        real_which = doctor_mod.shutil.which
-        monkeypatch.setattr(
-            doctor_mod.shutil,
-            "which",
-            lambda cmd: ("/usr/local/bin/codex" if codex_cli_present else None) if cmd == "codex" else real_which(cmd),
-        )
+        monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: codex_status)
 
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             doctor_mod.run_doctor(Namespace(fix=False))
         return buf.getvalue()
 
-    @staticmethod
-    def _hint_line() -> str:
-        return "codex CLI not installed"
+    @pytest.mark.parametrize("status", ["codex_missing", "incompatible"])
+    def test_runtime_failure_reports_reason_without_login_hint(self, monkeypatch, tmp_path, status):
+        out = self._run(monkeypatch, tmp_path, {
+            "logged_in": False, "status": status,
+            "version": "0.172.0", "error": "Codex config/read failed",
+        })
+        assert "Codex runtime" in out
+        assert "Codex CLI 0.172.0" in out
+        assert "Codex config/read failed" in out
+        assert "(not logged in)" not in out
+        assert "Run 'marlow login'" not in out
 
-    def test_hint_appears_under_codex_auth_when_missing(self, monkeypatch, tmp_path):
-        out = self._run(monkeypatch, tmp_path, codex_logged_in=False, codex_cli_present=False)
-        lines = out.splitlines()
-        codex_idx = next(i for i, l in enumerate(lines) if "OpenAI Codex auth" in l)
-        hint_idx = next(i for i, l in enumerate(lines) if self._hint_line() in l)
-        assert hint_idx == codex_idx + 1
+    def test_missing_auth_gives_profile_login_hint(self, monkeypatch, tmp_path):
+        out = self._run(monkeypatch, tmp_path, {
+            "logged_in": False, "status": "auth_required", "version": "0.172.0",
+        })
+        assert "(not logged in)" in out
+        assert "Run 'marlow login' for this profile" in out
 
-    def test_hint_suppressed_when_codex_cli_present(self, monkeypatch, tmp_path):
-        out = self._run(monkeypatch, tmp_path, codex_logged_in=False, codex_cli_present=True)
-        assert "OpenAI Codex auth" in out
-        assert self._hint_line() not in out
-
-    def test_hint_suppressed_when_codex_logged_in(self, monkeypatch, tmp_path):
-        out = self._run(monkeypatch, tmp_path, codex_logged_in=True, codex_cli_present=False)
+    def test_authenticated_profile_reports_actual_version(self, monkeypatch, tmp_path):
+        out = self._run(monkeypatch, tmp_path, {
+            "logged_in": True, "status": "ready", "version": "0.172.0",
+        })
         assert "OpenAI Codex auth" in out
         assert "(logged in)" in out
-        assert self._hint_line() not in out
+        assert "Codex CLI 0.172.0" in out

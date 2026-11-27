@@ -178,6 +178,7 @@ def test_private_file_memory_through_real_codex_threads(tmp_path, monkeypatch):
     import shlex
 
     from agent.memory_workspace import gateway_memory_principal, memory_directory
+    from agent.transports.codex_app_server_session import CodexAppServerSession
     from run_agent import AIAgent
 
     binary = shutil.which("codex")
@@ -196,6 +197,16 @@ def test_private_file_memory_through_real_codex_threads(tmp_path, monkeypatch):
     corrected = "memory-fixture-prefers-markdown"
     steps = deque()
     requests = []
+    terminal_results = []
+    execute_command = CodexAppServerSession.execute_command
+
+    def observe_command(session, argv, **kwargs):
+        result = execute_command(session, argv, **kwargs)
+        if argv[:2] == ["/bin/sh", "-c"]:
+            terminal_results.append(result)
+        return result
+
+    monkeypatch.setattr(CodexAppServerSession, "execute_command", observe_command)
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -325,6 +336,7 @@ def test_private_file_memory_through_real_codex_threads(tmp_path, monkeypatch):
             ("guest", {"skip_memory": True, "conversation_persistence_policy": "none"}),
         ]
         for session_id, scope_kwargs in unauthorized:
+            previous_terminal_calls = len(terminal_results)
             _, denied_requests = run(
                 session_id,
                 "Find the private note.",
@@ -338,9 +350,11 @@ def test_private_file_memory_through_real_codex_threads(tmp_path, monkeypatch):
             assert str(memory) not in json.dumps(denied_requests[0])
             assert corrected not in json.dumps(denied_requests)
             assert "Marlow tool failed" in json.dumps(denied_requests[1])
-            assert "Operation not permitted" in json.dumps(denied_requests[2]) or (
-                "Permission denied" in json.dumps(denied_requests[2])
-            )
+            assert len(terminal_results) == previous_terminal_calls + 1
+            terminal_result = terminal_results[-1]
+            assert terminal_result["exitCode"] != 0
+            assert terminal_result["stdout"] == ""
+            assert str(note) in terminal_result["stderr"]
 
         _, delete_requests = run(
             "third",

@@ -12,7 +12,7 @@
 
 **An AI agent with persistent memory, local tools, and messaging integrations.** Marlow searches past conversations, uses reusable skills, and can create skills at your request. Run it locally, on a cloud VM, or through a messaging gateway.
 
-All inference runs through Codex app-server 0.159.2 in a Marlow-managed profile. Use native Codex authentication or a Codex Responses provider with tool support. See [runtime configuration and migration](docs/architecture/phase-2-validation.md).
+All inference runs through a compatible Codex app-server in a Marlow-managed profile. Marlow uses the binary selected by `runtime.codex.binary` or finds the Codex CLI on PATH. It checks the runtime configuration and protocol at startup. Use native Codex authentication or a Codex Responses provider with tool support. [Compatibility requirements](docs/architecture/codex-runtime-compatibility.md) · [Configuration and migration](docs/architecture/phase-2-validation.md)
 
 <table>
 <tr><td><b>Scriptable command line</b></td><td>Run a single query with image input and session history, or use a stdout-only invocation in a script.</td></tr>
