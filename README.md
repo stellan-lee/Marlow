@@ -17,7 +17,7 @@ All inference runs through Codex app-server 0.159.2 in a Marlow-managed profile.
 <table>
 <tr><td><b>Scriptable command line</b></td><td>Run a single query with image input and session history, or use a stdout-only invocation in a script.</td></tr>
 <tr><td><b>Lives where you do</b></td><td>Telegram, Discord, Slack, Feishu, Teams, email, and signed webhooks through one Gateway.</td></tr>
-<tr><td><b>Persistent memory and skills</b></td><td>Local memory, project-scoped work experience and decisions, FTS5 session search, and user-initiated skill creation. <a href="https://github.com/plastic-labs/honcho">Honcho</a> dialectic user modeling. Compatible with the <a href="https://agentskills.io">agentskills.io</a> open standard.</td></tr>
+<tr><td><b>Persistent memory and skills</b></td><td>Agent-managed Markdown memory, FTS5 session search, and user-initiated skill creation. Memory files persist across sessions within the authorized user scope. Compatible with the <a href="https://agentskills.io">agentskills.io</a> open standard.</td></tr>
 <tr><td><b>Scheduled automations</b></td><td>Built-in cron scheduler with delivery to any platform. Daily reports, nightly backups, weekly audits — all in natural language, running unattended.</td></tr>
 <tr><td><b>Delegates and parallelizes</b></td><td>Spawn isolated subagents for parallel workstreams. Write Python scripts that call tools via RPC, collapsing multi-step pipelines into zero-context-cost turns.</td></tr>
 <tr><td><b>Runs where you work</b></td><td>Agent shell and files run through the managed Codex local sandbox with explicit project grants. Docker/SSH agent execution is not migrated.</td></tr>
@@ -67,6 +67,53 @@ Use `marlow --help`, `marlow setup`, and the guides in this repository for confi
 
 ---
 
+## Memory
+
+Marlow provides persistent, scoped Markdown files that the agent can search,
+read, edit, and organize through its file tools. Ask it to remember, correct,
+or delete information. The same authorized private user can reuse memory in a
+new conversation. Marlow limits private memory to its authorized owner and
+denies access from shared channels and guest conversations. Codex native
+memory stays disabled.
+
+Stop the legacy Gateway and any other writers for the profile before taking
+the migration snapshot. Run `marlow memory migrate` for an existing profile, or
+`marlow -p <profile> memory migrate` for a named profile. Enabled legacy
+`MEMORY.md` and `USER.md` files are imported into the local profile owner's
+workspace. Work Experience, Decision Memory, and consolidation records are
+preserved as scoped Markdown and backups under `memory-migration/` for operator
+review. The archive retains the legacy scope and disclosure policies. The
+migration report identifies external providers that require operator export.
+
+To let the profile owner use those imported notes in Gateway DMs, add each
+verified private route to that profile’s `config.yaml`. Use the canonical user
+and chat IDs reported by `/whoami` in the authorized DM.
+
+```yaml
+memory:
+  owner_gateway_routes:
+    - platform: telegram
+      user_id: "123456789"
+      chat_id: "123456789"
+```
+
+The route must already pass Gateway authorization. Each listed one-to-one
+route shares the local owner’s Markdown directory across sessions. Start a new
+session after adding or removing a route. Other authorized private accounts
+keep their own files. Existing account directories stay on disk when a route
+is linked, and the operator can review and copy any notes they want to keep in
+the owner directory. Review the protected migration archive locally before
+copying any scoped records into active memory.
+
+The originals and protected archive stay on the host. Back up
+`memory-migration/` separately if using portable profile export. A config-only
+profile clone copies the local owner's notes and clears Gateway owner links.
+Profile copies skip symlinked directories and links into private memory.
+
+The first turn after an upgrade starts a fresh Codex Thread with the existing
+Marlow conversation history. This retires any context injected by the legacy
+memory runtime.
+
 ## Skills
 
 New profiles start with zero installed skills. Place custom skills in the
@@ -104,7 +151,7 @@ for ongoing messaging conversations. Run `marlow --help` for operator commands.
 - [Contributing guide](CONTRIBUTING.md) — development setup and project conventions
 - [Security policy](SECURITY.md) — trust model and vulnerability reporting
 - [Admin approvals](docs/admin-approvals.md) — privileged approval routing
-- [Telegram guest digital twin](docs/telegram-digital-twin.md) — guest prompts and scoped owner experience
+- [Telegram guest digital twin](docs/telegram-digital-twin.md) — guest prompts and isolated sessions
 - [Network isolation](docs/security/network-egress-isolation.md) — container egress controls
 
 ---

@@ -74,6 +74,25 @@ def _private_directory(path: Path) -> Path:
     return path
 
 
+def _is_workspace_trust_entry(workspace_base: Path, raw: str, entry) -> bool:
+    # Codex 0.159.2 versions of this harness could persist a trust decision
+    # for their own working directory. Accept only that narrowly scoped state.
+    path = Path(raw)
+    if entry not in ({"trust_level": "trusted"}, {"trust_level": "untrusted"}):
+        return False
+    if not path.is_relative_to(workspace_base) or str(path) != raw:
+        return False
+    parts = path.relative_to(workspace_base).parts
+    if not parts:
+        return True
+    return (
+        len(parts) == 2
+        and parts[0] == "conversations"
+        and len(parts[1]) == 32
+        and all(char in "0123456789abcdef" for char in parts[1])
+    )
+
+
 @dataclass(frozen=True)
 class CodexEnvironment:
     profile: Path
@@ -84,6 +103,15 @@ class CodexEnvironment:
     config: dict
     projects: tuple[tuple[str, bool], ...] = ()
     execution_network: bool = False
+    memory: Path | None = None
+    memory_writable: bool = True
+
+    @property
+    def file_grants(self) -> tuple[tuple[str, bool], ...]:
+        grants = ((str(self.workspace), True), *self.projects)
+        if self.memory is not None:
+            grants += ((str(self.memory), self.memory_writable),)
+        return grants
 
     @classmethod
     def build(
@@ -93,6 +121,8 @@ class CodexEnvironment:
         settings: Mapping | None = None,
         parent: Mapping[str, str] | None = None,
         workspace_scope: str | None = None,
+        memory_principal: str | None = None,
+        memory_writable: bool = True,
     ) -> "CodexEnvironment":
         parent = os.environ if parent is None else parent
         settings = settings or {}
@@ -156,6 +186,12 @@ class CodexEnvironment:
         if not isinstance(config.get("model_providers", {}), dict):
             raise CodexConfigurationError("Native model_providers must be a TOML table")
         unsupported = config.keys() - MODEL_KEYS
+        trust = config.get("projects")
+        if isinstance(trust, dict) and all(
+            _is_workspace_trust_entry(workspace_base, path, entry)
+            for path, entry in trust.items()
+        ):
+            unsupported.discard("projects")
         if unsupported:
             raise CodexConfigurationError(
                 "Profile Codex config contains host-controlled fields: "
@@ -231,6 +267,19 @@ class CodexEnvironment:
                 raise CodexConfigurationError(
                     "A project grant cannot include runtime/profile state"
                 )
+            if profile.parent.name == "profiles" and (
+                not path.is_relative_to(workspace_base)
+                and (
+                    path.is_relative_to(profile.parent)
+                    or any(
+                        path.is_relative_to(profile.parent.parent / name)
+                        for name in ("memories", "memory-workspaces", "memory-migration")
+                    )
+                )
+            ):
+                raise CodexConfigurationError(
+                    "A project grant cannot include another profile's state"
+                )
             from agent.file_safety import is_write_denied
 
             if path in {
@@ -252,6 +301,11 @@ class CodexEnvironment:
                     "Project grant conflicts with Marlow file safety policy"
                 )
             projects.append((str(path), entry.get("writable") is True))
+        memory = None
+        if memory_principal is not None:
+            from agent.memory_workspace import memory_directory
+
+            memory = memory_directory(profile, memory_principal)
         return cls(
             profile,
             home,
@@ -261,6 +315,8 @@ class CodexEnvironment:
             config,
             tuple(projects),
             settings.get("execution_network") is True,
+            memory,
+            memory_writable,
         )
 
     def overrides(self) -> dict:
@@ -282,10 +338,9 @@ class CodexEnvironment:
             ":minimal": "read",
             str(self.profile): "deny",
             str(self.home): "read",
-            str(self.workspace): "write",
         }
         filesystem.update({
-            path: "write" if writable else "read" for path, writable in self.projects
+            path: "write" if writable else "read" for path, writable in self.file_grants
         })
         # Preserve Marlow's mandatory sensitive-path and write-safe-root rules
         # in the OS sandbox too, including inside broader project grants.
@@ -295,10 +350,7 @@ class CodexEnvironment:
         )
 
         personal_home = str(Path.home().resolve())
-        writable_roots = [
-            self.workspace,
-            *(Path(path) for path, writable in self.projects if writable),
-        ]
+        writable_roots = [Path(path) for path, writable in self.file_grants if writable]
         for denied in [
             *build_write_denied_paths(personal_home),
             *build_write_denied_prefixes(personal_home),
@@ -312,10 +364,7 @@ class CodexEnvironment:
         safe_root = os.environ.get("MARLOW_WRITE_SAFE_ROOT")
         if safe_root:
             allowed_write_root = Path(safe_root).expanduser().resolve()
-            for root in [
-                self.workspace,
-                *(Path(path) for path, writable in self.projects if writable),
-            ]:
+            for root in writable_roots:
                 if root != allowed_write_root and not root.is_relative_to(
                     allowed_write_root
                 ):
@@ -334,6 +383,12 @@ class CodexEnvironment:
                 "inherit": "none",
                 "set": shell_env,
                 "experimental_use_profile": False,
+            },
+            # The app-server otherwise auto-trusts a new cwd and persists the
+            # trust entry in the profile model config.
+            "projects": {
+                path: {"trust_level": "untrusted"}
+                for path in (*self.config.get("projects", {}), str(self.workspace))
             },
             "project_root_markers": [".marlow-runtime-root"],
             "project_doc_max_bytes": 0,
@@ -477,11 +532,11 @@ def select_project_grants(environment, selected=None, explicit=()):
     return replace(environment, projects=grants)
 
 
-def gateway_environment(source):
+def gateway_environment(source, *, workspace_scope=None):
     from marlow_cli.config import load_config
 
     settings = (load_config().get("runtime") or {}).get("codex") or {}
-    scope = conversation_workspace_scope(
+    scope = workspace_scope or conversation_workspace_scope(
         channel=source.platform,
         user=None if gateway_shared(source) else source.user_id,
         chat=source.chat_id,

@@ -6105,6 +6105,7 @@ class TelegramAdapter(BasePlatformAdapter):
             ),
             thread_id=thread_id_str,
             chat_topic=chat_topic,
+            is_bot=bool(getattr(user, "is_bot", False)),
             message_id=str(message.message_id),
         )
 

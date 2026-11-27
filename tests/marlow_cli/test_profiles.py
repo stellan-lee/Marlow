@@ -7,6 +7,7 @@ and shell completion generation.
 
 import json
 import io
+import os
 import tarfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -153,7 +154,7 @@ class TestCreateProfile:
     def test_creates_directory_with_subdirs(self, profile_env):
         profile_dir = create_profile("coder", no_alias=True)
         assert profile_dir.is_dir()
-        for subdir in ["memories", "sessions", "skills", "logs",
+        for subdir in ["sessions", "skills", "logs",
                         "plans", "workspace", "cron"]:
             assert (profile_dir / subdir).is_dir(), f"Missing subdir: {subdir}"
 
@@ -211,6 +212,45 @@ class TestCreateProfile:
             / "installed-skill"
             / "SKILL.md"
         ).read_text() == "---\nname: installed-skill\n---\n"
+
+    def test_config_clone_copies_only_local_owner_memory_and_drops_routes(self, profile_env):
+        import yaml
+
+        from agent.memory_workspace import LOCAL_OWNER, gateway_memory_principal, memory_directory
+
+        source = get_profile_dir("default")
+        config = {
+            "memory": {
+                "owner_gateway_routes": [{"platform": "telegram", "user_id": "17", "chat_id": "17"}],
+                "memory_enabled": False,
+            },
+            "terminal": {"timeout": 30},
+        }
+        (source / "config.yaml").write_text(yaml.safe_dump(config))
+        owner_memory = memory_directory(source, LOCAL_OWNER)
+        (owner_memory / "projects").mkdir()
+        (owner_memory / "projects" / "note.md").write_text("local note")
+        gateway_principal = gateway_memory_principal("telegram", "42")
+        gateway_memory = memory_directory(source, gateway_principal)
+        other_note = gateway_memory / "note.md"
+        other_note.write_text("private Gateway note")
+        (owner_memory / "other-agent.md").symlink_to(other_note)
+        (source / "skills").mkdir(exist_ok=True)
+        (source / "skills" / "profile-alias").symlink_to(gateway_memory.parent)
+        (source / "SOUL.md").symlink_to(other_note)
+
+        cloned = create_profile("coder", clone_config=True, no_alias=True)
+
+        assert (cloned / "memory-workspaces/local-owner/memory/projects/note.md").read_text() == "local note"
+        assert not (cloned / "memory-workspaces/local-owner/memory/other-agent.md").exists()
+        assert not (cloned / "memory-workspaces" / gateway_principal).exists()
+        assert not (cloned / "skills/profile-alias").exists()
+        assert "private Gateway note" not in (cloned / "SOUL.md").read_text()
+        assert yaml.safe_load((cloned / "config.yaml").read_text()) == {
+            "memory": {"memory_enabled": False},
+            "terminal": {"timeout": 30},
+        }
+        assert yaml.safe_load((source / "config.yaml").read_text()) == config
 
     def test_clone_all_copies_entire_tree(self, profile_env):
         tmp_path = profile_env
@@ -624,68 +664,8 @@ class TestRenameProfile:
         assert new_dir.is_dir()
         assert new_dir == tmp_path / ".marlow" / "profiles" / "newname"
 
-    def test_renames_root_honcho_host_without_changing_ai_peer(self, profile_env):
-        tmp_path = profile_env
-        create_profile("ssi_health", no_alias=True)
-        honcho_path = tmp_path / ".marlow" / "honcho.json"
-        honcho_path.write_text(json.dumps({
-            "hosts": {
-                "marlow.ssi_health": {
-                    "recallMode": "hybrid",
-                    "writeFrequency": "async",
-                    "sessionStrategy": "per-session",
-                    "saveMessages": True,
-                    "peerName": "user-peer",
-                    "aiPeer": "ssi_health",
-                    "workspace": "marlow",
-                    "enabled": True,
-                }
-            }
-        }))
 
-        with patch("marlow_cli.profiles.check_alias_collision", return_value="skip"):
-            rename_profile("ssi_health", "heimdall")
 
-        cfg = json.loads(honcho_path.read_text())
-        assert "marlow.ssi_health" not in cfg["hosts"]
-        assert cfg["hosts"]["marlow_heimdall"]["aiPeer"] == "ssi_health"
-        assert cfg["hosts"]["marlow_heimdall"]["peerName"] == "user-peer"
-
-    def test_pins_ai_peer_when_absent_on_honcho_host_rename(self, profile_env):
-        tmp_path = profile_env
-        create_profile("ssi_health", no_alias=True)
-        honcho_path = tmp_path / ".marlow" / "honcho.json"
-        honcho_path.write_text(json.dumps({
-            "hosts": {
-                "marlow.ssi_health": {"workspace": "marlow", "enabled": True}
-            }
-        }))
-
-        with patch("marlow_cli.profiles.check_alias_collision", return_value="skip"):
-            rename_profile("ssi_health", "heimdall")
-
-        cfg = json.loads(honcho_path.read_text())
-        assert "marlow.ssi_health" not in cfg["hosts"]
-        assert cfg["hosts"]["marlow_heimdall"]["aiPeer"] == "ssi_health"
-        assert cfg["hosts"]["marlow_heimdall"]["workspace"] == "marlow"
-
-    def test_does_not_overwrite_existing_honcho_host_on_rename(self, profile_env):
-        tmp_path = profile_env
-        create_profile("ssi_health", no_alias=True)
-        honcho_path = tmp_path / ".marlow" / "honcho.json"
-        honcho_path.write_text(json.dumps({
-            "hosts": {
-                "marlow.ssi_health": {"aiPeer": "ssi_health"},
-                "marlow_heimdall": {"aiPeer": "heimdall"},
-            }
-        }))
-
-        with patch("marlow_cli.profiles.check_alias_collision", return_value="skip"):
-            rename_profile("ssi_health", "heimdall")
-
-        cfg = json.loads(honcho_path.read_text())
-        assert cfg["hosts"]["marlow.ssi_health"]["aiPeer"] == "ssi_health"
-        assert cfg["hosts"]["marlow_heimdall"]["aiPeer"] == "heimdall"
 
     def test_default_raises_value_error(self, profile_env):
         with pytest.raises(ValueError, match="default"):
@@ -745,6 +725,48 @@ class TestExportImport:
         imported = import_profile(str(archive_path), name="coder")
         assert imported.is_dir()
         assert (imported / "marker.txt").read_text() == "hello"
+
+    @pytest.mark.parametrize("source_name", ["default", "coder"])
+    def test_portable_profile_retains_private_markdown_and_omits_migration_archive(
+        self, profile_env, tmp_path, source_name
+    ):
+        from agent.memory_workspace import LOCAL_OWNER, memory_directory
+
+        source = (
+            get_profile_dir("default") if source_name == "default"
+            else create_profile(source_name, no_alias=True)
+        )
+        owner_memory = memory_directory(source, LOCAL_OWNER)
+        (owner_memory / "note.md").write_text("active private memory")
+        backup_dir = source / "memory-migration" / "backups"
+        backup_dir.mkdir(parents=True)
+        backup = backup_dir / "state.db"
+        backup.write_text("operator-only migration snapshot")
+        (source / "backup-link.db").symlink_to(backup)
+        (owner_memory / "backup-link.db").symlink_to(backup)
+        sibling = create_profile("sibling", no_alias=True)
+        sibling_backup = sibling / "memory-migration/backups/state.db"
+        sibling_backup.parent.mkdir(parents=True)
+        sibling_backup.write_text("other profile's migration snapshot")
+        (source / "workspace").mkdir(exist_ok=True)
+        (source / "workspace" / "profile-alias").symlink_to(sibling)
+
+        archive = export_profile(source_name, str(tmp_path / "portable.tar.gz"))
+        with tarfile.open(archive) as stream:
+            members = stream.getnames()
+        assert f"{source_name}/memory-workspaces/local-owner/memory/note.md" in members
+        assert not any(
+            any(part in name for part in ("memory-migration", "backup-link", "profile-alias"))
+            for name in members
+        )
+        assert backup.is_file()
+
+        imported = import_profile(str(archive), name="restored")
+        memory_root = imported / "memory-workspaces"
+        assert (memory_root / "local-owner/memory/note.md").read_text() == "active private memory"
+        if os.name != "nt":
+            assert archive.stat().st_mode & 0o777 == 0o600
+            assert memory_root.stat().st_mode & 0o777 == 0o700
 
     def test_import_to_existing_name_raises(self, profile_env, tmp_path):
         create_profile("coder", no_alias=True)

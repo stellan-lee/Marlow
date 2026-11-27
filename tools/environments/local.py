@@ -60,6 +60,7 @@ def _build_provider_env_blocklist() -> frozenset:
     blocked.update({
         "OPENAI_BASE_URL",
         "OPENAI_API_KEY",
+        "HONCHO_API_KEY",  # Retired providers can leave credentials in old profiles.
         "TELEGRAM_HOME_CHANNEL",
         "TELEGRAM_HOME_CHANNEL_NAME",
         "DISCORD_HOME_CHANNEL",

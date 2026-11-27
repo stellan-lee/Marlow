@@ -1,6 +1,9 @@
 # Marlow Long-Term Memory and Decision Intelligence
 
-**Status:** PROPOSED — READY FOR ENGINEERING REVIEW  
+> Historical proposal. Marlow adopted [agent-managed Markdown memory](../README.md#memory).
+> The proposal and engineering history below describe the retired Memory Framework.
+
+**Original status:** PROPOSED — READY FOR ENGINEERING REVIEW\
 **Scope:** PR 1–10  
 **Primary codebase:** `Marlow-main`  
 **Date:** 2026-08-21  

@@ -3130,9 +3130,8 @@ class BasePlatformAdapter(ABC):
         If a callback for the same ``session_key`` (and generation, when set)
         is already registered, the new callback is chained — both fire, in
         registration order, with per-callback exception isolation. This lets
-        independent features (background-review release + temporary-bubble
-        cleanup) coexist without clobbering each other. Stale-generation
-        callers never overwrite a fresher generation's slot.
+        deferred response cleanup features coexist without clobbering each other.
+        Stale-generation callers never overwrite a fresher generation's slot.
         """
         if not session_key or not callable(callback):
             return
@@ -4505,7 +4504,7 @@ class BasePlatformAdapter(ABC):
                 pass  # Last resort — don't let error reporting crash the handler
         finally:
             # Fire any one-shot post-delivery callback registered for this
-            # session (e.g. deferred background-review notifications).
+            # session (e.g. temporary progress-bubble cleanup).
             #
             # Snapshot the callback generation HERE (after the agent has run),
             # not at the top of this task.  _marlow_run_generation is set on

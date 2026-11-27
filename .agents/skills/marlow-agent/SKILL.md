@@ -15,13 +15,13 @@ Marlow Agent is an open-source AI agent framework that runs in your terminal and
 
 Runtime implementation and limits: see `docs/architecture/phase-2-codex-runtime.md`
 and `docs/architecture/phase-2-validation.md`. Marlow owns business authorization,
-identity, memory and history; Codex owns reasoning, model retries and compaction.
+identity, memory access and history. Codex owns file-based memory, reasoning, model retries and compaction.
 Do not add auxiliary clients, provider fallback or a second tool reasoning loop.
 
 What makes Marlow different:
 
 - **Reusable skills** — request `/learn` to save a procedure for future sessions. Existing skills can be loaded and edited on request.
-- **Persistent memory across sessions** — remembers who you are, your preferences, environment details, and lessons learned through local memory or Honcho.
+- **Persistent memory across sessions** — the agent can organize Markdown files and recall them on demand within its private scope.
 - **Multi-platform gateway** — the same agent runs on Telegram, Discord, Slack, Feishu/Lark, Email, and signed webhooks with full tool access.
 - **Flexible inference** — configure a Responses provider with tools in the profile’s native Codex TOML. Chat Completions-only endpoints are unsupported.
 - **Profiles** — run multiple independent Marlow instances with isolated configs, sessions, skills, and memory.
@@ -196,8 +196,7 @@ marlow insights [--days N]  Usage analytics
 marlow update               Update to latest version
 marlow pairing list/approve/revoke  DM authorization
 marlow plugins list/install/remove  Plugin management
-marlow honcho setup/status  Honcho memory integration (requires honcho plugin)
-marlow memory setup/status/off  Memory provider config
+marlow memory migrate        Import local legacy memory and report external sources
 marlow completion bash|zsh  Shell completions
 marlow uninstall            Uninstall Marlow
 ```
@@ -308,7 +307,6 @@ Edit with `marlow config edit` or `marlow config set section.key value`.
 | `terminal` | `backend` (local/docker/ssh), `cwd`, `timeout` (180) |
 | `compression` | `enabled`, `threshold` (0.50), `target_ratio` (0.20) |
 | `display` | `tool_progress`, `show_reasoning`, `show_cost` |
-| `memory` | `memory_enabled`, `user_profile_enabled`, `provider` |
 | `security` | `tirith_enabled`, `website_blocklist` |
 | `delegation` | `model`, `provider`, `base_url`, `api_key`, `max_iterations` (50), `reasoning_effort` |
 | `checkpoints` | `enabled`, `max_snapshots` (50) |
@@ -340,7 +338,6 @@ Enable/disable via `marlow tools` (interactive) or `marlow tools enable/disable 
 | `code_execution` | Sandboxed Python execution |
 | `vision` | Image analysis |
 | `skills` | Skill browsing and management |
-| `memory` | Persistent cross-session memory |
 | `session_search` | Search past conversations |
 | `delegation` | Subagent task delegation |
 | `cronjob` | Scheduled task management |
@@ -496,8 +493,8 @@ the `cronjob` tool, the `marlow cron` CLI (`list`, `add`, `edit`,
   (run in a specific dir with its `AGENTS.md` / `CLAUDE.md` loaded),
   multi-platform delivery.
 - **Invariants:** 3-minute hard interrupt per run, `.tick.lock` file
-  prevents duplicate ticks across processes, cron sessions pass
-  `skip_memory=True` by default, and cron deliveries are framed with a
+  prevents duplicate ticks across processes, cron sessions receive no private
+  memory grant, and cron deliveries are framed with a
   header/footer instead of being mirrored into the target gateway
   session (keeps role alternation intact).
 
@@ -561,7 +558,7 @@ marlow config set auxiliary.vision.model <model_name>
 | MCP servers | `marlow mcp list` |
 | Profiles | `marlow profile list` |
 | Cron jobs | `marlow cron list` |
-| Memory | `marlow memory status` |
+| Memory | Scoped Markdown and `marlow memory migrate` |
 | Env variables | `marlow config env-path` |
 | CLI commands | `marlow --help` |
 | Gateway logs | `~/.marlow/logs/gateway.log` |
@@ -582,7 +579,7 @@ marlow-agent/
 ├── model_tools.py        # Tool discovery and dispatch
 ├── toolsets.py           # Toolset definitions
 ├── marlow_state.py       # SQLite session store
-├── agent/                # Prompt builder, context compression, memory, model routing, credential pooling, skill dispatch
+├── agent/                # Codex transport, scoped file access, runtime policy, skill dispatch
 ├── marlow_cli/           # CLI subcommands, config, setup, commands
 │   ├── commands.py       # Slash command registry (CommandDef)
 │   ├── config.py         # DEFAULT_CONFIG, env var definitions

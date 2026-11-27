@@ -240,7 +240,7 @@ class TestFalsePositives:
 
 class TestClassicInjection:
     """Confirm the prompt-injection / exfiltration patterns we INHERITED
-    from prompt_builder.py + memory_tool.py still fire at the expected scopes.
+    from prompt_builder.py still fire at the expected scopes.
     """
 
     def test_ignore_previous_instructions(self):

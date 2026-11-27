@@ -1,4 +1,4 @@
-"""Unit tests for StreamingContextScrubber (agent/memory_manager.py).
+"""Unit tests for StreamingContextScrubber (agent/history_privacy.py).
 
 Regression coverage for #5719 — memory-context spans split across stream
 deltas must not leak payload to the UI.  The one-shot sanitize_context()
@@ -6,10 +6,9 @@ regex can't survive chunk boundaries, so _fire_stream_delta routes deltas
 through a stateful scrubber.
 """
 
-from agent.memory_manager import (
+from agent.history_privacy import (
     StreamingContextScrubber,
     sanitize_context,
-    scrub_internal_context_payload,
 )
 
 
@@ -215,24 +214,6 @@ class TestSanitizeContextUnchanged:
 
         assert out == "Visible"
 
-    def test_nested_hook_or_debug_payload_is_scrubbed_without_mutating_source(self):
-        source = {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": (
-                        "question\n<work-experience-context>private lesson"
-                        "</work-experience-context>"
-                    ),
-                }
-            ]
-        }
-
-        scrubbed = scrub_internal_context_payload(source)
-
-        assert "private lesson" not in scrubbed["messages"][0]["content"]
-        assert "private lesson" in source["messages"][0]["content"]
-
     def test_unclosed_work_experience_echo_is_dropped_to_end(self):
         echoed = (
             "Visible answer\n<work-experience-context>"
@@ -269,35 +250,3 @@ class TestStreamingContextScrubberCrossTurn:
         s.reset()
         out = s.feed("post-reset visible text")
         assert out == "post-reset visible text"
-
-
-class TestBuildMemoryContextBlockWarnsOnViolation:
-    """Providers must return raw context — not pre-wrapped.  When they do,
-    we strip and warn so the buggy provider surfaces."""
-
-    def test_provider_emitting_wrapper_warns(self, caplog):
-        import logging
-        from agent.memory_manager import build_memory_context_block
-
-        prewrapped = (
-            "<memory-context>\n"
-            "[System note: ...]\n\n"
-            "real fact\n"
-            "</memory-context>"
-        )
-        with caplog.at_level(logging.WARNING, logger="agent.memory_manager"):
-            out = build_memory_context_block(prewrapped)
-
-        assert any("pre-wrapped" in rec.message for rec in caplog.records)
-        assert out.count("<memory-context>") == 1
-        assert out.count("</memory-context>") == 1
-
-    def test_clean_provider_output_does_not_warn(self, caplog):
-        import logging
-        from agent.memory_manager import build_memory_context_block
-
-        with caplog.at_level(logging.WARNING, logger="agent.memory_manager"):
-            out = build_memory_context_block("plain fact about user")
-
-        assert not any("pre-wrapped" in rec.message for rec in caplog.records)
-        assert "plain fact about user" in out

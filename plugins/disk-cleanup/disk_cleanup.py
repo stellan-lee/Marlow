@@ -63,15 +63,29 @@ def get_log_file() -> Path:
 # Path safety
 # ---------------------------------------------------------------------------
 
-def is_safe_path(path: Path) -> bool:
-    """Accept only paths under MARLOW_HOME or ``/tmp/marlow-*``.
+_MEMORY_STATE_PATHS = {
+    "memories", "memory-workspaces", "memory-migration",
+    "memory_consolidation.db", "memory_consolidation.db-shm",
+    "memory_consolidation.db-wal", "memory_consolidation.db-journal",
+}
 
-    Rejects Windows mounts (``/mnt/c`` etc.) and any system directory.
+
+def _protects_memory(parts: tuple[str, ...]) -> bool:
+    """Reject private memory state and directories that can contain it."""
+    if parts and parts[0] == "profiles":
+        parts = parts[2:]
+    return not parts or parts[0] in _MEMORY_STATE_PATHS
+
+
+def is_safe_path(path: Path) -> bool:
+    """Accept cleanup paths under MARLOW_HOME or ``/tmp/marlow-*``.
+
+    Preserve memory state and reject Windows mounts and system directories.
     """
-    marlow_home = get_marlow_home()
+    marlow_home = get_marlow_home().resolve()
     try:
-        path.resolve().relative_to(marlow_home)
-        return True
+        relative = path.resolve().relative_to(marlow_home)
+        return not _protects_memory(relative.parts)
     except (ValueError, OSError):
         pass
     # Allow /tmp/marlow-* explicitly
@@ -170,7 +184,7 @@ def track(path_str: str, category: str, silent: bool = False) -> bool:
         return False
 
     if not is_safe_path(path):
-        _log(f"REJECT: {path} (outside MARLOW_HOME)")
+        _log(f"REJECT: {path} (protected or outside cleanup scope)")
         return False
 
     size = path.stat().st_size if path.is_file() else 0
@@ -220,7 +234,7 @@ def dry_run() -> Tuple[List[Dict], List[Dict]]:
 
     for item in tracked:
         p = Path(item["path"])
-        if not p.exists():
+        if not p.exists() or not is_safe_path(p):
             continue
         age = (now - datetime.fromisoformat(item["timestamp"])).days
         cat = item["category"]
@@ -267,6 +281,10 @@ def quick() -> Dict[str, Any]:
             _log(f"STALE: {p} (removed from tracking)")
             continue
 
+        if not is_safe_path(p):
+            _log(f"PROTECTED: {p} (removed from tracking)")
+            continue
+
         age = (now - datetime.fromisoformat(item["timestamp"])).days
 
         should_delete = (
@@ -308,6 +326,8 @@ def quick() -> Dict[str, Any]:
             try:
                 rel_parts = dirpath.relative_to(marlow_home).parts
             except ValueError:
+                continue
+            if _protects_memory(rel_parts):
                 continue
             # Skip the well-known top-level state dirs themselves.
             if len(rel_parts) == 1 and rel_parts[0] in _PROTECTED_TOP_LEVEL:
@@ -362,7 +382,7 @@ def deep(
 
     for item in tracked:
         p = Path(item["path"])
-        if not p.exists():
+        if not p.exists() or not is_safe_path(p):
             continue
         age = (now - datetime.fromisoformat(item["timestamp"])).days
         cat = item["category"]
@@ -412,7 +432,9 @@ def deep(
 
 def status() -> Dict[str, Any]:
     """Return per-category breakdown and top 10 largest tracked files."""
-    tracked = load_tracked()
+    tracked = [
+        item for item in load_tracked() if is_safe_path(Path(item["path"]))
+    ]
     cats: Dict[str, Dict] = {}
     for item in tracked:
         c = item["category"]
@@ -470,12 +492,12 @@ def guess_category(path: Path) -> Optional[str]:
         return None
 
     # Skip the state dir itself, logs, memory files, sessions, config.
-    marlow_home = get_marlow_home()
+    marlow_home = get_marlow_home().resolve()
     try:
         rel = path.resolve().relative_to(marlow_home)
         top = rel.parts[0] if rel.parts else ""
         if top in {
-            "disk-cleanup", "logs", "memories", "sessions", "config.yaml",
+            "disk-cleanup", "logs", "sessions", "config.yaml",
             "skills", "plugins", ".env", "USER.md", "MEMORY.md", "SOUL.md",
             "auth.json", "marlow-agent",
         }:

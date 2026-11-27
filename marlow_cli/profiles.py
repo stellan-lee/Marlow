@@ -11,7 +11,7 @@ zero migration needed.
 Usage::
 
     marlow profile create coder          # fresh profile with empty skills directory
-    marlow profile create coder --clone  # also copy config, .env, SOUL.md, skills
+    marlow profile create coder --clone  # also copy config, skills and local owner notes
     marlow profile create coder --clone-all  # full copy of source profile
     coder chat                           # use via wrapper alias
     marlow -p coder chat                 # or via flag
@@ -36,7 +36,6 @@ _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 # Directories bootstrapped inside every new profile
 _PROFILE_DIRS = [
-    "memories",
     "sessions",
     "skills",
     "logs",
@@ -55,14 +54,6 @@ _CLONE_CONFIG_FILES = [
     "config.yaml",
     ".env",
     "SOUL.md",
-]
-
-# Subdirectory files copied during --clone (path relative to profile root).
-# Memory files are part of the agent's curated identity — just as important
-# as SOUL.md for continuity when cloning a profile.
-_CLONE_SUBDIR_FILES = [
-    "memories/MEMORY.md",
-    "memories/USER.md",
 ]
 
 # Runtime files stripped after --clone-all (shouldn't carry over).
@@ -120,7 +111,7 @@ def _clone_all_copytree_ignore(source_dir: Path):
     is_default_source = source_resolved == _get_default_marlow_home().resolve()
 
     def _ignore(directory: str, names: List[str]) -> List[str]:
-        ignored: list[str] = []
+        ignored = list(_private_memory_symlinks(source_dir, Path(directory), names))
         for entry in names:
             # Universal exclusions at any depth.
             if (
@@ -143,6 +134,26 @@ def _clone_all_copytree_ignore(source_dir: Path):
         return ignored
 
     return _ignore
+
+
+def _private_memory_symlinks(root: Path, directory: Path, names: list[str]) -> set[str]:
+    """Keep filesystem links from bypassing profile copy boundaries."""
+    protected = {"memory-workspaces", "memory-migration"}
+    inside_memory = bool(protected.intersection(directory.relative_to(root).parts[:1]))
+    ignored = set()
+    for name in names:
+        path = directory / name
+        if not path.is_symlink():
+            continue
+        if inside_memory or path.is_dir() or (directory == root and name in protected):
+            ignored.add(name)
+            continue
+        try:
+            if protected.intersection(path.resolve().parts):
+                ignored.add(name)
+        except (OSError, RuntimeError):
+            ignored.add(name)
+    return ignored
 
 
 # Directories/files to exclude when exporting the default (~/.marlow) profile.
@@ -183,7 +194,7 @@ _MARLOW_SUBCOMMANDS = frozenset({
     "chat", "model", "gateway", "setup", "login", "logout",
     "status", "cron", "doctor", "dump", "config", "pairing", "skills", "tools",
     "mcp", "sessions", "insights", "version", "update", "uninstall",
-    "profile", "plugins", "honcho",
+    "profile", "plugins", "memory",
 })
 
 
@@ -616,6 +627,47 @@ def list_profiles() -> List[ProfileInfo]:
     return profiles
 
 
+def _copy_profile_config(source: Path, destination: Path) -> None:
+    import yaml
+    from utils import atomic_yaml_write
+
+    try:
+        config = yaml.safe_load(source.read_text(encoding="utf-8"))
+    except (UnicodeError, yaml.YAMLError):
+        # Preserve invalid config for operator repair. The Gateway cannot use it.
+        config = None
+    memory = config.get("memory") if isinstance(config, dict) else None
+    if isinstance(memory, dict) and "owner_gateway_routes" in memory:
+        memory = dict(memory)
+        del memory["owner_gateway_routes"]
+        config["memory"] = memory
+        if not memory:
+            del config["memory"]
+        atomic_yaml_write(destination, config)
+    else:
+        shutil.copy2(source, destination)
+
+
+def _copy_local_owner_memory(source_profile: Path, destination_profile: Path) -> None:
+    from agent.memory_workspace import LOCAL_OWNER, memory_directory
+
+    workspaces = source_profile / "memory-workspaces"
+    owner = workspaces / LOCAL_OWNER
+    source = owner / "memory"
+    if any(path.is_symlink() for path in (workspaces, owner, source)) or not source.is_dir():
+        return
+    destination = memory_directory(destination_profile, LOCAL_OWNER)
+    shutil.copytree(
+        source,
+        destination,
+        dirs_exist_ok=True,
+        ignore=lambda directory, names: _private_memory_symlinks(
+            source_profile, Path(directory), names
+        ),
+    )
+    destination.chmod(0o700)
+
+
 def create_profile(
     name: str,
     clone_from: Optional[str] = None,
@@ -638,7 +690,8 @@ def create_profile(
         If True, do a full copytree of the source (all state).
     clone_config:
         If True, copy config files (config.yaml, .env, SOUL.md), installed
-        skills, and selected profile identity files from the source profile.
+        skills, and local owner memory from the source profile. The clone has
+        no Gateway delegation to its owner's memory until explicitly configured.
     no_alias:
         If True, skip wrapper script creation.
     no_skills:
@@ -702,11 +755,15 @@ def create_profile(
 
         # Clone config files from source
         if source_dir is not None:
+            excluded = _private_memory_symlinks(source_dir, source_dir, _CLONE_CONFIG_FILES)
             for filename in _CLONE_CONFIG_FILES:
                 src = source_dir / filename
-                if src.exists():
+                if filename not in excluded and src.exists():
                     dst = profile_dir / filename
-                    shutil.copy2(src, dst)
+                    if filename == "config.yaml":
+                        _copy_profile_config(src, dst)
+                    else:
+                        shutil.copy2(src, dst)
                     # Tighten .env to owner-only after copy. shutil.copy2
                     # preserves source mode bits, but if the source's .env
                     # was loose (host umask 0o022 leaving 0o644), tighten
@@ -720,16 +777,14 @@ def create_profile(
             # Clone installed skills from the source profile so the new profile
             # immediately has the same agent capabilities as its source.
             source_skills = source_dir / "skills"
-            if source_skills.is_dir():
-                shutil.copytree(source_skills, profile_dir / "skills", dirs_exist_ok=True)
-
-            # Clone memory and other subdirectory files
-            for relpath in _CLONE_SUBDIR_FILES:
-                src = source_dir / relpath
-                if src.exists():
-                    dst = profile_dir / relpath
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src, dst)
+            if source_skills.is_dir() and not source_skills.is_symlink():
+                shutil.copytree(
+                    source_skills, profile_dir / "skills", dirs_exist_ok=True,
+                    ignore=lambda directory, names: _private_memory_symlinks(
+                        source_dir, Path(directory), names
+                    ),
+                )
+            _copy_local_owner_memory(source_dir, profile_dir)
 
     # Seed a default SOUL.md so the user has a file to customize immediately.
     # Skipped when the profile already has one (from --clone / --clone-all).
@@ -1180,8 +1235,11 @@ def _default_export_ignore(root_dir: Path):
 def export_profile(name: str, output_path: str) -> Path:
     """Export a profile to a tar.gz archive.
 
+    Portable profile data includes active memory. Operator migration archives
+    stay in the source profile and may contain the complete session database.
     Returns the output file path.
     """
+    import tarfile
     import tempfile
 
     canon = normalize_profile_name(name)
@@ -1190,35 +1248,33 @@ def export_profile(name: str, output_path: str) -> Path:
     if not profile_dir.is_dir():
         raise FileNotFoundError(f"Profile '{canon}' does not exist.")
 
-    output = Path(output_path)
-    # shutil.make_archive wants the base name without extension
-    base = str(output).removesuffix(".tar.gz").removesuffix(".tgz")
+    portable_default_ignore = _default_export_ignore(profile_dir)
 
-    if canon == "default":
-        # The default profile IS ~/.marlow itself — its parent is ~/ and its
-        # directory name is ".marlow", not "default".  We stage a clean copy
-        # under a temp dir so the archive contains ``default/...``.
-        with tempfile.TemporaryDirectory() as tmpdir:
-            staged = Path(tmpdir) / "default"
-            shutil.copytree(
-                profile_dir,
-                staged,
-                ignore=_default_export_ignore(profile_dir),
-            )
-            result = shutil.make_archive(base, "gztar", tmpdir, "default")
-            return Path(result)
+    def _ignore(directory: str, contents: list[str]) -> set[str]:
+        directory_path = Path(directory)
+        ignored = _private_memory_symlinks(profile_dir, directory_path, contents)
+        if directory_path == profile_dir:
+            ignored.add("memory-migration")
+        if canon == "default":
+            ignored.update(portable_default_ignore(directory, contents))
+        ignored.update({"auth.json", ".env"}.intersection(contents))
+        return ignored
 
-    # Named profiles — stage a filtered copy to exclude credentials
+    base = str(output_path).removesuffix(".tar.gz").removesuffix(".tgz")
+    output = Path(f"{base}.tar.gz").absolute()
+    output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as tmpdir:
         staged = Path(tmpdir) / canon
-        _CREDENTIAL_FILES = {"auth.json", ".env"}
-        shutil.copytree(
-            profile_dir,
-            staged,
-            ignore=lambda d, contents: _CREDENTIAL_FILES & set(contents),
-        )
-        result = shutil.make_archive(base, "gztar", tmpdir, canon)
-        return Path(result)
+        shutil.copytree(profile_dir, staged, ignore=_ignore)
+        fd, temporary_name = tempfile.mkstemp(prefix=".marlow-export-", dir=output.parent)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                with tarfile.open(fileobj=stream, mode="w:gz") as archive:
+                    archive.add(staged, arcname=canon)
+            os.replace(temporary_name, output)
+        finally:
+            Path(temporary_name).unlink(missing_ok=True)
+    return output
 
 
 def _normalize_profile_archive_parts(member_name: str) -> List[str]:
@@ -1351,6 +1407,11 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
                 f"Profile archive root is missing or invalid: {archive_root}"
             )
 
+        for directory in ("memory-workspaces", "memory-migration"):
+            protected = extracted / directory
+            if protected.is_dir():
+                protected.chmod(0o700)
+
         final_source = extracted
         if archive_root != canon:
             final_source = staging_root / canon
@@ -1365,64 +1426,6 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
 # Rename
 # ---------------------------------------------------------------------------
 
-def _migrate_honcho_profile_host(old_name: str, new_name: str, new_dir: Path) -> None:
-    """Rename Honcho host blocks for a renamed profile without changing peers."""
-    old_host = f"marlow_{old_name}"
-    legacy_old_host = f"marlow.{old_name}"
-    new_host = f"marlow_{new_name}"
-
-    candidates = [
-        new_dir / "honcho.json",
-        _get_default_marlow_home() / "honcho.json",
-        Path.home() / ".honcho" / "config.json",
-    ]
-
-    seen: set[Path] = set()
-    for path in candidates:
-        try:
-            resolved = path.resolve()
-        except OSError:
-            resolved = path
-        if resolved in seen or not path.is_file():
-            continue
-        seen.add(resolved)
-
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-
-        hosts = raw.get("hosts")
-        if not isinstance(hosts, dict):
-            continue
-        source_host = old_host if old_host in hosts else legacy_old_host
-        if source_host not in hosts:
-            continue
-
-        if new_host in hosts:
-            print(f"⚠ Honcho host block not migrated: {new_host} already exists in {path}")
-            continue
-
-        block = hosts[source_host]
-        if isinstance(block, dict) and "aiPeer" not in block:
-            if source_host.startswith("marlow_"):
-                bare = source_host.split("_", 1)[1]
-            else:
-                bare = source_host.split(".", 1)[1] if "." in source_host else source_host
-            block["aiPeer"] = bare
-        hosts[new_host] = hosts.pop(source_host)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        try:
-            tmp.write_text(json.dumps(raw, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-            tmp.replace(path)
-        except OSError:
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
-            continue
-
-        print(f"✓ Honcho host updated: {source_host} → {new_host}")
 
 
 def rename_profile(old_name: str, new_name: str) -> Path:
@@ -1456,9 +1459,6 @@ def rename_profile(old_name: str, new_name: str) -> Path:
     # 2. Rename directory
     old_dir.rename(new_dir)
     print(f"✓ Renamed {old_dir.name} → {new_dir.name}")
-
-    # 3. Update profile-scoped Honcho host blocks, preserving aiPeer identity
-    _migrate_honcho_profile_host(old_canon, new_canon, new_dir)
 
     # 4. Update wrapper script
     remove_wrapper_script(old_canon)

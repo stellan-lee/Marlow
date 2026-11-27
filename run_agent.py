@@ -20,12 +20,12 @@ from agent.codex_environment import (
     CodexAuthenticationError,
     SUPPORTED_CODEX_VERSION,
 )
-from agent.codex_memory import MemoryLifecycle
 from agent.codex_state import RuntimeState
-from agent.memory_manager import (
-    StreamingContextScrubber,
-    build_memory_context_block,
-    sanitize_context,
+from agent.history_privacy import StreamingContextScrubber, sanitize_context
+from agent.memory_workspace import (
+    LOCAL_OWNER,
+    gateway_memory_principal,
+    memory_instructions,
 )
 from marlow_constants import (
     get_marlow_home,
@@ -38,7 +38,7 @@ _CAPACITY_LOCK = threading.Lock()
 _CAPACITY = {}
 
 
-class AIAgent(MemoryLifecycle):
+class AIAgent:
     """Compatibility interface for Gateway, SDK, CLI, Cron and task workers."""
 
     def __init__(
@@ -90,8 +90,49 @@ class AIAgent(MemoryLifecycle):
         if options.get("workspace_scope") is not None:
             workspace_scope = options["workspace_scope"]
         self._workspace_scope = workspace_scope
+        memory_settings = self.config.get("memory", {})
+        # Preserve the profile's legacy opt-outs for the new directory grant.
+        memory_enabled = isinstance(memory_settings, dict) and (
+            memory_settings.get("memory_enabled", True) is True
+            or memory_settings.get("user_profile_enabled", True) is True
+        )
+        memory_writable = memory_enabled and all(
+            str(mode or "").strip().lower() not in {"off", "none", "read-only"}
+            for mode in (
+                memory_settings.get("memory_write_mode"),
+                options.get("memory_write_mode"),
+            )
+        )
+        memory_principal = None
+        if (
+            memory_enabled
+            and not options.get("skip_memory")
+            and not options.get("skip_profile_memory")
+            and not options.get("runtime_task_id")
+            and not options.get("parent_session_id")
+            and not self._conversation_shared
+            and options.get("conversation_persistence_policy") != "none"
+        ):
+            if platform in (None, "cli", "sdk") and workspace_scope is None:
+                memory_principal = LOCAL_OWNER
+            elif options.get("chat_type") == "dm":
+                candidate = gateway_memory_principal(
+                    platform,
+                    options.get("user_id"),
+                    chat_id=options.get("chat_id"),
+                    owner_routes=memory_settings.get("owner_gateway_routes"),
+                )
+                if candidate is not None and candidate == options.get("memory_principal"):
+                    memory_principal = candidate
         self.environment = CodexEnvironment.build(
-            self.profile, settings=settings, workspace_scope=workspace_scope
+            self.profile,
+            settings=settings,
+            workspace_scope=workspace_scope,
+            memory_principal=memory_principal,
+            memory_writable=memory_writable,
+        )
+        self._memory_access = (
+            (memory_principal, memory_writable) if memory_principal else None
         )
         # Model/provider truth is Codex TOML. Old credentials and provider URL
         # arguments must not silently select a different backend.
@@ -194,16 +235,11 @@ class AIAgent(MemoryLifecycle):
         self._business_uncertain = False
         self._dispatched_write = False
         self._failed_mutations = {}
-        self._decision_turn = None
-        self._experience_turn = None
         self._current_task_id = None
         self._current_turn_id = None
         self._stream_callback = None
         self._print_fn = None
         self._stream_scrubber = StreamingContextScrubber()
-        self.background_review_callback = None
-        self._skip_memory = options.get("skip_memory", False)
-        self._memory_post_turn_prefetch_enabled = False
         self._activity_ts = time.monotonic()
         self._activity_description = "idle"
         self._turn_lock = threading.Lock()
@@ -319,20 +355,6 @@ class AIAgent(MemoryLifecycle):
         from tools.todo_tool import TodoStore
 
         self._todo_store = TodoStore()
-        from agent.business_memory import initialize_memory
-
-        with self._profile_context():
-            initialize_memory(self, self.config, options)
-        self._automatic_memory_ingestion_enabled = options.get(
-            "automatic_memory_ingestion_enabled",
-            self._automatic_memory_ingestion_enabled,
-        )
-        self._memory_write_mode = options.get(
-            "memory_write_mode", self._memory_write_mode
-        )
-        # Automatic background review belongs to neither startup nor idle.
-        # Explicit background jobs still use this same facade.
-        self._background_review_enabled = False
 
     @contextmanager
     def _profile_context(self):
@@ -398,35 +420,6 @@ class AIAgent(MemoryLifecycle):
                 from agent.codex_execution import execute
 
                 return execute(self, name, args)
-            if name == "memory":
-                from tools.memory_tool import memory_tool
-
-                if (
-                    self._memory_write_mode in {"off", "none", "read-only"}
-                    and args.get("action") != "read"
-                ):
-                    raise PermissionError("Memory writes disabled for this scope")
-                target = args.get("target", "memory")
-                if (target == "memory" and not self._memory_enabled) or (
-                    target == "user" and not self._user_profile_enabled
-                ):
-                    raise PermissionError("This memory target is disabled")
-                if self._memory_store is None:
-                    raise PermissionError("Profile memory not enabled in this scope")
-                result = memory_tool(
-                    action=args.get("action"),
-                    target=args.get("target", "memory"),
-                    content=args.get("content"),
-                    old_text=args.get("old_text"),
-                    store=self._memory_store,
-                )
-                if self._memory_manager and args.get("action") in {"add", "replace"}:
-                    self._memory_manager.on_memory_write(
-                        args["action"],
-                        args.get("target", "memory"),
-                        args.get("content", ""),
-                    )
-                return result
             if name == "todo":
                 from tools.todo_tool import todo_tool
 
@@ -435,10 +428,6 @@ class AIAgent(MemoryLifecycle):
                     merge=args.get("merge", False),
                     store=self._todo_store,
                 )
-            if name == "experience_decision":
-                from tools.experience_decision_tool import experience_decision_tool
-
-                return experience_decision_tool(args, runtime=self._decision_turn)
             if name == "session_search":
                 return self._search_history(args)
             if name in {"skills_list", "skill_view"}:
@@ -459,8 +448,6 @@ class AIAgent(MemoryLifecycle):
                 from tools.delegate_tool import delegate_task
 
                 return delegate_task(**args, parent_agent=self)
-            if self._memory_manager and self._memory_manager.has_tool(name):
-                return self._memory_manager.handle_tool_call(name, args)
             if name == "send_message":
                 from gateway.turn_context import get_current_turn
 
@@ -483,7 +470,7 @@ class AIAgent(MemoryLifecycle):
 
     @staticmethod
     def _tool_can_write(name, args):
-        if name in {"memory", "cronjob", "experience_decision"}:
+        if name == "cronjob":
             return args.get("action") not in {
                 "read",
                 "list",
@@ -620,64 +607,6 @@ class AIAgent(MemoryLifecycle):
             self._session_db = SessionDB(self.profile / "state.db")
         return self._session_db
 
-    def _memory_context(self, user_message, raw_user_message, turn_origin):
-        context = []
-        if self._memory_store:
-            targets = ([] if not self._memory_enabled else ["memory"]) + (
-                [] if not self._user_profile_enabled else ["user"]
-            )
-            context += [
-                self._memory_store.format_for_system_prompt(k) or "" for k in targets
-            ]
-        if self._memory_manager:
-            provider_context = self._memory_manager.build_system_prompt()
-            if provider_context:
-                context.append(build_memory_context_block(provider_context))
-            from agent.memory_recall import recall_external
-
-            recalled = recall_external(self, user_message, self._session_messages)
-            if recalled:
-                context.append(build_memory_context_block(recalled))
-        consolidation = (self.config.get("memory") or {}).get("consolidation") or {}
-        if (
-            not self._skip_memory
-            and consolidation.get("enabled")
-            and consolidation.get("legacy_recall_enabled") is True
-        ):
-            try:
-                from agent.memory_consolidation_runner import (
-                    retrieve_consolidated_memory,
-                )
-
-                recalled = retrieve_consolidated_memory(
-                    scope_id=self._user_id or "local-owner",
-                    scope_type="user" if self._user_id else "profile",
-                    query=user_message,
-                    limit=int(consolidation.get("retrieval_limit", 8)),
-                )
-                if recalled:
-                    context.append(build_memory_context_block(recalled))
-            except Exception as exc:
-                logger.debug("Consolidated recall failed: %s", type(exc).__name__)
-        from agent.experience.runtime import (
-            prepare_experience_turn,
-            prepare_decision_capture_turn,
-        )
-
-        self._experience_turn = prepare_experience_turn(
-            self, raw_user_message=raw_user_message, turn_origin=turn_origin
-        )
-        self._decision_turn = prepare_decision_capture_turn(
-            self, raw_user_message=raw_user_message, turn_origin=turn_origin
-        )
-        if self._experience_turn:
-            context.append(
-                self._experience_turn.context_for_request(
-                    provider=self.provider, base_url=self.base_url
-                )
-            )
-        return "\n\n".join(x for x in context if x)
-
     def _new_session(self, thread_id):
         from agent.codex_bridge import BusinessBridge
         from agent.transports.codex_app_server import check_codex_binary
@@ -694,13 +623,19 @@ class AIAgent(MemoryLifecycle):
         self._bridge = BusinessBridge(self)
         from tools.terminal_tool import _get_approval_callback
 
+        instructions = self.ephemeral_system_prompt
+        if self.environment.memory is not None:
+            guidance = memory_instructions(
+                self.environment.memory, writable=self.environment.memory_writable
+            )
+            instructions = "\n\n".join(filter(None, (instructions, guidance)))
         self._codex_session = CodexAppServerSession(
             environment=self.environment,
             codex_bin=binary,
             thread_id=thread_id,
             bridge=self._bridge,
             model=self.model or None,
-            instructions=self.ephemeral_system_prompt,
+            instructions=instructions,
             approval_callback=_get_approval_callback(),
             clarify_callback=self.clarify_callback,
             on_event=self._on_codex_event,
@@ -762,8 +697,6 @@ class AIAgent(MemoryLifecycle):
                 self._business_uncertain = False
                 self._dispatched_write = False
                 self._failed_mutations = {}
-                self._decision_turn = None
-                self._experience_turn = None
                 with self._sampling_budget_lock:
                     self._sampling_remaining = max(
                         0,
@@ -792,7 +725,8 @@ class AIAgent(MemoryLifecycle):
                     raise CodexConfigurationError(
                         "Legacy per-task execution backends are not supported by this Codex adapter"
                     )
-                self.state.claim_scope()
+                if self.state.claim_scope(memory_access=self._memory_access):
+                    thread_id = None
                 if self._codex_session is None:
                     self._new_session(thread_id)
                 db = self._get_session_db_for_recall()
@@ -837,31 +771,12 @@ class AIAgent(MemoryLifecycle):
                 self._codex_session.ensure_started()
                 self.provider = self._codex_session.effective_provider or self.provider
                 self.base_url = self._codex_session.provider_base_url or self.base_url
-                memory_text = (
-                    user_message
-                    if isinstance(user_message, str)
-                    else "\n".join(
-                        str(part.get("text") or "")
-                        for part in user_message
-                        if isinstance(part, dict)
-                        and part.get("type") in {"text", "input_text"}
-                    )
-                )
-                context = (
-                    ""
-                    if runtime_action
-                    else self._memory_context(
-                        memory_text,
-                        raw_user_message
-                        or (user_message if isinstance(user_message, str) else None),
-                        turn_origin,
-                    )
-                )
+                context = ""
                 # Native history remains native history. Import only dialogue
                 # text once into a new Thread, labelled as non-executable data.
                 if not thread_id and history:
                     safe = [
-                        {"role": m.get("role"), "content": m.get("content")}
+                        {"role": m.get("role"), "content": sanitize_context(m["content"])}
                         for m in history[-12:]
                         if m.get("role") in {"user", "assistant"}
                         and isinstance(m.get("content"), str)
@@ -945,17 +860,6 @@ class AIAgent(MemoryLifecycle):
                 if turn.should_retire or turn.interrupted:
                     self.interrupt("Parent turn stopped")
                     self.release_clients()
-                if (
-                    completed
-                    and not runtime_action
-                    and self._automatic_memory_ingestion_enabled
-                ):
-                    self._sync_external_memory_for_turn(
-                        original_user_message=memory_text,
-                        final_response=final,
-                        interrupted=False,
-                        messages=self._session_messages,
-                    )
                 if db:
                     # Canonical raw history excludes recalled context and secrets.
                     from agent.redact import redact_sensitive_text
@@ -1132,7 +1036,6 @@ class AIAgent(MemoryLifecycle):
     def reset_session_state(self, session_id=None, **kwargs):
         if self._turn_lock.locked():
             raise RuntimeError("Stop the active turn before resetting the session")
-        self.commit_memory_session(self._session_messages)
         self.release_clients()
         self.session_id = session_id or "marlow_" + uuid.uuid4().hex
         self.scope = dict(self.scope, session=self.session_id)
@@ -1159,13 +1062,6 @@ class AIAgent(MemoryLifecycle):
         ):
             setattr(self, "session_" + name, 0)
         self.usage_available = False
-        # Providers receive the real new session identity, rather than retaining
-        # another conversation's cached memory state.
-        self.shutdown_memory_provider()
-        from agent.business_memory import initialize_memory
-
-        with self._profile_context():
-            initialize_memory(self, self.config, {"skip_memory": self._skip_memory})
 
     def switch_model(self, new_model, new_provider=None, **kwargs):
         if self._turn_lock.locked():
@@ -1229,7 +1125,6 @@ class AIAgent(MemoryLifecycle):
         self._closed = True
         self.interrupt()
         self.release_clients()
-        self.shutdown_memory_provider(self._session_messages)
         if self._current_task_id:
             from tools.browser_tool import cleanup_browser
 

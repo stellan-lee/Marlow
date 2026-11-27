@@ -918,8 +918,3 @@ def get_cute_tool_message(
     return _wrap(f"┊ ⚡ {tool_name[:9]:9} {_trunc(preview, 35)}  {dur}")
 
 
-# =========================================================================
-# Honcho session line (one-liner with clickable OSC 8 hyperlink)
-# =========================================================================
-
-

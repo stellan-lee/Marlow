@@ -18,21 +18,6 @@ Usage:
     marlow cron list           # List cron jobs
     marlow cron status         # Check if cron scheduler is running
     marlow doctor              # Check configuration and dependencies
-    marlow honcho setup                    # Configure Honcho AI memory integration
-    marlow honcho status                   # Show Honcho config and connection status
-    marlow honcho sessions                 # List directory → session name mappings
-    marlow honcho map <name>               # Map current directory to a session name
-    marlow honcho peer                     # Show peer names and dialectic settings
-    marlow honcho peer --user NAME         # Set user peer name
-    marlow honcho peer --ai NAME           # Set AI peer name
-    marlow honcho peer --reasoning LEVEL   # Set dialectic reasoning level
-    marlow honcho mode                     # Show current memory mode
-    marlow honcho mode [hybrid|honcho|local]  # Set memory mode
-    marlow honcho tokens                   # Show token budget settings
-    marlow honcho tokens --context N       # Set session.context() token cap
-    marlow honcho tokens --dialectic N     # Set dialectic result char cap
-    marlow honcho identity                 # Show AI peer identity representation
-    marlow honcho identity <file>          # Seed AI peer identity from a file (SOUL.md etc.)
     marlow version             Show version
     marlow update              Update to latest version
     marlow uninstall           Uninstall Marlow Agent
@@ -2504,16 +2489,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
         except Exception:
             pass  # non-fatal — worst case a lazy import fails gracefully
 
-        # Sync Honcho host blocks to all profiles
-        try:
-            from plugins.memory.honcho.cli import sync_honcho_profiles_quiet
-
-            synced = sync_honcho_profiles_quiet()
-            if synced:
-                print(f"\n-> Honcho: synced {synced} profile(s)")
-        except Exception:
-            pass  # honcho plugin not installed or not configured
-
         # Check for config migrations
         print()
         print("→ Checking configuration for new options...")
@@ -3257,12 +3232,10 @@ def _coalesce_session_name_args(argv: list) -> list:
         "update",
         "uninstall",
         "profile",
-        "honcho",
         "plugins",
         "security",
         "webhook",
         "memory",
-        "experience",
         "dump",
         "debug",
         "completion",
@@ -3418,16 +3391,6 @@ def cmd_profile(args):
                     print(
                         f"Cloned config, .env, SOUL.md, and skills from {source_label}."
                     )
-
-            # Auto-clone Honcho config for the new profile (only with --clone/--clone-all)
-            if clone or clone_all:
-                try:
-                    from plugins.memory.honcho.cli import clone_honcho_for_profile
-
-                    if clone_honcho_for_profile(name):
-                        print(f"Honcho config cloned (peer: {name})")
-                except Exception:
-                    pass  # Honcho plugin not installed or not configured
 
             if no_skills:
                 print("Bundled on-demand skills disabled (--no-skills).")
@@ -3964,7 +3927,6 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "checkpoints", "completion",
         "config", "cron", "debug", "doctor",
         "dump", "runtime", "gateway", "hooks", "insights",
-        "experience",
         "login", "logout", "logs", "mcp", "memory",
         "model", "pairing", "plugins", "postinstall", "profile",
         "prompt-size",
@@ -5145,7 +5107,7 @@ Examples:
     plugins_parser.set_defaults(func=cmd_plugins)
 
     # =========================================================================
-    # Plugin CLI commands — dynamically registered by memory/general plugins.
+    # Plugin CLI commands — dynamically registered by general plugins.
     # Plugins provide a register_cli(subparser) function that builds their
     # own argparse tree.  No hardcoded plugin commands in main.py.
     #
@@ -5157,26 +5119,10 @@ Examples:
     # =========================================================================
     if _plugin_cli_discovery_needed():
         try:
-            from plugins.memory import discover_plugin_cli_commands
             from marlow_cli.plugins import discover_plugins, get_plugin_manager
-
-            seen_plugin_commands = set()
-            for cmd_info in discover_plugin_cli_commands():
-                plugin_parser = subparsers.add_parser(
-                    cmd_info["name"],
-                    help=cmd_info["help"],
-                    description=cmd_info.get("description", ""),
-                    formatter_class=__import__("argparse").RawDescriptionHelpFormatter,
-                )
-                cmd_info["setup_fn"](plugin_parser)
-                if cmd_info.get("handler_fn") is not None:
-                    plugin_parser.set_defaults(func=cmd_info["handler_fn"])
-                seen_plugin_commands.add(cmd_info["name"])
 
             discover_plugins()
             for cmd_info in get_plugin_manager()._cli_commands.values():
-                if cmd_info["name"] in seen_plugin_commands:
-                    continue
                 plugin_parser = subparsers.add_parser(
                     cmd_info["name"],
                     help=cmd_info["help"],
@@ -5190,125 +5136,26 @@ Examples:
             logging.getLogger(__name__).debug("Plugin CLI discovery failed: %s", _exc)
 
     # =========================================================================
-    # experience command — user governance for durable work experience
-    # =========================================================================
-    experience_parser = subparsers.add_parser(
-        "experience",
-        help="Inspect and govern durable work experience",
-        description=(
-            "Manage project-scoped Work Experience lessons and recall policy. "
-            "Policies are stored in the active profile's state.db."
-        ),
-    )
-    from marlow_cli.experience import register_cli as _register_experience_cli
-
-    _register_experience_cli(experience_parser)
-
-    # =========================================================================
     # memory command
     # =========================================================================
     memory_parser = subparsers.add_parser(
         "memory",
-        help="Configure external memory provider",
-        description=(
-            "Set up and manage external memory provider plugins.\n\n"
-            "Bundled external memory provider: honcho.\n\n"
-            "Only one external provider can be active at a time.\n"
-            "Built-in memory (MEMORY.md/USER.md) is always active."
-        ),
+        help="Migrate legacy memory into agent-managed Markdown files",
     )
-    memory_sub = memory_parser.add_subparsers(dest="memory_command")
-    _setup_parser = memory_sub.add_parser(
-        "setup", help="Interactive provider selection and configuration"
-    )
-    _setup_parser.add_argument(
-        "provider",
-        nargs="?",
-        default=None,
-        help="Provider to configure directly (e.g. honcho), skipping the picker",
-    )
-    memory_sub.add_parser("status", help="Show current memory provider config")
-    memory_sub.add_parser("off", help="Disable external provider (built-in only)")
-    _reset_parser = memory_sub.add_parser(
-        "reset",
-        help="Erase all built-in memory (MEMORY.md and USER.md)",
-    )
-    _reset_parser.add_argument(
-        "--yes",
-        "-y",
-        action="store_true",
-        help="Skip confirmation prompt",
-    )
-    _reset_parser.add_argument(
-        "--target",
-        choices=["all", "memory", "user"],
-        default="all",
-        help="Which store to reset: 'all' (default), 'memory', or 'user'",
+    memory_sub = memory_parser.add_subparsers(dest="memory_command", required=True)
+    migrate_parser = memory_sub.add_parser(
+        "migrate", help="Back up and migrate local memory with a scope report"
     )
 
-    def cmd_memory(args):
-        sub = getattr(args, "memory_command", None)
-        if sub == "off":
-            from marlow_cli.config import load_config, save_config
+    def cmd_memory_migrate(args):
+        from agent.memory_migration import migrate_memory
 
-            config = load_config()
-            if not isinstance(config.get("memory"), dict):
-                config["memory"] = {}
-            config["memory"]["provider"] = ""
-            save_config(config)
-            print("\n  ✓ Memory provider: built-in only")
-            print("  Saved to config.yaml\n")
-        elif sub == "reset":
-            from marlow_constants import get_marlow_home, display_marlow_home
+        report = migrate_memory()
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        if report["status"] in {"blocked", "failed"}:
+            raise SystemExit(1)
 
-            mem_dir = get_marlow_home() / "memories"
-            target = getattr(args, "target", "all")
-            files_to_reset = []
-            if target in {"all", "memory"}:
-                files_to_reset.append(("MEMORY.md", "agent notes"))
-            if target in {"all", "user"}:
-                files_to_reset.append(("USER.md", "user profile"))
-
-            # Check what exists
-            existing = [
-                (f, desc) for f, desc in files_to_reset if (mem_dir / f).exists()
-            ]
-            if not existing:
-                print(
-                    f"\n  Nothing to reset — no memory files found in {display_marlow_home()}/memories/\n"
-                )
-                return
-
-            print(f"\n  This will permanently erase the following memory files:")
-            for f, desc in existing:
-                path = mem_dir / f
-                size = path.stat().st_size
-                print(f"    ◆ {f} ({desc}) — {size:,} bytes")
-
-            if not getattr(args, "yes", False):
-                try:
-                    answer = input("\n  Type 'yes' to confirm: ").strip().lower()
-                except (EOFError, KeyboardInterrupt):
-                    print("\n  Cancelled.\n")
-                    return
-                if answer != "yes":
-                    print("  Cancelled.\n")
-                    return
-
-            for f, desc in existing:
-                (mem_dir / f).unlink()
-                print(f"  ✓ Deleted {f} ({desc})")
-
-            print(
-                f"\n  Memory reset complete. New sessions will start with a blank slate."
-            )
-            print(f"  Files were in: {display_marlow_home()}/memories/\n")
-        else:
-            from marlow_cli.memory_setup import memory_command
-
-            memory_command(args)
-
-    memory_parser.set_defaults(func=cmd_memory)
+    migrate_parser.set_defaults(func=cmd_memory_migrate)
 
     # =========================================================================
     # tools command
@@ -5318,7 +5165,7 @@ Examples:
         help="Configure which tools are enabled per platform",
         description=(
             "Enable, disable, or list tools for CLI, Telegram, Discord, etc.\n\n"
-            "Built-in toolsets use plain names (e.g. web, memory).\n"
+            "Built-in toolsets use plain names (e.g. web, file).\n"
             "MCP tools use server:tool notation (e.g. github:create_issue).\n\n"
             "Run 'marlow tools' with no subcommand for the interactive configuration UI."
         ),
@@ -6171,7 +6018,7 @@ Examples:
         help="Show a byte breakdown of the system prompt + tool schemas",
         description=(
             "Report the fixed prompt budget for a fresh session: system "
-            "prompt total, skills index, memory, user profile, and tool-schema "
+            "prompt total, skills index, and tool-schema "
             "JSON. Runs offline (no API call)."
         ),
     )

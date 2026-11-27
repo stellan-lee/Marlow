@@ -326,7 +326,6 @@ async def test_session_hygiene_default_hard_message_limit_does_not_fire_at_12_me
             type(self).last_instance = self
             self.session_id = kwargs.get("session_id", "fake-session")
             self._print_fn = None
-            self.shutdown_memory_provider = MagicMock()
             self.close = MagicMock()
 
         def _compress_context(self, messages, *_args, **_kwargs):

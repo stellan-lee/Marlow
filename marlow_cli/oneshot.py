@@ -143,7 +143,6 @@ def run_oneshot(
     """
     from marlow_cli.config import load_config
     from marlow_cli.query import local_query_approvals
-    from plugins.memory import RETIRED_MEMORY_PROVIDER, RETIRED_MEMORY_PROVIDER_MESSAGE
 
     # --provider without --model is ambiguous: carrying the user's configured
     # model across to a different provider is usually wrong (that provider may
@@ -163,10 +162,6 @@ def run_oneshot(
         sys.stderr.write(toolsets_error)
         return 2
     use_config_toolsets = _normalize_toolsets(toolsets) is None
-    memory = load_config().get("memory") or {}
-    if isinstance(memory, dict) and str(memory.get("provider", "")).strip().lower() == RETIRED_MEMORY_PROVIDER:
-        sys.stderr.write(RETIRED_MEMORY_PROVIDER_MESSAGE + "\n")
-
     # Redirect stderr AND stdout to devnull for the entire call tree.
     # We'll print the final response to the real stdout at the end.
     real_stdout = sys.stdout
@@ -300,13 +295,10 @@ def _run_agent(
         return agent.chat(prompt) or ""
     finally:
         try:
-            agent.shutdown_memory_provider(agent._session_messages)
+            agent.close()
         finally:
-            try:
-                agent.close()
-            finally:
-                if session_db is not None:
-                    session_db.close()
+            if session_db is not None:
+                session_db.close()
 
 
 def _oneshot_clarify_callback(question, choices=None):

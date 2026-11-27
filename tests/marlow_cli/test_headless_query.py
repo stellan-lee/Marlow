@@ -81,13 +81,13 @@ def test_oneshot_checks_protected_actions(monkeypatch, capsys, yolo):
     assert approval._headless_local_queries == 0
 
 
-def test_oneshot_reports_retired_memory_provider_on_stderr(monkeypatch, capsys):
+def test_oneshot_preserves_stdout_with_legacy_memory_config(monkeypatch, capsys):
     monkeypatch.setattr("marlow_cli.config.load_config", lambda: {"memory": {"provider": "holographic"}})
     monkeypatch.setattr(oneshot, "_run_agent", lambda *_a, **_kw: "answer")
     assert oneshot.run_oneshot("hello") == 0
     result = capsys.readouterr()
     assert result.out == "answer\n"
-    assert "Holographic" in result.err
+    assert result.err == ""
 
 
 def test_query_keeps_raw_text_session_and_checkpoint(tmp_path, monkeypatch, capsys):

@@ -1,5 +1,8 @@
 # Phase 2 实施与验证交接
 
+> 本文保留 Phase 2 的历史验证结果。当前的 Markdown 记忆架构和迁移步骤见
+> [Memory](../../README.md#memory)。
+
 ## 基线与交付状态
 
 实施位置是 `/workspace/Marlow`，基线为用户指定的远端 `main@37d58cdb`；

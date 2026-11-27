@@ -132,11 +132,6 @@ def _configured_platforms() -> list[str]:
     return [name for name, env in checks.items() if os.getenv(env)]
 
 
-def _memory_provider(config: dict) -> str:
-    """Return the active memory provider name."""
-    mem = config.get("memory", {})
-    provider = mem.get("provider", "")
-    return provider if provider else "built-in"
 
 
 def _get_model_and_provider(config: dict) -> tuple[str, str]:
@@ -278,7 +273,7 @@ def run_dump(args):
     toolsets = config.get("toolsets", ["marlow-cli"])
     lines.append(f"  toolsets:           {', '.join(toolsets) if toolsets else '(default)'}")
     lines.append(f"  mcp_servers:        {_count_mcp_servers(config)}")
-    lines.append(f"  memory_provider:    {_memory_provider(config)}")
+    lines.append("  memory:             agent-managed files")
     lines.append(f"  gateway:            {_gateway_status()}")
 
     platforms = _configured_platforms()

@@ -690,11 +690,8 @@ def on_pre_llm_call(*, task_id: str = "", session_id: str = "", platform: str = 
                     provider: str = "", base_url: str = "", api_mode: str = "",
                     api_call_count: int = 0, messages: Any = None, turn_type: str = "user",
                     conversation_history: Any = None, user_message: Any = None, **_: Any) -> None:
-    # Older Marlow branches used pre_llm_call for request-scoped tracing and
-    # passed the actual API messages. Current Marlow also has a turn-scoped
-    # pre_llm_call used for context injection; tracing that hook creates an
-    # extra orphan/root trace before the real request trace. Only trace the
-    # legacy request-shaped call here.
+    # Older branches passed API messages directly to pre_llm_call.
+    # Trace only that legacy request shape here.
     if not isinstance(messages, list):
         return
 
@@ -702,10 +699,6 @@ def on_pre_llm_call(*, task_id: str = "", session_id: str = "", platform: str = 
     if client is None:
         return
 
-    # messages is a list only for legacy Marlow branches that fired
-    # pre_llm_call with API messages directly. Current Marlow fires
-    # pre_llm_call for context injection (conversation_history/user_message,
-    # no messages list) — tracing that would create orphan traces.
     task_key = _trace_key(task_id, session_id)
 
     with _STATE_LOCK:

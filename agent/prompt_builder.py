@@ -1,7 +1,7 @@
 """System prompt assembly -- identity, platform hints, skills index, context files.
 
 All functions are stateless. AIAgent._build_system_prompt() calls these to
-assemble pieces, then combines them with memory and ephemeral prompts.
+assemble reusable prompt pieces.
 """
 
 import json
@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 # .cursorrules, SOUL.md before they get injected into the system prompt.
 #
 # Patterns live in ``tools/threat_patterns.py`` — the single source of truth
-# shared with the memory-tool scanner and the tool-result delimiter system.
+# shared with the tool-result delimiter system.
 # This module just chooses how to react when a match is found (block-with-
 # placeholder; the actual content never reaches the system prompt).
 # ---------------------------------------------------------------------------
@@ -132,40 +132,6 @@ MARLOW_AGENT_HELP_GUIDANCE = (
     "If the user asks about configuring, setting up, or using Marlow Agent "
     "itself, consult the project guide at https://github.com/stellan-lee/Marlow#readme "
     "or inspect the relevant `marlow` command's help."
-)
-
-MEMORY_GUIDANCE = (
-    "You have persistent memory across sessions. Save durable facts using the memory "
-    "tool: user preferences, environment details, tool quirks, and stable conventions. "
-    "Memory is injected into every turn, so keep it compact and focused on facts that "
-    "will still matter later.\n"
-    "Prioritize what reduces future user steering — the most valuable memory is one "
-    "that prevents the user from having to correct or remind you again. "
-    "User preferences and recurring corrections matter more than procedural task details.\n"
-    "Do NOT save task progress, session outcomes, completed-work logs, or temporary TODO "
-    "state to memory; use session_search to recall those from past transcripts. "
-    "Specifically: do not record PR numbers, issue numbers, commit SHAs, 'fixed bug X', "
-    "'submitted PR Y', 'Phase N done', file counts, or any artifact that will be stale "
-    "in 7 days. If a fact will be stale in a week, it does not belong in memory. "
-    "If you've discovered a new way to do something, solved a problem that could be "
-    "necessary later, save it as a skill with the skill tool.\n"
-    "Write memories as declarative facts, not instructions to yourself. "
-    "'User prefers concise responses' ✓ — 'Always respond concisely' ✗. "
-    "'Project uses pytest with xdist' ✓ — 'Run tests with pytest -n 4' ✗. "
-    "Imperative phrasing gets re-read as a directive in later sessions and can "
-    "cause repeated work or override the user's current request. Procedures and "
-    "workflows belong in skills, not memory."
-)
-
-SESSION_SEARCH_GUIDANCE = (
-    "session_search is lower-priority, supporting context — a fallback for explicit "
-    "past-session recall, not a primary source. Always defer to the current user "
-    "request, long-term memory, and the user profile first; reach for session_search "
-    "only when the user references something from a past conversation or you suspect "
-    "relevant cross-session context exists that those higher-priority sources do not "
-    "cover. Treat anything it returns as older, weaker evidence: when it conflicts "
-    "with memory, the profile, or what the user is asking for now, the current "
-    "request and durable memory win."
 )
 
 CLARIFY_GUIDANCE = (

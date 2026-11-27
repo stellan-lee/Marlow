@@ -41,7 +41,7 @@ class TestEnsureMarlowHome:
             assert (tmp_path / "cron").is_dir()
             assert (tmp_path / "sessions").is_dir()
             assert (tmp_path / "logs").is_dir()
-            assert (tmp_path / "memories").is_dir()
+            assert not (tmp_path / "memories").exists()
 
     def test_creates_default_soul_md_if_missing(self, tmp_path):
         with patch.dict(os.environ, {"MARLOW_HOME": str(tmp_path)}):

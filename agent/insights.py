@@ -127,10 +127,9 @@ class InsightsEngine:
         skill_usage = self._get_skill_usage(cutoff, source)
         usage_events = self._get_usage_events(cutoff, source)
         tracking_started_at = self._usage_tracking_started_at()
-        experience = self._get_experience_usage(cutoff, usage_events, source=source)
         message_stats = self._get_message_stats(cutoff, source)
 
-        if not sessions and not usage_events and not experience.get("summary", {}).get("retrieval_attempts"):
+        if not sessions and not usage_events:
             return {
                 "days": days,
                 "source_filter": source,
@@ -140,8 +139,6 @@ class InsightsEngine:
                 "platforms": [],
                 "tools": [],
                 "mcp": self._empty_mcp_breakdown(),
-                "memory": self._empty_memory_breakdown(),
-                "experience": self._empty_experience_breakdown(),
                 "skills": {
                     "summary": {
                         "total_skill_loads": 0,
@@ -167,7 +164,6 @@ class InsightsEngine:
             self._merge_skill_usage(skill_usage, usage_events)
         )
         mcp = self._compute_mcp_breakdown(tool_usage, usage_events)
-        memory = self._compute_memory_breakdown(usage_events)
         activity = self._compute_activity_patterns(sessions)
         top_sessions = self._compute_top_sessions(sessions)
 
@@ -182,8 +178,6 @@ class InsightsEngine:
             "tools": tools,
             "skills": skills,
             "mcp": mcp,
-            "memory": memory,
-            "experience": experience,
             "activity": activity,
             "top_sessions": top_sessions,
             "usage_tracking_started_at": tracking_started_at,
@@ -223,7 +217,10 @@ class InsightsEngine:
 
     def _get_usage_events(self, cutoff: float, source: str = None) -> List[Dict]:
         try:
-            return self.db.list_usage_events(since=cutoff, source=source)
+            return [
+                event for event in self.db.list_usage_events(since=cutoff, source=source)
+                if event["subsystem"] in {"tool", "skill", "mcp"}
+            ]
         except Exception:
             return []
 
@@ -539,94 +536,6 @@ class InsightsEngine:
             ) or None
         return list(merged.values())
 
-    def _get_experience_usage(
-        self,
-        cutoff: float,
-        events: List[Dict],
-        *,
-        source: str | None = None,
-    ) -> Dict[str, Any]:
-        result = self._empty_experience_breakdown()
-        if source is None:
-            try:
-                retrieval = self._conn.execute(
-                    """
-                    SELECT COUNT(*) AS attempts
-                    FROM experience_retrievals WHERE created_at >= ?
-                    """,
-                    (cutoff,),
-                ).fetchone()
-                matched = self._conn.execute(
-                    """
-                    SELECT COUNT(DISTINCT ri.retrieval_id) AS matched_attempts,
-                           COUNT(*) AS lessons_returned
-                    FROM experience_retrieval_items ri
-                    JOIN experience_retrievals r ON r.id = ri.retrieval_id
-                    WHERE r.created_at >= ?
-                    """,
-                    (cutoff,),
-                ).fetchone()
-                top_rows = self._conn.execute(
-                    """
-                    SELECT ri.item_id, COUNT(*) AS recall_count,
-                           MAX(r.created_at) AS last_recalled_at
-                    FROM experience_retrieval_items ri
-                    JOIN experience_retrievals r ON r.id = ri.retrieval_id
-                    WHERE r.created_at >= ?
-                    GROUP BY ri.item_id
-                    ORDER BY recall_count DESC, last_recalled_at DESC
-                    LIMIT 10
-                    """,
-                    (cutoff,),
-                ).fetchall()
-                result["summary"].update(
-                    {
-                        "retrieval_attempts": int(retrieval["attempts"] or 0),
-                        "attempts_with_matches": int(matched["matched_attempts"] or 0),
-                        "lessons_returned": int(matched["lessons_returned"] or 0),
-                    }
-                )
-                result["top_lessons"] = [dict(row) for row in top_rows]
-            except Exception:
-                pass
-
-        attempts = [
-            event
-            for event in events
-            if event.get("subsystem") == "experience"
-            and event.get("action") == "recall_attempt"
-        ]
-        hits = [
-            event
-            for event in events
-            if event.get("subsystem") == "experience"
-            and event.get("action") == "recall_hit"
-        ]
-        result["summary"]["retrieval_attempts"] = max(
-            result["summary"]["retrieval_attempts"],
-            sum(self._event_count(event) or 1 for event in attempts),
-        )
-        result["summary"]["attempts_with_matches"] = max(
-            result["summary"]["attempts_with_matches"],
-            len(hits),
-        )
-        result["summary"]["lessons_returned"] = max(
-            result["summary"]["lessons_returned"],
-            sum(self._event_count(event) for event in hits),
-        )
-
-        injections = [
-            event
-            for event in events
-            if event.get("subsystem") == "experience"
-            and event.get("action") == "context_injected"
-        ]
-        result["summary"]["context_injections"] = len(injections)
-        result["summary"]["lessons_injected"] = sum(
-            self._event_count(event) for event in injections
-        )
-        return result
-
     def _get_message_stats(self, cutoff: float, source: str = None) -> Dict:
         """Get aggregate message statistics."""
         if source:
@@ -675,33 +584,6 @@ class InsightsEngine:
             },
             "top_servers": [],
             "top_tools": [],
-        }
-
-    @staticmethod
-    def _empty_memory_breakdown() -> Dict[str, Any]:
-        return {
-            "summary": {
-                "recall_attempts": 0,
-                "recall_hits": 0,
-                "context_injections": 0,
-                "hit_rate": 0.0,
-                "writes": 0,
-                "explicit_calls": 0,
-            },
-            "top_providers": [],
-        }
-
-    @staticmethod
-    def _empty_experience_breakdown() -> Dict[str, Any]:
-        return {
-            "summary": {
-                "retrieval_attempts": 0,
-                "attempts_with_matches": 0,
-                "lessons_returned": 0,
-                "context_injections": 0,
-                "lessons_injected": 0,
-            },
-            "top_lessons": [],
         }
 
     def _compute_mcp_breakdown(
@@ -762,54 +644,6 @@ class InsightsEngine:
                 for name, count in tool_counts.most_common(10)
             ],
         }
-
-    def _compute_memory_breakdown(self, events: List[Dict]) -> Dict[str, Any]:
-        summary = self._empty_memory_breakdown()["summary"]
-        providers: Dict[str, Counter] = defaultdict(Counter)
-        for event in events:
-            if event.get("subsystem") != "memory":
-                continue
-            action = str(event.get("action") or "")
-            provider = str(
-                event.get("parent_name")
-                or event.get("item_name")
-                or "unknown"
-            )
-            amount = self._event_count(event) or 1
-            if action == "recall_attempt":
-                summary["recall_attempts"] += amount
-                providers[provider]["attempts"] += amount
-            elif action == "recall_hit":
-                summary["recall_hits"] += amount
-                providers[provider]["hits"] += amount
-            elif action == "context_injected":
-                summary["context_injections"] += amount
-                providers[provider]["injections"] += amount
-            elif action == "write":
-                summary["writes"] += amount
-            elif action == "call":
-                summary["explicit_calls"] += amount
-        if summary["recall_attempts"]:
-            summary["hit_rate"] = (
-                summary["recall_hits"] / summary["recall_attempts"] * 100
-            )
-        top_providers = []
-        for provider, counts in providers.items():
-            attempts = counts["attempts"]
-            top_providers.append(
-                {
-                    "provider": provider,
-                    "attempts": attempts,
-                    "hits": counts["hits"],
-                    "injections": counts["injections"],
-                    "hit_rate": counts["hits"] / attempts * 100 if attempts else 0.0,
-                }
-            )
-        top_providers.sort(
-            key=lambda row: (row["injections"], row["hits"], row["attempts"]),
-            reverse=True,
-        )
-        return {"summary": summary, "top_providers": top_providers[:10]}
 
     def _compute_overview(self, sessions: List[Dict], message_stats: Dict) -> Dict:
         """Compute high-level overview statistics."""
@@ -1270,56 +1104,10 @@ class InsightsEngine:
                 )
             lines.append("")
 
-        memory = report.get("memory", {})
-        memory_summary = memory.get("summary", {})
-        if any(memory_summary.values()):
-            lines.append("  🧠 Memory Recall")
-            lines.append("  " + "─" * 56)
-            lines.append(
-                f"  Attempts: {memory_summary.get('recall_attempts', 0):,}  "
-                f"Hits: {memory_summary.get('recall_hits', 0):,}  "
-                f"Hit rate: {memory_summary.get('hit_rate', 0.0):.1f}%  "
-                f"Injections: {memory_summary.get('context_injections', 0):,}"
-            )
-            if memory_summary.get("writes") or memory_summary.get("explicit_calls"):
-                lines.append(
-                    f"  Writes: {memory_summary.get('writes', 0):,}  "
-                    f"Explicit memory calls: {memory_summary.get('explicit_calls', 0):,}"
-                )
-            for row in memory.get("top_providers", [])[:5]:
-                lines.append(
-                    f"    {row['provider'][:24]:<24} attempts={row['attempts']:<5,} "
-                    f"hits={row['hits']:<5,} injected={row['injections']:<5,}"
-                )
-            lines.append("")
-
-        experience = report.get("experience", {})
-        experience_summary = experience.get("summary", {})
-        if any(experience_summary.values()):
-            lines.append("  🧭 Work Experience")
-            lines.append("  " + "─" * 56)
-            lines.append(
-                f"  Retrievals: {experience_summary.get('retrieval_attempts', 0):,}  "
-                f"With matches: {experience_summary.get('attempts_with_matches', 0):,}  "
-                f"Lessons returned: {experience_summary.get('lessons_returned', 0):,}"
-            )
-            lines.append(
-                f"  Context injections: {experience_summary.get('context_injections', 0):,}  "
-                f"Lessons injected: {experience_summary.get('lessons_injected', 0):,}"
-            )
-            if experience.get("top_lessons"):
-                lines.append("  Top recalled lessons:")
-                for row in experience["top_lessons"][:5]:
-                    lines.append(
-                        f"    {row['item_id'][:36]:<36} {row['recall_count']:>7,}"
-                    )
-            lines.append("  Recall is diagnostic; it does not prove application or benefit.")
-            lines.append("")
-
         tracking_started = report.get("usage_tracking_started_at")
         if tracking_started:
             lines.append(
-                "  Detailed source/recall tracking since "
+                "  Detailed usage tracking since "
                 + datetime.fromtimestamp(tracking_started).strftime("%b %d, %Y %H:%M")
             )
             lines.append("")
@@ -1428,25 +1216,6 @@ class InsightsEngine:
                 lines.append(
                     f"  {skill['skill']} — {skill['view_count']:,} loads, {skill['manage_count']:,} edits{suffix}"
                 )
-            lines.append("")
-
-        memory = report.get("memory", {})
-        if any(memory.get("summary", {}).values()):
-            ms = memory["summary"]
-            lines.append(
-                f"**🧠 Memory:** {ms['recall_hits']:,}/{ms['recall_attempts']:,} "
-                f"recall hits ({ms['hit_rate']:.1f}%), {ms['context_injections']:,} injections"
-            )
-            lines.append("")
-
-        experience = report.get("experience", {})
-        if any(experience.get("summary", {}).values()):
-            es = experience["summary"]
-            lines.append(
-                f"**🧭 Work Experience:** {es['retrieval_attempts']:,} retrievals, "
-                f"{es['lessons_returned']:,} lessons returned, "
-                f"{es['context_injections']:,} injections"
-            )
             lines.append("")
 
         # Activity summary

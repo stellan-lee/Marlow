@@ -20,8 +20,7 @@ def allowed_path(agent, raw, *, write=False):
 
         if is_write_denied(str(path)):
             raise PermissionError("Write is forbidden by Marlow file safety policy")
-    grants = [(str(agent.environment.workspace), True), *agent.environment.projects]
-    for root, writable in grants:
+    for root, writable in agent.environment.file_grants:
         if path == Path(root) or path.is_relative_to(Path(root)):
             if not write or writable:
                 return path
@@ -143,7 +142,10 @@ def execute(agent, name, args):
     program = (
         Path(__file__).with_name("codex_file_worker.py").read_text(encoding="utf-8")
     )
-    argv = [sys.executable, "-I", "-c", program, name, str(path), json.dumps(args)]
+    # Use the interpreter's canonical path inside the sandbox. A virtualenv
+    # launcher can follow an intermediate symlink outside its read grants.
+    python = str(Path(sys.executable).resolve())
+    argv = [python, "-I", "-c", program, name, str(path), json.dumps(args)]
     prior_dispatch = agent._dispatched_write
     if write:
         agent._dispatched_write = True

@@ -17,7 +17,7 @@ def test_configurable_toolsets_match_retained_surface():
     assert keys == {
         "admin_approval", "browser", "clarify", "code_execution",
         "context_engine", "cronjob", "delegation", "file",
-        "memory", "messaging", "moa", "session_search",
+        "messaging", "moa", "session_search",
         "skills", "terminal", "todo", "vision", "web",
     }
 
