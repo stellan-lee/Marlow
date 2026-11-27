@@ -267,6 +267,19 @@ class CodexEnvironment:
                 raise CodexConfigurationError(
                     "A project grant cannot include runtime/profile state"
                 )
+            if profile.parent.name == "profiles" and (
+                not path.is_relative_to(workspace_base)
+                and (
+                    path.is_relative_to(profile.parent)
+                    or any(
+                        path.is_relative_to(profile.parent.parent / name)
+                        for name in ("memories", "memory-workspaces", "memory-migration")
+                    )
+                )
+            ):
+                raise CodexConfigurationError(
+                    "A project grant cannot include another profile's state"
+                )
             from agent.file_safety import is_write_denied
 
             if path in {

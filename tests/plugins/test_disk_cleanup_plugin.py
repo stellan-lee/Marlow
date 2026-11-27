@@ -223,6 +223,39 @@ class TestTrackForgetQuick:
         for d in ("logs", "memories", "sessions", "cron", "cache"):
             assert (_isolate_env / d).exists(), f"{d}/ should be preserved"
 
+    @pytest.mark.parametrize(
+        "subtree",
+        [
+            "memory-workspaces/local-owner/memory",
+            "memory-migration/archive",
+            "profiles/named/memory-workspaces/local-owner/memory",
+        ],
+    )
+    def test_memory_files_and_directories_are_protected(self, _isolate_env, subtree):
+        dg = _load_lib()
+        memory = _isolate_env / subtree
+        empty = memory / "test_topics"
+        empty.mkdir(parents=True)
+        note = memory / "test_preferences.md"
+        note.write_text("synthetic memory")
+
+        assert dg.guess_category(note) is None
+        assert not dg.track(str(note), "test", silent=True)
+        dg.save_tracked([
+            {
+                "path": str(note),
+                "timestamp": "2026-01-01T00:00:00+00:00",
+                "category": "test",
+                "size": note.stat().st_size,
+            },
+        ])
+
+        assert dg.status()["total_tracked"] == 0
+        assert dg.dry_run() == ([], [])
+        assert dg.quick()["deleted"] == 0
+        assert note.read_text() == "synthetic memory"
+        assert empty.is_dir()
+
 
 class TestStatus:
     def test_empty_status(self, _isolate_env):

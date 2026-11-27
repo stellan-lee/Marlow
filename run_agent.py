@@ -90,16 +90,16 @@ class AIAgent:
         if options.get("workspace_scope") is not None:
             workspace_scope = options["workspace_scope"]
         self._workspace_scope = workspace_scope
-        legacy_memory = self.config.get("memory")
-        legacy_memory = legacy_memory if isinstance(legacy_memory, dict) else {}
-        memory_enabled = (
-            legacy_memory.get("memory_enabled", True)
-            or legacy_memory.get("user_profile_enabled", True)
+        memory_settings = self.config.get("memory", {})
+        # Preserve the profile's legacy opt-outs for the new directory grant.
+        memory_enabled = isinstance(memory_settings, dict) and (
+            memory_settings.get("memory_enabled", True) is True
+            or memory_settings.get("user_profile_enabled", True) is True
         )
-        memory_writable = all(
+        memory_writable = memory_enabled and all(
             str(mode or "").strip().lower() not in {"off", "none", "read-only"}
             for mode in (
-                legacy_memory.get("memory_write_mode"),
+                memory_settings.get("memory_write_mode"),
                 options.get("memory_write_mode"),
             )
         )
@@ -116,7 +116,12 @@ class AIAgent:
             if platform in (None, "cli", "sdk") and workspace_scope is None:
                 memory_principal = LOCAL_OWNER
             elif options.get("chat_type") == "dm":
-                candidate = gateway_memory_principal(platform, options.get("user_id"))
+                candidate = gateway_memory_principal(
+                    platform,
+                    options.get("user_id"),
+                    chat_id=options.get("chat_id"),
+                    owner_routes=memory_settings.get("owner_gateway_routes"),
+                )
                 if candidate is not None and candidate == options.get("memory_principal"):
                     memory_principal = candidate
         self.environment = CodexEnvironment.build(

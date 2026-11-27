@@ -2565,6 +2565,7 @@ class SlackAdapter(BasePlatformAdapter):
             user_name=user_name,
             thread_id=thread_ts,
         )
+        source.metadata = {"slack_channel_type": channel_type}
 
         # Per-channel ephemeral prompt
         from gateway.platforms.base import (

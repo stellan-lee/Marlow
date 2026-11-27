@@ -46,6 +46,7 @@ def _source(
         {"source": _source(user_id=None)},
         {"source": _source(platform="email")},
         {"source": _source(platform="webhook")},
+        {"source": _source(platform=Platform.SLACK, chat_id="G12345")},
         {"event": None},
         {"event": SimpleNamespace(source=_source(), internal=True)},
         {"event": SimpleNamespace(source=_source(user_id="other"), internal=False)},
@@ -94,7 +95,60 @@ def test_memory_identity_is_stable_across_private_chats_and_scoped_by_platform()
         guest=False,
         skip_memory=False,
     ) == gateway_memory_principal(Platform.TELEGRAM, "12345")
-    assert gateway_memory_principal("telegram", "12345") != gateway_memory_principal("slack", "12345")
+    assert gateway_memory_principal("telegram", "12345") != gateway_memory_principal(
+        "slack", "12345", chat_id="D12345",
+    )
+
+
+@pytest.mark.parametrize("platform", [Platform.SLACK, Platform.FEISHU])
+def test_tenant_local_ids_in_distinct_private_chats_are_isolated(platform):
+    from agent.memory_workspace import gateway_memory_principal
+
+    first = gateway_memory_principal(platform, "same-id", chat_id="D11111")
+    second = gateway_memory_principal(platform, "same-id", chat_id="D22222")
+    assert first is not None and second is not None and first != second
+
+
+def test_slack_multiparty_dm_has_no_memory_grant():
+    source = _source(platform=Platform.SLACK, chat_id="D12345")
+    source.metadata = {"slack_channel_type": "mpim"}
+    assert _private_memory_principal(
+        source, event=MessageEvent(text="question", source=source),
+        stateless_thread=False, guest=False, skip_memory=False,
+    ) is None
+
+
+@pytest.mark.parametrize(
+    ("platform", "user_id", "chat_id", "chat_type", "guest", "bot", "linked"),
+    [
+        (Platform.TELEGRAM, "12345", "12345", "dm", False, False, True),
+        (Platform.TELEGRAM, "67890", "12345", "dm", False, False, False),
+        (Platform.TELEGRAM, "12345", "67890", "dm", False, False, False),
+        (Platform.TELEGRAM, "12345", "12345", "group", False, False, False),
+        (Platform.TELEGRAM, "12345", "12345", "dm", True, False, False),
+        (Platform.TELEGRAM, "12345", "12345", "dm", False, True, False),
+        (Platform.DISCORD, "12345", "12345", "dm", False, False, False),
+    ],
+)
+def test_explicit_owner_memory_link_requires_exact_private_route(
+    platform, user_id, chat_id, chat_type, guest, bot, linked,
+):
+    from agent.memory_workspace import LOCAL_OWNER
+
+    source = _source(
+        platform=platform, user_id=user_id, chat_id=chat_id, chat_type=chat_type,
+        thread_id="another-session",
+    )
+    source.is_bot = bot
+    source.user_id_alt = "12345"
+    config = {"memory": {"owner_gateway_routes": [
+        {"platform": "telegram", "user_id": "12345", "chat_id": "12345"},
+    ]}}
+    principal = _private_memory_principal(
+        source, event=MessageEvent(text="question", source=source),
+        stateless_thread=False, guest=guest, skip_memory=False, user_config=config,
+    )
+    assert (principal == LOCAL_OWNER) is linked
 
 
 def test_every_non_super_admin_telegram_source_resolves_as_digital_twin() -> None:

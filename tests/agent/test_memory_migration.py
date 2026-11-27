@@ -127,6 +127,37 @@ def test_database_migration_keeps_consistent_backup_and_reads_first_snapshot(
         backup_connection.close()
 
 
+def test_migration_verifies_backups_in_renamed_profile(profile_home, monkeypatch):
+    legacy = profile_home / "memories"
+    legacy.mkdir()
+    (legacy / "USER.md").write_text("Owner preference\n", encoding="utf-8")
+    connection = sqlite3.connect(profile_home / "memory_consolidation.db")
+    try:
+        connection.execute("CREATE TABLE memory_events (event_id TEXT, scope_id TEXT)")
+        connection.execute("INSERT INTO memory_events VALUES ('event', 'scope')")
+        connection.commit()
+    finally:
+        connection.close()
+    assert memory_migration.migrate_memory()["errors"] == []
+
+    renamed = profile_home.rename(profile_home.with_name("renamed"))
+    monkeypatch.setattr(memory_migration, "_profile_home", lambda _profile: renamed)
+    target = renamed / "memory-workspaces" / "local-owner" / "memory" / "legacy-user.md"
+    target.unlink()
+
+    report = memory_migration.migrate_memory()
+
+    assert report["errors"] == []
+    assert report["migrated"]["local_files"] == 0
+    assert report["migrated"]["consolidation_records"] == 0
+    assert len(report["backup_paths"]) == 2
+    assert all(
+        Path(path).is_relative_to(renamed) and Path(path).is_file()
+        for path in report["backup_paths"]
+    )
+    assert not target.exists()
+
+
 def test_symlinked_legacy_memory_source_fails_closed(profile_home):
     outside = profile_home.parent / "outside.md"
     outside.write_text("private", encoding="utf-8")
@@ -265,6 +296,7 @@ def test_active_explicit_any_provider_experience_remains_operator_only(profile_h
     source = profile_home / "state.db"
     records = [
         {"id": "eligible"},
+        {"id": "historic-decision", "kind": "decision", "current_status": "active"},
         {"id": "other-principal", "principal_id": "gateway-user"},
         {
             "id": "project-scope",
@@ -290,6 +322,8 @@ def test_active_explicit_any_provider_experience_remains_operator_only(profile_h
     )
     archive_text = "\n".join(path.read_text(encoding="utf-8") for path in archive_docs)
     assert "Body eligible" in archive_text
+    assert "Body historic-decision" in archive_text
+    assert '"kind": "decision"' in archive_text
     assert "session-source" in archive_text
     assert "verified historical lesson" in archive_text
     assert any(
@@ -344,6 +378,39 @@ def test_both_legacy_memory_flags_false_keep_both_files_in_backup_only(profile_h
     backup_dir = profile_home / "memory-migration" / "backups" / "legacy-memory"
     assert (backup_dir / "MEMORY.md").read_text(encoding="utf-8") == "Agent memory\n"
     assert (backup_dir / "USER.md").read_text(encoding="utf-8") == "User memory\n"
+
+
+def test_invalid_legacy_memory_flags_are_archived_without_disclosure(profile_home):
+    legacy = profile_home / "memories"
+    legacy.mkdir()
+    (legacy / "MEMORY.md").write_text("Notes with invalid policy\n", encoding="utf-8")
+    (profile_home / "config.yaml").write_text(
+        'memory:\n  memory_enabled: "false"\n', encoding="utf-8"
+    )
+
+    report = memory_migration.migrate_memory()
+
+    assert report["status"] == "partial"
+    assert report["migrated"]["local_files"] == 0
+    assert Path(report["backup_paths"][0]).read_text(encoding="utf-8") == (
+        "Notes with invalid policy\n"
+    )
+    assert not (profile_home / "memory-workspaces/local-owner/memory/legacy-memory.md").exists()
+
+
+def test_migration_blocks_malformed_profile_config(profile_home):
+    legacy = profile_home / "memories"
+    legacy.mkdir()
+    source = legacy / "MEMORY.md"
+    source.write_text("No valid memory policy\n", encoding="utf-8")
+    (profile_home / "config.yaml").write_text("[]\n", encoding="utf-8")
+
+    report = memory_migration.migrate_memory()
+
+    assert report["status"] == "blocked"
+    assert report["errors"][0]["message"] == "profile config must be a YAML mapping"
+    assert source.read_text(encoding="utf-8") == "No valid memory policy\n"
+    assert not (profile_home / "memory-workspaces/local-owner/memory/legacy-memory.md").exists()
 
 
 def test_database_decode_failure_keeps_completed_local_file_journal(profile_home):

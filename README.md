@@ -76,13 +76,39 @@ new conversation. Marlow limits private memory to its authorized owner and
 denies access from shared channels and guest conversations. Codex native
 memory stays disabled.
 
-Run `marlow memory migrate` for an existing profile, or
+Stop the legacy Gateway and any other writers for the profile before taking
+the migration snapshot. Run `marlow memory migrate` for an existing profile, or
 `marlow -p <profile> memory migrate` for a named profile. Enabled legacy
 `MEMORY.md` and `USER.md` files are imported into the local profile owner's
 workspace. Work Experience, Decision Memory, and consolidation records are
 preserved as scoped Markdown and backups under `memory-migration/` for operator
 review. The archive retains the legacy scope and disclosure policies. The
 migration report identifies external providers that require operator export.
+
+To let the profile owner use those imported notes in Gateway DMs, add each
+verified private route to that profile’s `config.yaml`. Use the canonical user
+and chat IDs reported by `/whoami` in the authorized DM.
+
+```yaml
+memory:
+  owner_gateway_routes:
+    - platform: telegram
+      user_id: "123456789"
+      chat_id: "123456789"
+```
+
+The route must already pass Gateway authorization. Each listed one-to-one
+route shares the local owner’s Markdown directory across sessions. Start a new
+session after adding or removing a route. Other authorized private accounts
+keep their own files. Existing account directories stay on disk when a route
+is linked, and the operator can review and copy any notes they want to keep in
+the owner directory. Review the protected migration archive locally before
+copying any scoped records into active memory.
+
+The originals and protected archive stay on the host. Back up
+`memory-migration/` separately if using portable profile export. A config-only
+profile clone copies the local owner's notes and clears Gateway owner links.
+Profile copies skip symlinked directories and links into private memory.
 
 The first turn after an upgrade starts a fresh Codex Thread with the existing
 Marlow conversation history. This retires any context injected by the legacy

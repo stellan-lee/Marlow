@@ -45,6 +45,7 @@ def permits_delivery(path):
     profile = get_marlow_home().absolute()
     if (
         path.is_relative_to(profile / "runtime")
+        or path.is_relative_to(profile / "memories")
         or path.is_relative_to(profile / "memory-workspaces")
         or path.is_relative_to(profile / "memory-migration")
     ):

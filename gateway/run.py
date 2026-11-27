@@ -1129,7 +1129,9 @@ _GUEST_PRIVATE_SESSION_COMMANDS = frozenset({
 })
 
 
-def _private_memory_principal(source, *, event, stateless_thread, guest, skip_memory):
+def _private_memory_principal(
+    source, *, event, stateless_thread, guest, skip_memory, user_config=None,
+):
     """Grant durable memory only for an authenticated, persistent private turn."""
     if (
         stateless_thread
@@ -1137,6 +1139,8 @@ def _private_memory_principal(source, *, event, stateless_thread, guest, skip_me
         or skip_memory
         or source.chat_type != "dm"
         or not source.user_id
+        or source.is_bot
+        or (source.metadata or {}).get("slack_channel_type") == "mpim"
         or event is None
         or event.source != source
         or event.internal
@@ -1145,7 +1149,11 @@ def _private_memory_principal(source, *, event, stateless_thread, guest, skip_me
         return None
     from agent.memory_workspace import gateway_memory_principal
 
-    return gateway_memory_principal(source.platform, source.user_id)
+    memory = (user_config or {}).get("memory")
+    owner_routes = memory.get("owner_gateway_routes") if isinstance(memory, dict) else None
+    return gateway_memory_principal(
+        source.platform, source.user_id, chat_id=source.chat_id, owner_routes=owner_routes,
+    )
 
 
 def _canonical_teams_thread_lane(snapshot: ExternalConversationSnapshot) -> Optional[str]:
@@ -8496,11 +8504,13 @@ class GatewayRunner:
         chat_type = (source.chat_type if source else "") or "dm"
         scope = "DM" if chat_type.lower() in {"dm", "direct", "private", ""} else "group/channel"
         user_id = (source.user_id if source else None) or "?"
+        identity = f"**You** — {platform} ({scope})\nUser ID: `{user_id}`\n"
+        if source and source.chat_type == "dm" and source.chat_id:
+            identity += f"Chat ID: `{source.chat_id}`\n"
 
         if self._is_super_admin_source(source):
             return (
-                f"**You** — {platform} ({scope})\n"
-                f"User ID: `{user_id}`\n"
+                f"{identity}"
                 f"Tier: **super admin**\n"
                 f"Slash commands: all available\n"
                 f"Approvable actions: automatically authorized"
@@ -8508,16 +8518,14 @@ class GatewayRunner:
 
         if not policy.enabled:
             return (
-                f"**You** — {platform} ({scope})\n"
-                f"User ID: `{user_id}`\n"
+                f"{identity}"
                 f"Tier: unrestricted (no admin list configured for this scope)\n"
                 f"Slash commands: all available"
             )
 
         if policy.is_admin(user_id):
             return (
-                f"**You** — {platform} ({scope})\n"
-                f"User ID: `{user_id}`\n"
+                f"{identity}"
                 f"Tier: **admin**\n"
                 f"Slash commands: all available"
             )
@@ -8534,8 +8542,7 @@ class GatewayRunner:
                 runnable.append(c)
         runnable_str = ", ".join(f"/{c}" for c in runnable) if runnable else "(none)"
         return (
-            f"**You** — {platform} ({scope})\n"
-            f"User ID: `{user_id}`\n"
+            f"{identity}"
             f"Tier: user\n"
             f"Slash commands you can run: {runnable_str}"
         )
@@ -10240,7 +10247,8 @@ class GatewayRunner:
             return "No active Codex thread. Resume the conversation before requesting compaction."
         current_config = _load_gateway_config()
         principal = _private_memory_principal(
-            source, event=event, stateless_thread=False, guest=False, skip_memory=False
+            source, event=event, stateless_thread=False, guest=False, skip_memory=False,
+            user_config=current_config,
         )
         fingerprint = self._gateway_authorization_fingerprint(source, current_config, principal)
         if getattr(agent, "_gateway_authorization_fingerprint", None) != fingerprint:
@@ -13500,6 +13508,7 @@ class GatewayRunner:
             stateless_thread=stateless_thread,
             guest=telegram_digital_twin.enabled,
             skip_memory=skip_memory,
+            user_config=user_config,
         )
         guest_runtime = {}
         runtime_session_id = session_id

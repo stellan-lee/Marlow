@@ -1,10 +1,9 @@
 """Conservatively migrate legacy local memory into protected Markdown files.
 
-The old files and databases remain authoritative backups. Profile-wide legacy
-memory and a narrowly proven subset of Experience records may be promoted to
-the private local-owner workspace. Other Experience and consolidation records
-stay in an operator-only migration area because their historical scope or
-disclosure policy is not sufficient for promotion.
+The original files and databases remain in place. Enabled profile-wide legacy
+Markdown is imported into the private local-owner workspace. Experience and
+consolidation records stay in an operator-only archive to retain their original
+scope and disclosure policy.
 """
 
 from __future__ import annotations
@@ -253,20 +252,17 @@ def _archive_file_source(
     archive_dir: Path,
     manifest: dict[str, Any],
     manifest_path: Path,
-) -> tuple[bytes | None, bool]:
+) -> tuple[bytes, bool]:
     """Return immutable source bytes and whether this call created its snapshot."""
+    archive = archive_dir / source.name
     entry = manifest["completed"].get(key)
     if entry is not None:
-        archive = Path(entry["backup_path"])
-        if _destination_state(archive) != "regular":
-            raise ValueError(f"recorded memory backup is missing: {archive}")
-        content = archive.read_bytes()
+        content = _read_regular_file(archive)
         if _sha256(content) != entry.get("source_sha256"):
             raise ValueError(f"recorded memory backup hash does not match: {archive}")
         return content, False
 
     content = _read_regular_file(source)
-    archive = archive_dir / source.name
     state = _destination_state(archive)
     if state != "absent":
         raise MigrationAmbiguityError(
@@ -442,19 +438,23 @@ def _profile_config(home: Path) -> dict[str, Any]:
     try:
         import yaml
 
-        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     except Exception as exc:
         raise ValueError("profile config could not be read safely") from exc
-    return config if isinstance(config, dict) else {}
+    if config is None:
+        return {}
+    if not isinstance(config, dict):
+        raise ValueError("profile config must be a YAML mapping")
+    return config
 
 
 def _legacy_memory_flags(config: dict[str, Any]) -> dict[str, bool]:
     memory = config.get("memory", {})
     if not isinstance(memory, dict):
-        memory = {}
+        return {"MEMORY.md": False, "USER.md": False}
     return {
-        "MEMORY.md": bool(memory.get("memory_enabled", True)),
-        "USER.md": bool(memory.get("user_profile_enabled", True)),
+        "MEMORY.md": memory.get("memory_enabled", True) is True,
+        "USER.md": memory.get("user_profile_enabled", True) is True,
     }
 
 
@@ -462,8 +462,8 @@ def _configured_external_providers(home: Path, config: dict[str, Any]) -> list[s
     providers: set[str] = set()
     memory = config.get("memory", {})
     provider = memory.get("provider", "") if isinstance(memory, dict) else ""
-    if str(provider or "").strip():
-        providers.add(str(provider).strip())
+    if isinstance(provider, str) and provider.strip():
+        providers.add(provider.strip())
 
     from marlow_constants import get_default_marlow_root
 
@@ -528,8 +528,6 @@ def _migrate_database(
         }
         manifest["completed"][backup_key] = backup_entry
         _persist_manifest(manifest_path, manifest)
-    elif Path(backup_entry.get("backup_path", "")) != backup:
-        raise ValueError("database backup path does not match migration journal")
     if _destination_state(backup) != "regular":
         raise ValueError(f"recorded database backup is missing: {backup}")
     if _file_sha256(backup) != backup_entry.get("backup_sha256"):
@@ -714,13 +712,13 @@ def _migrate_memory_locked(profile: str | None = None) -> dict[str, Any]:
                         entry["target"] = str(target)
                         entry["target_created"] = False
                         persist()
-                        reason = "legacy memory was explicitly disabled in config; archived without promotion"
+                        reason = "legacy memory was disabled or its flag was invalid; retained in the archive"
                         result["skipped"].append({
                             "source": str(source),
                             "reason": reason,
                         })
                         result["restrictions"].append(
-                            f"{source.name} remains in its protected backup because its legacy feature flag is false."
+                            f"{source.name} remains in its protected backup because its legacy feature flag is false or invalid."
                         )
                         continue
                     eligible_archived_snapshot = (
@@ -742,7 +740,7 @@ def _migrate_memory_locked(profile: str | None = None) -> dict[str, Any]:
                         entry["target"] = str(target)
                         persist()
                         continue
-                    document = _snapshot_markdown(source, content or b"")
+                    document = _snapshot_markdown(source, content)
                     _atomic_write(target, document)
                     entry["status"] = "written"
                     entry["target"] = str(target)

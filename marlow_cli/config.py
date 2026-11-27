@@ -1050,6 +1050,11 @@ DEFAULT_CONFIG = {
         "guard_agent_created": False,
     },
 
+    "memory": {
+        # Exact Gateway DM routes explicitly linked to the local owner.
+        "owner_gateway_routes": [],
+    },
+
     # Guest digital twin behavior remains independent of memory storage.
     "experience": {
         # Telegram-only guest digital twin. This is deliberately separate

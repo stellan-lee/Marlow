@@ -56,6 +56,55 @@ def test_no_process_or_model_request_on_initialization(profile):
     agent.close()
 
 
+def test_gateway_owner_must_have_configured_route_and_host_grant(profile):
+    from agent.codex_execution import allowed_path
+    from agent.memory_workspace import LOCAL_OWNER, memory_directory
+    from run_agent import AIAgent
+
+    config = profile / "config.yaml"
+    config.write_text(config.read_text() + (
+        "memory:\n  owner_gateway_routes:\n"
+        '    - {platform: telegram, user_id: "owner", chat_id: "owner-dm"}\n'
+    ))
+    note = memory_directory(profile, LOCAL_OWNER) / "legacy.md"
+    note.write_text("Migrated synthetic preference")
+    for chat_id, host_grant, allowed in (
+        ("owner-dm", LOCAL_OWNER, True),
+        ("owner-dm", None, False),
+        ("other-dm", LOCAL_OWNER, False),
+    ):
+        agent = AIAgent(
+            platform="telegram", user_id="owner", chat_id=chat_id, chat_type="dm",
+            memory_principal=host_grant, enabled_toolsets=[],
+        )
+        try:
+            if allowed:
+                assert allowed_path(agent, note).read_text() == "Migrated synthetic preference"
+            else:
+                with pytest.raises(PermissionError):
+                    allowed_path(agent, note)
+        finally:
+            agent.close()
+
+
+@pytest.mark.parametrize("target", [
+    "profiles/other/memory-workspaces/local-owner/memory",
+    "profiles/other/memory-migration",
+    "profiles/other",
+    "memory-workspaces/local-owner/memory",
+    "memory-migration",
+    "memories",
+])
+def test_named_profile_cannot_grant_other_profiles_memory_as_project(tmp_path, target):
+    project = tmp_path / "marlow" / target
+    project.mkdir(parents=True)
+    with pytest.raises(CodexConfigurationError, match="another profile's state"):
+        CodexEnvironment.build(
+            tmp_path / "marlow" / "profiles" / "active",
+            settings={"projects": [{"path": str(project), "writable": False}]},
+        )
+
+
 def test_protocol_turn_usage_raw_history_and_restart(profile, monkeypatch):
     monkeypatch.setenv("PERSONAL_MARKER", "must-not-inherit")
     agent = new_agent(session_id="stable")

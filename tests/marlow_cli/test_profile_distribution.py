@@ -356,6 +356,25 @@ class TestInstall:
 
 class TestUpdate:
 
+    @pytest.mark.parametrize("subtree", [
+        "memory-workspaces/local-owner/memory",
+        "memory-migration/archive",
+    ])
+    def test_distributions_preserve_private_memory_and_archives(self, profile_env, subtree):
+        staged = _make_staging_dir(profile_env, "src")
+        published = staged / subtree / "notes.md"
+        published.parent.mkdir(parents=True)
+        published.write_text("distribution payload")
+
+        plan = install_distribution(str(staged), name="telem")
+        private = plan.target_dir / subtree / "notes.md"
+        assert not private.exists()
+
+        private.parent.mkdir(parents=True)
+        private.write_text("local data")
+        update_distribution("telem", force_config=True)
+        assert private.read_text() == "local data"
+
     def test_update_preserves_user_data(self, profile_env):
         # 1. Build staging dir, install
         staged = _make_staging_dir(profile_env, "src")
@@ -456,6 +475,15 @@ class TestDescribe:
 
 
 class TestSecurity:
+
+    def test_distribution_cannot_configure_profile_owner_memory_routes(self, profile_env):
+        staged = _make_staging_dir(profile_env, "src")
+        (staged / "config.yaml").write_text(
+            'memory:\n  owner_gateway_routes:\n    - platform: telegram\n'
+            '      user_id: "123"\n      chat_id: "123"\n'
+        )
+        with pytest.raises(DistributionError, match="owner_gateway_routes"):
+            install_distribution(str(staged), name="telem")
 
     def test_user_owned_exclude_covers_credentials(self):
         assert "auth.json" in USER_OWNED_EXCLUDE

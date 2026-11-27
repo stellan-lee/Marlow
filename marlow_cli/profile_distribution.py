@@ -38,10 +38,6 @@ Manifest format (``distribution.yaml`` at the profile root)::
       - name: OPENAI_API_KEY
         description: "OpenAI API key"
         required: true
-      - name: GRAPHITI_MCP_URL
-        description: "Memory graph URL"
-        required: false
-        default: "http://127.0.0.1:8000/sse"
     distribution_owned:      # optional; sensible defaults apply
       - SOUL.md
       - skills/
@@ -54,8 +50,9 @@ Update semantics:
   distribution.yaml) are replaced from the new source.
 * ``config.yaml`` is distribution-owned but preserved on update unless
   ``--force-config`` is passed (user overrides typically live here).
-* User-owned paths (memories/, sessions/, state.db, auth.json, .env,
-  logs/, workspace/, home/, plans/, *_cache/, and anything under
+* User-owned paths (memory-workspaces/, memory-migration/, memories/,
+  sessions/, state.db, auth.json, .env, logs/, workspace/, home/,
+  plans/, *_cache/, and anything under
   ``local/``) are never touched.
 """
 
@@ -99,7 +96,7 @@ DEFAULT_DIST_OWNED: Tuple[str, ...] = (
 # convention for user customizations.
 USER_OWNED_EXCLUDE: frozenset = frozenset({
     # Credentials & runtime secrets
-    "auth.json", ".env",
+    "auth.json", ".env", "honcho.json",
     # Databases & runtime state
     "state.db", "state.db-shm", "state.db-wal",
     "marlow_state.db", "response_store.db",
@@ -108,7 +105,10 @@ USER_OWNED_EXCLUDE: frozenset = frozenset({
     "auth.lock", "active_profile", ".update_check",
     "errors.log", ".marlow_history",
     # User data
-    "memories", "sessions", "logs", "plans", "workspace", "home",
+    "memories", "memory-workspaces", "memory-migration",
+    "memory_consolidation.db", "memory_consolidation.db-shm",
+    "memory_consolidation.db-wal", "memory_consolidation.db-journal",
+    "sessions", "logs", "plans", "workspace", "home",
     "image_cache", "audio_cache", "document_cache",
     "browser_screenshots", "checkpoints", "sandboxes",
     "backups", "cache",
@@ -500,6 +500,17 @@ def plan_install(
 
     staged, provenance = _stage_source(source, workdir)
     _reject_distribution_symlinks(staged)
+    config_path = staged / "config.yaml"
+    if config_path.is_file():
+        try:
+            config = _load_yaml(config_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise DistributionError("Invalid distribution config.yaml") from exc
+        memory = config.get("memory") if isinstance(config, dict) else None
+        if isinstance(memory, dict) and memory.get("owner_gateway_routes"):
+            raise DistributionError(
+                "Configure memory.owner_gateway_routes locally after installing the distribution."
+            )
     manifest = read_manifest(staged)
     if manifest is None:
         raise DistributionError(
@@ -594,7 +605,7 @@ def _copy_dist_payload(
 
 def _bootstrap_user_dirs(target: Path) -> None:
     """Create the bootstrap dirs a fresh profile expects."""
-    for d in ("memories", "sessions", "skills", "logs",
+    for d in ("sessions", "skills", "logs",
               "plans", "workspace", "cron", "home"):
         (target / d).mkdir(parents=True, exist_ok=True)
 

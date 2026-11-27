@@ -12,12 +12,30 @@ LOCAL_OWNER = "local-owner"
 _PRIVATE_GATEWAYS = frozenset({"telegram", "discord", "slack", "feishu"})
 
 
-def gateway_memory_principal(platform, user_id):
+def gateway_memory_principal(platform, user_id, *, chat_id=None, owner_routes=None):
     """Name an adapter account once the Gateway has authorized its private DM."""
     channel = getattr(platform, "value", platform)
     if channel not in _PRIVATE_GATEWAYS or user_id is None or not str(user_id).strip():
         return None
-    identity = json.dumps([channel, str(user_id)], separators=(",", ":"))
+    if channel == "slack" and not str(chat_id or "").startswith("D"):
+        # Slack also routes multiparty DMs through its DM handling path.
+        return None
+    account = [channel, str(user_id)]
+    if channel in {"slack", "feishu"}:
+        # Their user IDs can be tenant-scoped. Each one-to-one bot chat has
+        # a stable channel ID shared by all of its sessions and threads.
+        if not chat_id:
+            return None
+        account.append(str(chat_id))
+    if isinstance(owner_routes, list) and chat_id and any(
+        isinstance(route, dict)
+        and route.get("platform") == channel
+        and route.get("user_id") == str(user_id)
+        and route.get("chat_id") == str(chat_id)
+        for route in owner_routes
+    ):
+        return LOCAL_OWNER
+    identity = json.dumps(account, separators=(",", ":"))
     return "gateway-" + sha256(identity.encode("utf-8")).hexdigest()
 
 

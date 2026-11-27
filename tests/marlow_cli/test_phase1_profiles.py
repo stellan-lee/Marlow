@@ -12,7 +12,8 @@ def test_fresh_profile_does_not_advertise_retired_features(tmp_path, monkeypatch
     config = load_config()
     assert {"tts", "stt", "voice", "curator", "personalities"}.isdisjoint(config)
     assert {"skin", "personality", "tui_status_indicator"}.isdisjoint(config["display"])
-    assert {"memory", "honcho"}.isdisjoint(config)
+    assert "honcho" not in config
+    assert config["memory"] == {"owner_gateway_routes": []}
 
     import model_tools
 
