@@ -299,6 +299,62 @@ def test_symlinked_home_and_project_grants_fail_closed(tmp_path):
         )
 
 
+@pytest.mark.parametrize("helper_dir", ["arg0", "arg0-macos"])
+def test_native_codex_helper_alias_allows_reopening_profile(tmp_path, helper_dir):
+    binary = tmp_path / "codex"
+    binary.touch(mode=0o700)
+    settings = {"binary": str(binary)}
+    env = CodexEnvironment.build(tmp_path / "profile", settings=settings)
+    helpers = env.codex_home / "tmp" / helper_dir / "codex-arg0ABC123"
+    helpers.mkdir(parents=True)
+    for name in ("applypatch", "apply_patch", "codex-execve-wrapper"):
+        (helpers / name).symlink_to(binary)
+
+    reopened = CodexEnvironment.build(env.profile, settings=settings)
+    assert reopened.codex_home == env.codex_home
+    assert (helpers / "applypatch").is_symlink()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS native helper layout")
+def test_reopen_profile_with_real_codex_app_server_alive(tmp_path):
+    binary = shutil.which("codex")
+    if binary is None:
+        pytest.skip("Codex CLI unavailable")
+    settings = {"binary": binary}
+    env = CodexEnvironment.build(tmp_path / "profile", settings=settings)
+    with CodexAppServerClient(codex_bin=binary, environment=env) as first:
+        first.initialize(capabilities={"experimentalApi": True})
+        reopened = CodexEnvironment.build(env.profile, settings=settings)
+        with CodexAppServerClient(codex_bin=binary, environment=reopened) as second:
+            second.initialize(capabilities={"experimentalApi": True})
+            account = second.request("account/read", {"refreshToken": False}, timeout=10)
+            assert account.get("account") is None
+            assert first.is_alive()
+
+
+@pytest.mark.parametrize(("root", "relative", "wrong_target"), [
+    ("home", "tmp/arg0-macos/codex-arg0ABC123/applypatch", False),
+    ("codex_home", "tmp/arg0-macos/codex-arg0ABC123/config.toml", False),
+    ("codex_home", "tmp/arg0-macos/codex-arg0ABC123/applypatch", True),
+    ("codex_home", "tmp/arg0-macos/other/applypatch", False),
+    ("codex_home", "config.toml", False),
+])
+def test_unrelated_runtime_links_remain_forbidden(tmp_path, root, relative, wrong_target):
+    binary = tmp_path / "codex"
+    binary.touch(mode=0o700)
+    other = tmp_path / "other"
+    other.touch(mode=0o700)
+    settings = {"binary": str(binary)}
+    env = CodexEnvironment.build(tmp_path / "profile", settings=settings)
+    alias = getattr(env, root) / relative
+    alias.parent.mkdir(parents=True, exist_ok=True)
+    alias.unlink(missing_ok=True)
+    alias.symlink_to(other if wrong_target else binary)
+
+    with pytest.raises(CodexConfigurationError, match="Runtime state must not contain symlinks"):
+        CodexEnvironment.build(env.profile, settings=settings)
+
+
 @pytest.mark.parametrize(
     "choice,expected",
     [

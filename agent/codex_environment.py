@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import tomllib
@@ -71,6 +72,27 @@ def resolve_codex_binary(settings: Mapping | None = None) -> str:
             "runtime.codex.binary to an executable path."
         )
     return os.path.abspath(binary)
+
+
+def _is_codex_helper_alias(path: Path, relative: Path, settings: Mapping) -> bool:
+    if len(relative.parts) != 4:
+        return False
+    tmp, platform_dir, instance, name = relative.parts
+    if (
+        tmp != "tmp"
+        or platform_dir not in {"arg0", "arg0-macos"}
+        or re.fullmatch(r"codex-arg0[A-Za-z0-9]{6}", instance) is None
+        or name not in {"apply_patch", "applypatch", "codex-execve-wrapper"}
+    ):
+        return False
+    try:
+        binary = Path(resolve_codex_binary(settings)).resolve(strict=True)
+        return path.resolve(strict=True) == binary
+    except FileNotFoundError:
+        # Another Codex process may be cleaning up its own aliases.
+        return not path.is_symlink()
+    except (OSError, RuntimeError):
+        return False
 
 
 def _private_directory(path: Path) -> Path:
@@ -168,6 +190,10 @@ class CodexEnvironment:
                     # Codex's own PATH helper aliases are not configuration,
                     # credentials or instruction discovery sources.
                     if len(relative.parts) > 1 and relative.parts[0] == ".tmp":
+                        continue
+                    if root == codex_home and _is_codex_helper_alias(
+                        child, relative, settings
+                    ):
                         continue
                     raise CodexConfigurationError(
                         f"Runtime state must not contain symlinks: {relative}"
