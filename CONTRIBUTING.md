@@ -50,21 +50,12 @@ Specialized community skills should ship independently and can be copied into `~
 
 ---
 
-## Memory Providers: Ship as a Standalone Plugin
+## Long-Term Memory
 
-**We are no longer accepting new memory providers into this repo.** Honcho is the bundled provider under `plugins/memory/`. If you want to add a new memory backend, publish it as a **standalone plugin repo** that users install into `~/.marlow/plugins/` (or via a pip entry point).
-
-Standalone memory plugins:
-
-- Implement the same `MemoryProvider` ABC (`agent/memory_provider.py`) — `sync_turn`, `prefetch`, `shutdown`, and optionally `post_setup(marlow_home, config)` for setup-wizard integration
-- Use the same discovery system — `discover_memory_providers()` picks them up from user/project plugin directories and pip entry points
-- Integrate with `marlow memory setup` via `post_setup()` — no need to touch core code
-- Can register their own CLI subcommands via `register_cli(subparser)` in a `cli.py` file
-- Get all the same lifecycle hooks and config plumbing as in-tree providers
-
-PRs that add a new directory under `plugins/memory/` will be closed with a pointer to publish the provider as its own repo. Existing in-tree providers stay; bug fixes to them are welcome.
-
-This isn't a quality bar — it's a coupling-and-maintenance decision. Memory providers are the most common plugin type and they shouldn't all live in this tree.
+Marlow grants a persistent Markdown directory to an authorized private
+identity. Codex manages those files through the ordinary file tools. The
+trusted instructions live in `agent/runtime_instructions/AGENTS.md`.
+See the [memory guide](README.md#memory) for scope and migration.
 
 ---
 
@@ -143,7 +134,7 @@ marlow-agent/
 ├── batch_runner.py           # Parallel batch processing for trajectory generation
 │
 ├── agent/                    # Agent internals (extracted modules)
-│   ├── prompt_builder.py         # System prompt assembly (identity, skills, context files, memory)
+│   ├── prompt_builder.py         # System prompt assembly (identity, skills, context files)
 │   ├── context_compressor.py     # Auto-summarization when approaching context limits
 │   ├── auxiliary_client.py       # Resolves auxiliary OpenAI clients (summarization, vision)
 │   ├── display.py                # KawaiiSpinner, tool progress formatting
@@ -205,7 +196,8 @@ marlow-agent/
 | `~/.marlow/.env` | API keys and secrets |
 | `~/.marlow/auth.json` | Codex OAuth credentials |
 | `~/.marlow/skills/` | Installed local and user-requested skills |
-| `~/.marlow/memories/` | Persistent memory (MEMORY.md, USER.md) |
+| `~/.marlow/memory-workspaces/` | Scoped Markdown memory |
+| `~/.marlow/memory-migration/` | Operator archive of legacy memory |
 | `~/.marlow/state.db` | SQLite session database |
 | `~/.marlow/sessions/` | Gateway routing index (`sessions.json`), request-dump breadcrumbs, gateway `*.jsonl` transcripts, and (optionally) per-session JSON snapshots when `sessions.write_json_snapshots: true` is set. The per-session snapshots are off by default; state.db is canonical. |
 | `~/.marlow/cron/` | Scheduled job data |
@@ -581,7 +573,6 @@ After the [litellm supply chain compromise](https://github.com/BerriAI/litellm/i
 # ✅ Correct — pre-1.0 (tight minor window)
 "asyncpg>=0.29,<0.32"
 "aiosqlite>=0.20,<0.23"
-"honcho-ai>=2.0,<3"
 
 # ❌ Rejected — no upper bound
 "some-package>=1.2.3"

@@ -194,8 +194,8 @@ def scan_for_threats(content: str, scope: str = "context") -> List[str]:
     - ``"context"`` (default): adds promptware / C2 / role-play patterns —
       suitable for context files, memory entries, and tool results.
     - ``"strict"`` (broad): adds persistence / SSH backdoor / exfil-URL
-      patterns — appropriate for user-mediated writes (memory tool,
-      local skill writes) where false positives can be resolved interactively.
+      patterns — appropriate for user-mediated writes such as local skills,
+      where false positives can be resolved interactively.
 
     Also checks for invisible unicode characters (returned as
     ``"invisible_unicode_U+XXXX"`` so the caller can surface the offending
@@ -228,7 +228,7 @@ def first_threat_message(content: str, scope: str = "strict") -> Optional[str]:
     """Return a human-readable error string for the first threat found, or None.
 
     Convenience wrapper used by paths that block on the first hit
-    (memory tool writes, local skill writes) where the caller just needs a
+    (such as local skill writes) where the caller just needs a
     yes/no + a message.
     """
     findings = scan_for_threats(content, scope=scope)

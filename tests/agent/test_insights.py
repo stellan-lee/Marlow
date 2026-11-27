@@ -398,18 +398,7 @@ class TestInsightsPopulated:
         }
         assert report["mcp"]["top_servers"][0] == {"server": "github", "count": 2}
 
-        memory = report["memory"]["summary"]
-        assert memory["recall_attempts"] == 1
-        assert memory["recall_hits"] == 1
-        assert memory["context_injections"] == 1
-        assert memory["hit_rate"] == 100.0
-
-        experience = report["experience"]["summary"]
-        assert experience["retrieval_attempts"] == 1
-        assert experience["attempts_with_matches"] == 1
-        assert experience["lessons_returned"] == 2
-        assert experience["context_injections"] == 1
-        assert experience["lessons_injected"] == 1
+        assert not report.keys() & {"memory", "experience"}
 
         skills = report["skills"]["summary"]
         assert skills["task_loads"] == 2
@@ -418,13 +407,15 @@ class TestInsightsPopulated:
 
         terminal_text = engine.format_terminal(report)
         gateway_text = engine.format_gateway(report)
-        for label in ("MCP Usage", "Memory Recall", "Work Experience"):
-            assert label in terminal_text
-        for label in ("MCP", "Memory", "Work Experience"):
-            assert label in gateway_text
+        assert "MCP Usage" in terminal_text
+        assert "MCP" in gateway_text
+        for label in ("Memory Recall", "Work Experience"):
+            assert label not in terminal_text
+            assert label not in gateway_text
 
-        cli_report = engine.generate(days=30, source="cli")
-        assert cli_report["experience"]["summary"]["retrieval_attempts"] == 1
+        # Retiring the analytics leaves the recorded audit data intact.
+        subsystems = {row["subsystem"] for row in populated_db.list_usage_events()}
+        assert {"memory", "experience"} <= subsystems
 
     def test_activity_patterns(self, populated_db):
         engine = InsightsEngine(populated_db)

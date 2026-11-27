@@ -302,8 +302,7 @@ explicitly (it's idempotent).
 (`run_agent.py`, `cli.py`, `gateway/run.py`, `marlow_cli/main.py`, etc.).
 If a plugin needs a capability the framework doesn't expose, expand the
 generic plugin surface (new hook, new ctx method) — never hardcode
-plugin-specific logic into core. PR #5295 removed 95 lines of hardcoded
-honcho argparse from `main.py` for exactly this reason.
+plugin-specific logic into core.
 
 ### Model configuration
 

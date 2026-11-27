@@ -1,5 +1,9 @@
 # Phase 2: Codex-only runtime
 
+> The memory sections record the Phase 2 implementation. See
+> [Memory](../../README.md#memory) for the current agent-managed Markdown
+> architecture and migration procedure.
+
 ## 1. Background and context
 
 Approved by the task request (Marlow Phase 2 — Codex-only Runtime

@@ -12,9 +12,7 @@ Matches OpenClaw's 9-tool MCP channel bridge surface:
   events_poll, events_wait, messages_send, permissions_list_open,
   permissions_respond
 
-Plus: channels_list and seven Work Experience tools:
-  experience_recall, experience_list, experience_show, experience_add,
-  experience_approve, experience_edit, experience_retract
+Plus: channels_list.
 
 Usage:
     marlow mcp serve

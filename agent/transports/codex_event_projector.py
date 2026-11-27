@@ -292,7 +292,6 @@ class CodexEventProjector:
 
     def _project_opaque(self, item: dict, item_type: str) -> ProjectionResult:
         # Record the existence of the item without inventing tool_calls.
-        # Memory review will see this and may or may not save anything.
         try:
             payload = json.dumps(item, ensure_ascii=False)[:1500]
         except (TypeError, ValueError):

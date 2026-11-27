@@ -1,7 +1,7 @@
 """
 Lazy dependency installer for opt-in Marlow Agent backends.
 
-Honcho, Slack and other optional integrations require Python packages that not every user needs. The
+Slack and other optional integrations require Python packages that not every user needs. The
 historical approach was to bundle them all under ``pyproject.toml`` extras
 (``marlow-agent[all]``) and install them eagerly at setup time. That has
 two problems:

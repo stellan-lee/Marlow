@@ -5,9 +5,8 @@ super-admin conversation as a guest-facing digital twin of the profile owner.
 Guest turns combine a global role prompt with the existing per-chat or per-topic
 prompt.
 
-This feature changes context, not authorization. It does not widen Telegram
-allowlists or mention gates, grant admin permissions, expose personal memory,
-or let guests capture or govern Work Experience.
+Telegram allowlists, mention gates, and administrator authorization apply
+unchanged. Guests receive their own conversation and file workspace.
 
 ## Configure the admin boundary
 

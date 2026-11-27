@@ -53,7 +53,7 @@ from tools.thread_context import propagate_context_to_thread
 logger = logging.getLogger(__name__)
 
 # Back-compat alias — the daemon executor now lives in tools.daemon_pool so
-# other subsystems (tool_executor, memory_manager, delegate_tool)
+# other subsystems (tool_executor, delegate_tool)
 # can share it. Existing imports of ``_DaemonThreadPoolExecutor`` keep working.
 _DaemonThreadPoolExecutor = DaemonThreadPoolExecutor
 

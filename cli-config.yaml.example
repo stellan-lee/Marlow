@@ -20,9 +20,5 @@ agent:
   disabled_toolsets: []
 terminal:
   backend: local               # Codex command/exec sandbox; no SSH/Docker fallback
-memory:
-  memory_enabled: true
-  user_profile_enabled: true
-  provider: ""                 # opt in to Honcho separately
 streaming:
   enabled: true

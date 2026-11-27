@@ -1,6 +1,8 @@
 # Microsoft Teams Gateway — Stateless Thread Context and Canonical Message Identity
 
-**Status:** Proposal — Ready for Engineering Review
+**Status:** Historical design. [Agent-managed Markdown memory](README.md#memory)
+supersedes the memory sections of this proposal. Stateless Teams turns receive no
+private memory directory.
 
 **Document type:** Engineering Design Amendment
 

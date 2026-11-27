@@ -1,10 +1,15 @@
 # Work Experience Memory for Marlow
 
-Status: Decision-aware Work Experience implemented on 2026-08-21.
-Automatic retrospective capture, work-record UI, gateway capture, shared/team
-experience, embeddings, and remote synchronization remain deferred.
+> Historical design. Work Experience was retired when Marlow adopted
+> agent-managed Markdown memory. The original design and implementation
+> record are preserved below. See [Memory](../README.md#memory) for the
+> current runtime and how to archive historical experiences and decisions.
 
-## Implementation boundary (authoritative)
+Status as of 2026-08-21: Decision-aware Work Experience implemented.
+Automatic retrospective capture, work-record UI, gateway capture, shared/team
+experience, embeddings, and remote synchronization were deferred.
+
+## Original implementation boundary
 
 The implemented slice deliberately validates safe recall before building the
 automatic capture loop described later in this document.

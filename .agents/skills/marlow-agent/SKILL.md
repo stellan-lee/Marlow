@@ -493,8 +493,8 @@ the `cronjob` tool, the `marlow cron` CLI (`list`, `add`, `edit`,
   (run in a specific dir with its `AGENTS.md` / `CLAUDE.md` loaded),
   multi-platform delivery.
 - **Invariants:** 3-minute hard interrupt per run, `.tick.lock` file
-  prevents duplicate ticks across processes, cron sessions pass
-  `skip_memory=True` by default, and cron deliveries are framed with a
+  prevents duplicate ticks across processes, cron sessions receive no private
+  memory grant, and cron deliveries are framed with a
   header/footer instead of being mirrored into the target gateway
   session (keeps role alternation intact).
 
@@ -579,7 +579,7 @@ marlow-agent/
 ├── model_tools.py        # Tool discovery and dispatch
 ├── toolsets.py           # Toolset definitions
 ├── marlow_state.py       # SQLite session store
-├── agent/                # Prompt builder, context compression, memory, model routing, credential pooling, skill dispatch
+├── agent/                # Codex transport, scoped file access, runtime policy, skill dispatch
 ├── marlow_cli/           # CLI subcommands, config, setup, commands
 │   ├── commands.py       # Slash command registry (CommandDef)
 │   ├── config.py         # DEFAULT_CONFIG, env var definitions
